@@ -1,0 +1,30 @@
+{
+  "seeds": [
+    "https://liauto.com"
+  ],
+  "max_depth": 10,
+  "max_concurrent_pages": 5,
+  "page_timeout": 60000000000,
+  "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  "output_dir": "output",
+  "crawl_delay": 2000000000,
+  "respect_robots": true,
+  "enable_screenshot": true,
+  "enable_pdf": false,
+  "enable_warc": false,
+  "enable_singlefile": true,
+  "enable_article_extract": true,
+  "scroll_height": 5000,
+  "max_retries": 3,
+  "max_urls_per_host": 1000,
+  "max_total_urls": 100000,
+  "checkpoint_interval": 300000000000,
+  "checkpoint_file": "checkpoint.gob",
+  "bloom_filter_path": "bloom.gob",
+  "rotate_user_agents": false,
+  "user_agents": [
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+  ]
+}

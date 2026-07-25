@@ -1,0 +1,23 @@
+{
+  "https://preview.themeforest.net/favicon.ico": {
+    "url": "https://preview.themeforest.net/favicon.ico",
+    "local_path": "output/preview.themeforest.net/favicon.ico",
+    "sha256": "683776860a73328fbfb90221f38228ae31fd55217f17b0fdba2daa1727c47dbd",
+    "mime_type": "image/x-icon",
+    "size": 21822
+  },
+  "https://preview.themeforest.net/item/quickloans-loan-company-wordpress-theme/full_screen_preview": {
+    "url": "https://preview.themeforest.net/item/quickloans-loan-company-wordpress-theme/full_screen_preview",
+    "local_path": "output/preview.themeforest.net/item/quickloans-loan-company-wordpress-theme/full_screen_preview/index.html",
+    "sha256": "b94d4c43423c65321b8d4a57f713ce82f4de2b788700145899e3ddbfff0b874b",
+    "mime_type": "text/html",
+    "size": 6459
+  },
+  "https://preview.themeforest.net/robots.txt": {
+    "url": "https://preview.themeforest.net/robots.txt",
+    "local_path": "output/preview.themeforest.net/robots.txt",
+    "sha256": "a5e3dcefa9471069da2d0cd34fc157adecf85563e899c7118fc0b9fc2f99fc38",
+    "mime_type": "text/plain",
+    "size": 27
+  }
+}
