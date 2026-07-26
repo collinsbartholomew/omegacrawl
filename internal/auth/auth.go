@@ -157,12 +157,14 @@ func (am *AuthManager) injectHeaders(ctx context.Context, targetURL string) erro
 		return nil
 	}
 
+	headers := make(map[string]interface{})
 	for k, v := range am.cfg.HeaderAuth.Headers {
-		if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
-			return network.SetExtraHTTPHeaders(map[string]interface{}{k: v}).Do(ctx)
-		})); err != nil {
-			util.LogDebug("failed to inject header", zap.String("key", k), zap.Error(err))
-		}
+		headers[k] = v
+	}
+	if err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return network.SetExtraHTTPHeaders(headers).Do(ctx)
+	})); err != nil {
+		util.LogDebug("failed to inject auth headers", zap.Error(err))
 	}
 
 	util.LogInfo("injected custom auth headers", zap.Int("count", len(am.cfg.HeaderAuth.Headers)))
@@ -174,7 +176,10 @@ func (am *AuthManager) oauthFlow(ctx context.Context, targetURL string) error {
 		return fmt.Errorf("oauth config required for oauth auth type")
 	}
 
-	if am.token != nil && am.token.IsValid() {
+	am.tokenMu.RLock()
+	valid := am.token != nil && am.token.IsValid()
+	am.tokenMu.RUnlock()
+	if valid {
 		return am.injectOAuthToken(ctx)
 	}
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"math"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -163,34 +162,4 @@ func (rl *RateLimiter) Len() int {
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()
 	return len(rl.limiters)
-}
-
-type RequestThrottler struct {
-	global   *rate.Limiter
-	perHost  *RateLimiter
-	total    atomic.Int64
-	rejected atomic.Int64
-}
-
-func NewRequestThrottler(globalRate float64, burst int, perHostDelay time.Duration) *RequestThrottler {
-	return &RequestThrottler{
-		global:  rate.NewLimiter(rate.Limit(globalRate), burst),
-		perHost: New(perHostDelay, 1),
-	}
-}
-
-func (rt *RequestThrottler) Wait(ctx context.Context, host string) error {
-	rt.total.Add(1)
-	if err := rt.global.Wait(ctx); err != nil {
-		rt.rejected.Add(1)
-		return err
-	}
-	if err := rt.perHost.Wait(ctx, host, 0); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (rt *RequestThrottler) Stats() (total, rejected int64) {
-	return rt.total.Load(), rt.rejected.Load()
 }

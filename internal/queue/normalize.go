@@ -2,7 +2,6 @@ package queue
 
 import (
 	"net/url"
-	"sort"
 	"strings"
 )
 
@@ -193,28 +192,17 @@ func sortQueryParams(rawQuery string) string {
 		return rawQuery
 	}
 
-	var keys []string
 	for k := range params {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	var result []string
-	for _, k := range keys {
 		if shouldStripParam(k) {
-			continue
-		}
-		vals := params[k]
-		for _, v := range vals {
-			if v == "" {
-				result = append(result, k)
-			} else {
-				result = append(result, k+"="+v)
-			}
+			delete(params, k)
 		}
 	}
 
-	return strings.Join(result, "&")
+	if len(params) == 0 {
+		return ""
+	}
+
+	return params.Encode()
 }
 
 func shouldStripParam(key string) bool {
@@ -236,18 +224,16 @@ func shouldStripParam(key string) bool {
 }
 
 func NormalizeAndClean(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	var fragment string
+	if err == nil && u.Fragment != "" && (strings.HasPrefix(u.Fragment, "/") || strings.HasPrefix(u.Fragment, "!/")) {
+		fragment = "#" + u.Fragment
+	}
+
 	normalized := NormalizeURL(rawURL)
 
-	u, err := url.Parse(normalized)
-	if err != nil {
-		return normalized
+	if fragment != "" && !strings.HasSuffix(normalized, fragment) {
+		return normalized + fragment
 	}
-
-	// Preserve hash fragments for SPA routing
-	if u.Fragment != "" && !strings.HasPrefix(u.Fragment, "~") {
-		return u.String()
-	}
-
-	u.Fragment = ""
-	return u.String()
+	return normalized
 }

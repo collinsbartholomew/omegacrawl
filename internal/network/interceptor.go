@@ -2,6 +2,8 @@ package network
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"path"
@@ -130,6 +132,17 @@ func (i *Interceptor) Start(ctx context.Context, targetURL string) {
 	}
 }
 
+func headerString(v interface{}) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case fmt.Stringer:
+		return s.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 func (i *Interceptor) onRequest(ev *network.EventRequestWillBeSent) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -144,9 +157,7 @@ func (i *Interceptor) onRequest(ev *network.EventRequestWillBeSent) {
 			Headers: func() map[string]string {
 				h := make(map[string]string)
 				for k, v := range ev.Request.Headers {
-					if s, ok := v.(string); ok {
-						h[k] = s
-					}
+					h[k] = headerString(v)
 				}
 				return h
 			}(),
@@ -163,9 +174,7 @@ func (i *Interceptor) onResponse(ev *network.EventResponseReceived) {
 
 	h := make(map[string]string)
 	for k, v := range ev.Response.Headers {
-		if s, ok := v.(string); ok {
-			h[k] = s
-		}
+		h[k] = headerString(v)
 	}
 
 	i.mu.Lock()
@@ -237,13 +246,14 @@ func (i *Interceptor) fetchAndProcess(ctx context.Context, p *pendingResource) {
 
 	isJSON := isJSONContentType(p.mimeType) || isAPIContentType(p.url, p.mimeType)
 
+	var ar APIResponse
 	i.mu.Lock()
 	if len(i.resources) < maxResources {
 		i.resources[p.url] = resource
 	}
 
 	if isJSON {
-		ar := APIResponse{
+		ar = APIResponse{
 			URL:        p.url,
 			Body:       body,
 			MimeType:   p.mimeType,
@@ -257,19 +267,21 @@ func (i *Interceptor) fetchAndProcess(ctx context.Context, p *pendingResource) {
 		if len(i.apiResponses) < maxAPIResponses {
 			i.apiResponses = append(i.apiResponses, ar)
 		}
-		if i.apiCallback != nil {
-			i.apiCallback(ar)
-		}
 	}
 	i.mu.Unlock()
+	if isJSON && i.apiCallback != nil {
+		i.apiCallback(ar)
+	}
 }
 
 func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestID, url string) []byte {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
+			retryTimer := time.NewTimer(time.Duration(attempt*300) * time.Millisecond)
 			select {
-			case <-time.After(time.Duration(attempt*300) * time.Millisecond):
+			case <-retryTimer.C:
 			case <-ctx.Done():
+				retryTimer.Stop()
 				return nil
 			}
 		}
@@ -335,13 +347,14 @@ func (i *Interceptor) FetchBodies(ctx context.Context) {
 
 			isJSON := isJSONContentType(pr.mimeType) || isAPIContentType(pr.url, pr.mimeType)
 
+			var ar APIResponse
 			i.mu.Lock()
 			if len(i.resources) < maxResources {
 				i.resources[pr.url] = resource
 			}
 
 			if isJSON {
-				ar := APIResponse{
+				ar = APIResponse{
 					URL:        pr.url,
 					Body:       body,
 					MimeType:   pr.mimeType,
@@ -355,11 +368,11 @@ func (i *Interceptor) FetchBodies(ctx context.Context) {
 				if len(i.apiResponses) < maxAPIResponses {
 					i.apiResponses = append(i.apiResponses, ar)
 				}
-				if i.apiCallback != nil {
-					i.apiCallback(ar)
-				}
 			}
 			i.mu.Unlock()
+			if isJSON && i.apiCallback != nil {
+				i.apiCallback(ar)
+			}
 		}(p)
 	}
 	wg.Wait()
@@ -397,7 +410,10 @@ func (i *Interceptor) IsCaptured(url string) bool {
 }
 
 func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource, error) {
-	if i.baseURL == "" {
+	i.mu.RLock()
+	baseURL := i.baseURL
+	i.mu.RUnlock()
+	if baseURL == "" {
 		return nil, nil
 	}
 
@@ -407,7 +423,7 @@ func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource,
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Referer", i.baseURL)
+	req.Header.Set("Referer", baseURL)
 
 	resp, err := httpclient.GlobalClient().Do(req)
 	if err != nil {
@@ -416,19 +432,13 @@ func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
 		return nil, nil
 	}
 
-	var body []byte
-	for {
-		buf := make([]byte, 32768)
-		n, err := resp.Body.Read(buf)
-		if n > 0 {
-			body = append(body, buf[:n]...)
-		}
-		if err != nil {
-			break
-		}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
 	}
 
 	if int64(len(body)) > MaxResponseBodySize {
@@ -575,9 +585,11 @@ func (i *Interceptor) GetAllSeenURLs() []string {
 }
 
 func (i *Interceptor) Close() {
+	i.mu.Lock()
 	if i.fetchCancel != nil {
 		i.fetchCancel()
 	}
+	i.mu.Unlock()
 	i.fetchWg.Wait()
 }
 

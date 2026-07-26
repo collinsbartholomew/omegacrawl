@@ -35,6 +35,7 @@ import (
 	"github.com/user/clone/internal/jsanalyzer"
 	"github.com/user/clone/internal/jsengine"
 	netintercept "github.com/user/clone/internal/network"
+	"github.com/user/clone/internal/pool"
 	"github.com/user/clone/internal/queue"
 	"github.com/user/clone/internal/rewrite"
 	"github.com/user/clone/internal/robots"
@@ -175,31 +176,6 @@ type hostSem struct {
 	closed   atomic.Bool
 }
 
-type BrowserPool struct {
-	browsers   chan context.Context
-	workers    int
-}
-
-func NewBrowserPool(workSize int) *BrowserPool {
-	browsers := make(chan context.Context, workSize)
-	return &BrowserPool{
-		browsers: browsers,
-		workers:  workSize,
-	}
-}
-
-func (bp *BrowserPool) GetContext() context.Context {
-	return <-bp.browsers
-}
-
-func (bp *BrowserPool) ReleaseContext(ctx context.Context) {
-	bp.browsers <- ctx
-}
-
-func (bp *BrowserPool) Close() {
-	close(bp.browsers)
-}
-
 func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	store := storage.NewFilesystem(cfg)
 	robotsParser := robots.NewRobotsParser()
@@ -209,7 +185,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	var bloomFilter *queue.BloomDedup
-	expectedItems := uint(cfg.MaxTotalURLs)
+	expectedItems := uint(cfg.MaxTotalURLs * 10)
 	if expectedItems < 1000 {
 		expectedItems = 1000
 	}
@@ -449,12 +425,9 @@ Loop:
 		c.hostURLCount[host]++
 		c.hostMu.Unlock()
 
-hs := c.getHostSem(host)
-	if hs.closed.Load() {
-		hs = &hostSem{ch: make(chan struct{}, 2)}
-	}
+	hostSemCh := c.getHostSem(host).ch
 	select {
-	case hs.ch <- struct{}{}:
+	case hostSemCh <- struct{}{}:
 	case <-c.ctx.Done():
 		continue
 	}
@@ -462,16 +435,19 @@ hs := c.getHostSem(host)
 	ua := cfgUserAgent(c.cfg)
 	canCrawl, crawlDelay := c.robotsParser.CanCrawl(item.URL, ua, c.cfg)
 	if !canCrawl {
-		<-hs.ch
+		<-hostSemCh
 		util.LogDebug("blocked by robots.txt", zap.String("url", item.URL))
 		continue
 	}
 
 	startTime := time.Now()
-	c.rateLimiter.Wait(c.ctx, host, crawlDelay)
+	if err := c.rateLimiter.Wait(c.ctx, host, crawlDelay); err != nil {
+		<-hostSemCh
+		continue
+	}
 
 	if !c.circuitBreaker.Allow(host) {
-		<-hs.ch
+		<-hostSemCh
 		util.LogDebug("circuit open, skipping", zap.String("host", host))
 		continue
 	}
@@ -480,15 +456,15 @@ hs := c.getHostSem(host)
 	select {
 	case c.semaphore <- struct{}{}:
 	case <-c.ctx.Done():
-		<-hs.ch
+		<-hostSemCh
 		c.wg.Done()
 		break Loop
 	}
 
-	go func(url string, depth int, hst string, start time.Time) {
+	go func(url string, depth int, hst string, semCh chan struct{}, start time.Time) {
 		defer c.wg.Done()
 		defer func() { <-c.semaphore }()
-		defer func() { <-c.getHostSem(hst).ch }()
+		defer func() { <-semCh }()
 		defer func() {
 			latency := time.Since(start)
 			c.rateLimiter.ObserveLatency(hst, latency)
@@ -496,19 +472,20 @@ hs := c.getHostSem(host)
 
 			defer func() {
 				if r := recover(); r != nil {
-					buf := make([]byte, 4096)
-					n := runtime.Stack(buf, false)
+					buf := pool.GlobalBufferPool.Get()
+					defer pool.GlobalBufferPool.Put(buf)
+					n := runtime.Stack(buf.Bytes(), false)
 					util.LogInfo("panic recovered",
 						zap.String("url", url),
 						zap.Any("error", r),
-						zap.String("stack", string(buf[:n])),
+						zap.String("stack", buf.String()[:n]),
 					)
 					c.metrics.IncErrors()
 				}
 			}()
 
 			c.crawlPage(browserCtx, url, depth)
-		}(item.URL, item.Depth, host, startTime)
+		}(item.URL, item.Depth, host, hostSemCh, startTime)
 	}
 
 	drainTimer := time.NewTimer(drainTimeout)
@@ -520,9 +497,13 @@ hs := c.getHostSem(host)
 
 	select {
 	case <-drainDone:
-		drainTimer.Stop()
+		if !drainTimer.Stop() {
+			<-drainTimer.C
+		}
 	case <-drainTimer.C:
 		util.LogInfo("drain timeout reached, continuing")
+	case <-c.ctx.Done():
+		drainTimer.Stop()
 	}
 	close(c.checkpointDone)
 
@@ -1362,11 +1343,14 @@ func (c *Crawler) crawlPage(ctx context.Context, urlStr string, depth int) {
 				zap.Int("attempt", attempt),
 				zap.Duration("backoff", backoff),
 			)
+			timer := time.NewTimer(backoff)
 			select {
-			case <-time.After(backoff):
+			case <-timer.C:
 			case <-ctx.Done():
+				timer.Stop()
 				return
 			case <-c.ctx.Done():
+				timer.Stop()
 				return
 			}
 		}
@@ -1539,9 +1523,11 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	}
 	for _, selector := range c.cfg.ClickSelectors {
 		jsengine.ClickElement(tabCtx, selector)
+		clickTimer := time.NewTimer(500 * time.Millisecond)
 		select {
-		case <-time.After(500 * time.Millisecond):
+		case <-clickTimer.C:
 		case <-c.ctx.Done():
+			clickTimer.Stop()
 			return nil
 		}
 	}
@@ -1616,10 +1602,11 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			if c.cfg.MaxSPARoutes > 0 && len(routesToCrawl) > c.cfg.MaxSPARoutes {
 				routesToCrawl = routesToCrawl[:c.cfg.MaxSPARoutes]
 			}
+		routeLoop:
 			for _, routeURL := range routesToCrawl {
 				select {
 				case <-c.ctx.Done():
-					break
+					break routeLoop
 				default:
 				}
 				util.LogDebug("navigating to SPA route", zap.String("route", routeURL))
@@ -1862,12 +1849,9 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 
 		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
 
-		dup := c.contentHashes.Contains(hashStr)
-		if !dup {
-			c.contentHashes.Add(hashStr)
-		}
+		added := c.contentHashes.AddIfAbsent(hashStr)
 
-		if dup {
+		if !added {
 			if c.cfg.Incremental && c.incCache != nil {
 				c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
 			}
@@ -1921,10 +1905,9 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			continue
 		}
 		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
-		if c.contentHashes.Contains(hashStr) {
+		if !c.contentHashes.AddIfAbsent(hashStr) {
 			continue
 		}
-		c.contentHashes.Add(hashStr)
 		localPath, err := c.storage.SaveFile(missingURL, resource.Body, resource.MimeType)
 		if err != nil {
 			continue
@@ -1951,17 +1934,20 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			for _, fontURL := range fontURLs {
 				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
 				if absFontURL != "" && isValidURL(absFontURL) {
-					if !c.bloomFilter.HasSeen(absFontURL) && !c.exactDedup.Contains(absFontURL) {
-						fontResp, err := c.httpClient.Get(absFontURL)
-						if err == nil && fontResp.StatusCode == 200 {
-							fontBody, _ := io.ReadAll(fontResp.Body)
-							fontResp.Body.Close()
-							if len(fontBody) > 0 {
-								localPath, err := c.storage.SaveFile(absFontURL, fontBody, fontResp.Header.Get("Content-Type"))
-								if err == nil {
-									c.rewriter.AddMapping(absFontURL, localPath)
-									c.metrics.IncAssetsCaptured()
-									c.metrics.AddBytes(int64(len(fontBody)))
+					if !c.bloomFilter.HasSeen(absFontURL) {
+						fontReq, _ := http.NewRequestWithContext(c.ctx, "GET", absFontURL, nil)
+						if fontReq != nil {
+							fontResp, err := c.httpClient.Do(fontReq)
+							if err == nil && fontResp.StatusCode == 200 {
+								fontBody, _ := io.ReadAll(fontResp.Body)
+								fontResp.Body.Close()
+								if len(fontBody) > 0 {
+									localPath, err := c.storage.SaveFile(absFontURL, fontBody, fontResp.Header.Get("Content-Type"))
+									if err == nil {
+										c.rewriter.AddMapping(absFontURL, localPath)
+										c.metrics.IncAssetsCaptured()
+										c.metrics.AddBytes(int64(len(fontBody)))
+									}
 								}
 							}
 						}
@@ -1974,17 +1960,20 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			for _, cssURL := range cssURLs {
 				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
 				if absCSSURL != "" && isValidURL(absCSSURL) {
-					if !c.bloomFilter.HasSeen(absCSSURL) && !c.exactDedup.Contains(absCSSURL) {
-						cssResp, err := c.httpClient.Get(absCSSURL)
-						if err == nil && cssResp.StatusCode == 200 {
-							cssBody, _ := io.ReadAll(cssResp.Body)
-							cssResp.Body.Close()
-							if len(cssBody) > 0 {
-								localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
-								if err == nil {
-									c.rewriter.AddMapping(absCSSURL, localPath)
-									c.metrics.IncAssetsCaptured()
-									c.metrics.AddBytes(int64(len(cssBody)))
+					if !c.bloomFilter.HasSeen(absCSSURL) {
+						cssReq, _ := http.NewRequestWithContext(c.ctx, "GET", absCSSURL, nil)
+						if cssReq != nil {
+							cssResp, err := c.httpClient.Do(cssReq)
+							if err == nil && cssResp.StatusCode == 200 {
+								cssBody, _ := io.ReadAll(cssResp.Body)
+								cssResp.Body.Close()
+								if len(cssBody) > 0 {
+									localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
+									if err == nil {
+										c.rewriter.AddMapping(absCSSURL, localPath)
+										c.metrics.IncAssetsCaptured()
+										c.metrics.AddBytes(int64(len(cssBody)))
+									}
 								}
 							}
 						}
@@ -2206,7 +2195,7 @@ func (c *Crawler) downloadHTMLAssets(baseURL, pageHTML, htmlLocalPath string, ne
 		if cdpSaved[assetURL] {
 			continue
 		}
-		if c.bloomFilter.HasSeen(assetURL) || c.exactDedup.Contains(assetURL) {
+		if c.bloomFilter.HasSeen(assetURL) {
 			continue
 		}
 		if !c.isAllowedDomain(assetURL) || c.isExcluded(assetURL) {
@@ -2221,10 +2210,9 @@ func (c *Crawler) downloadHTMLAssets(baseURL, pageHTML, htmlLocalPath string, ne
 			}
 
 			hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
-			if c.contentHashes.Contains(hashStr) {
+			if !c.contentHashes.AddIfAbsent(hashStr) {
 				return nil
 			}
-			c.contentHashes.Add(hashStr)
 
 			localPath, err := c.storage.SaveFile(u, resource.Body, resource.MimeType)
 			if err != nil {
@@ -2263,7 +2251,7 @@ func (c *Crawler) resolveJSDependencies(htmlLocalPath, baseURL string) {
 		analyzedURLs := jsanalyzer.ExtractJSURLs(string(jsData), baseURL)
 
 		for _, au := range analyzedURLs {
-			if c.bloomFilter.HasSeen(au.URL) || c.exactDedup.Contains(au.URL) {
+			if c.bloomFilter.HasSeen(au.URL) {
 				continue
 			}
 			if !c.isAllowedDomain(au.URL) || c.isExcluded(au.URL) {
@@ -2285,10 +2273,9 @@ func (c *Crawler) resolveJSDependencies(htmlLocalPath, baseURL string) {
 			}
 
 			hashStr := strconv.FormatUint(xxhash.Sum64(body), 36)
-			if c.contentHashes.Contains(hashStr) {
+			if !c.contentHashes.AddIfAbsent(hashStr) {
 				continue
 			}
-			c.contentHashes.Add(hashStr)
 
 			savedPath, err := c.storage.SaveFile(au.URL, body, resp.Header.Get("Content-Type"))
 			if err != nil {
@@ -2310,7 +2297,7 @@ func (c *Crawler) resolveJSDependencies(htmlLocalPath, baseURL string) {
 
 		htmlURLs := jsanalyzer.ExtractFromHTML(string(jsData), baseURL)
 		for _, au := range htmlURLs {
-			if c.bloomFilter.HasSeen(au.URL) || c.exactDedup.Contains(au.URL) {
+			if c.bloomFilter.HasSeen(au.URL) {
 				continue
 			}
 			if !c.isAllowedDomain(au.URL) || c.isExcluded(au.URL) {
@@ -2349,7 +2336,7 @@ func (c *Crawler) resolveJSDependenciesRecursive(jsURL, baseURL, htmlDir string,
 		return
 	}
 
-	if c.bloomFilter.HasSeen(jsURL) || c.exactDedup.Contains(jsURL) {
+	if c.bloomFilter.HasSeen(jsURL) {
 		return
 	}
 	if !c.isAllowedDomain(jsURL) || c.isExcluded(jsURL) {
@@ -2371,10 +2358,9 @@ func (c *Crawler) resolveJSDependenciesRecursive(jsURL, baseURL, htmlDir string,
 	}
 
 	hashStr := strconv.FormatUint(xxhash.Sum64(body), 36)
-	if c.contentHashes.Contains(hashStr) {
+	if !c.contentHashes.AddIfAbsent(hashStr) {
 		return
 	}
-	c.contentHashes.Add(hashStr)
 
 	savedPath, err := c.storage.SaveFile(jsURL, body, resp.Header.Get("Content-Type"))
 	if err != nil {
@@ -2394,7 +2380,7 @@ func (c *Crawler) resolveJSDependenciesRecursive(jsURL, baseURL, htmlDir string,
 		if strings.HasSuffix(au.URL, ".js") {
 			c.resolveJSDependenciesRecursive(au.URL, baseURL, htmlDir, depth+1)
 		} else {
-			if c.bloomFilter.HasSeen(au.URL) || c.exactDedup.Contains(au.URL) {
+			if c.bloomFilter.HasSeen(au.URL) {
 				continue
 			}
 			if !c.isAllowedDomain(au.URL) || c.isExcluded(au.URL) {
@@ -2414,10 +2400,9 @@ func (c *Crawler) resolveJSDependenciesRecursive(jsURL, baseURL, htmlDir string,
 			}
 
 			hashStr2 := strconv.FormatUint(xxhash.Sum64(body2), 36)
-			if c.contentHashes.Contains(hashStr2) {
+			if !c.contentHashes.AddIfAbsent(hashStr2) {
 				continue
 			}
-			c.contentHashes.Add(hashStr2)
 
 			savedPath2, err := c.storage.SaveFile(au.URL, body2, resp2.Header.Get("Content-Type"))
 			if err != nil {
@@ -3076,6 +3061,9 @@ func (c *Crawler) fetchPageMetadata(ctx context.Context, urlStr string) {
 
 			resp, err := c.httpClient.Do(req)
 			if err != nil {
+				if resp != nil {
+					resp.Body.Close()
+				}
 				return
 			}
 			defer resp.Body.Close()
@@ -3190,9 +3178,11 @@ func (c *Crawler) applyWaitStrategy(ctx context.Context) {
 			jsengine.WaitForNetworkIdle(waitCtx, c.cfg.NetworkIdleQuiet)
 		}
 	default:
+		waitTimer := time.NewTimer(c.cfg.WaitStrategyTimeout)
 		select {
-		case <-time.After(c.cfg.WaitStrategyTimeout):
+		case <-waitTimer.C:
 		case <-ctx.Done():
+			waitTimer.Stop()
 		}
 	}
 }
@@ -3259,9 +3249,11 @@ func (c *Crawler) solveCaptcha(tabCtx context.Context, urlStr string, html strin
 	solved := false
 	for attempt := 0; attempt < c.cfg.CAPTCHAConfig.RetryCount; attempt++ {
 		if attempt > 0 {
+			captchaTimer := time.NewTimer(time.Duration(attempt*2) * time.Second)
 			select {
-			case <-time.After(time.Duration(attempt*2) * time.Second):
+			case <-captchaTimer.C:
 			case <-c.ctx.Done():
+				captchaTimer.Stop()
 				return
 			}
 		}
@@ -3289,7 +3281,13 @@ func (c *Crawler) solveCaptcha(tabCtx context.Context, urlStr string, html strin
 		if resp.Solved && resp.Token != "" {
 			c.injectCaptchaToken(tabCtx, resp.Token, elems)
 			solved = true
-			time.Sleep(2 * time.Second)
+			postSolveTimer := time.NewTimer(2 * time.Second)
+			select {
+			case <-postSolveTimer.C:
+			case <-c.ctx.Done():
+				postSolveTimer.Stop()
+				return
+			}
 			break
 		}
 	}

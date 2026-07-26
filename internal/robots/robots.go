@@ -248,20 +248,12 @@ func (rp *RobotsParser) fetchRobots(robotsURL string) *RobotsEntry {
 				inOurAgent = false
 			}
 		case "disallow":
-			if inOurAgent {
-				if value == "" {
-					entry.Disallow = append(entry.Disallow, "/")
-				} else {
-					entry.Disallow = append(entry.Disallow, value)
-				}
+			if inOurAgent && value != "" {
+				entry.Disallow = append(entry.Disallow, value)
 			}
 		case "allow":
-			if inOurAgent {
-				if value == "" {
-					entry.Allow = append(entry.Allow, "/")
-				} else {
-					entry.Allow = append(entry.Allow, value)
-				}
+			if inOurAgent && value != "" {
+				entry.Allow = append(entry.Allow, value)
 			}
 		case "crawl-delay":
 			if inOurAgent {

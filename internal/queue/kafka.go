@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/segmentio/kafka-go"
@@ -19,6 +20,8 @@ type KafkaQueue struct {
 	seenTopic string
 	brokers   []string
 	closeCh   chan struct{}
+	wg        sync.WaitGroup
+	pending   atomic.Int64
 }
 
 func NewKafkaQueue(kafkaURL string) (*KafkaQueue, error) {
@@ -51,12 +54,14 @@ func NewKafkaQueueWithSize(kafkaURL string, maxSize int) (*KafkaQueue, error) {
 		closeCh:   make(chan struct{}),
 	}
 
+	q.wg.Add(1)
 	go q.consumeSeenTopic()
 
 	return q, nil
 }
 
 func (q *KafkaQueue) consumeSeenTopic() {
+	defer q.wg.Done()
 	seenReader := kafka.NewReader(kafka.ReaderConfig{
 		Brokers:        q.brokers,
 		Topic:          q.seenTopic,
@@ -75,9 +80,9 @@ func (q *KafkaQueue) consumeSeenTopic() {
 		default:
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		msg, err := seenReader.FetchMessage(ctx)
-		cancel()
+		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		msg, err := seenReader.FetchMessage(fetchCtx)
+		fetchCancel()
 		if err != nil {
 			select {
 			case <-q.closeCh:
@@ -94,12 +99,15 @@ func (q *KafkaQueue) consumeSeenTopic() {
 				q.seenMu.Unlock()
 			}
 		}
-		seenReader.CommitMessages(ctx, msg)
+		commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = seenReader.CommitMessages(commitCtx, msg)
+		commitCancel()
 	}
 }
 
 func (q *KafkaQueue) Close() error {
 	close(q.closeCh)
+	q.wg.Wait()
 	q.writer.Close()
 	q.reader.Close()
 	return nil
@@ -109,7 +117,7 @@ func (q *KafkaQueue) PushURL(url string, depth int) bool {
 	if q.HasSeen(url) {
 		return false
 	}
-	if q.Size() >= q.maxSize {
+	if q.pending.Load() >= int64(q.maxSize) {
 		return false
 	}
 	item := URLItem{URL: url, Depth: depth}
@@ -126,6 +134,7 @@ func (q *KafkaQueue) PushURL(url string, depth int) bool {
 	if err != nil {
 		return false
 	}
+	q.pending.Add(1)
 	q.markSeen(url)
 	return true
 }
@@ -161,13 +170,16 @@ func (q *KafkaQueue) PopURL() (URLItem, bool) {
 	if err := json.Unmarshal(msg.Value, &item); err != nil {
 		return URLItem{}, false
 	}
+	q.pending.Add(-1)
 	return item, true
 }
 
 func (q *KafkaQueue) Size() int {
-	q.seenMu.RLock()
-	defer q.seenMu.RUnlock()
-	return len(q.seenSet)
+	n := q.pending.Load()
+	if n < 0 {
+		return 0
+	}
+	return int(n)
 }
 
 func (q *KafkaQueue) HasSeen(url string) bool {
@@ -201,7 +213,7 @@ func (q *KafkaQueue) AllVisited() map[string]bool {
 }
 
 func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	for _, item := range items {
@@ -210,6 +222,7 @@ func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool
 			Key:   []byte(item.URL),
 			Value: data,
 		})
+		q.pending.Add(1)
 	}
 
 	for url := range visited {

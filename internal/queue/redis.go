@@ -38,35 +38,68 @@ func NewRedisQueueWithSize(redisURL string, maxSize int) (*RedisQueue, error) {
 	}, nil
 }
 
+var pushScript = redis.NewScript(`
+	local key = KEYS[1]
+	local itemsKey = KEYS[2]
+	local seenKey = KEYS[3]
+	local url = ARGV[1]
+	local data = ARGV[2]
+	local maxSize = tonumber(ARGV[3])
+
+	if redis.call("SISMEMBER", seenKey, url) == 1 then
+		return 0
+	end
+	if redis.call("LLEN", key) >= maxSize then
+		return 0
+	end
+	redis.call("RPUSH", key, data)
+	redis.call("HSET", itemsKey, url, data)
+	redis.call("SADD", seenKey, url)
+	return 1
+`)
+
+var popScript = redis.NewScript(`
+	local key = KEYS[1]
+	local itemsKey = KEYS[2]
+	local data = redis.call("LPOP", key)
+	if not data then
+		return nil
+	end
+	local ok, item = pcall(cjson.decode, data)
+	if ok and item.url then
+		redis.call("HDEL", itemsKey, item.url)
+	end
+	return data
+`)
+
 func (q *RedisQueue) PushURL(url string, depth int) bool {
-	if q.HasSeen(url) {
-		return false
-	}
-	if q.Size() >= q.maxSize {
-		return false
-	}
 	item := URLItem{URL: url, Depth: depth}
-	data, _ := json.Marshal(item)
+	data, err := json.Marshal(item)
+	if err != nil {
+		return false
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-
-	pipe := q.client.Pipeline()
-	pipe.RPush(ctx, q.key, string(data))
-	pipe.HSet(ctx, q.key+":items", url, data)
-	pipe.SAdd(ctx, q.key+":seen", url)
-	_, err := pipe.Exec(ctx)
-	return err == nil
+	res, err := pushScript.Run(ctx, q.client, []string{q.key, q.key + ":items", q.key + ":seen"}, url, string(data), q.maxSize).Result()
+	if err != nil {
+		return false
+	}
+	return res.(int64) == 1
 }
 
 func (q *RedisQueue) PopURL() (URLItem, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	val, err := q.client.LPop(ctx, q.key).Result()
-	if err != nil || val == "" {
+	val, err := popScript.Run(ctx, q.client, []string{q.key, q.key + ":items"}).Result()
+	if err != nil || val == nil {
+		return URLItem{}, false
+	}
+	valStr, ok := val.(string)
+	if !ok || valStr == "" {
 		return URLItem{}, false
 	}
 	var item URLItem
-	if err := json.Unmarshal([]byte(val), &item); err != nil {
+	if err := json.Unmarshal([]byte(valStr), &item); err != nil {
 		return URLItem{}, false
 	}
 	return item, true
@@ -132,16 +165,17 @@ func (q *RedisQueue) AllVisited() map[string]bool {
 func (q *RedisQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = q.client.Del(ctx, q.key, q.key+":seen", q.key+":items")
+	pipe := q.client.Pipeline()
+	pipe.Del(ctx, q.key, q.key+":seen", q.key+":items")
 	for _, item := range items {
 		data, _ := json.Marshal(item)
-		_ = q.client.RPush(ctx, q.key, string(data))
-		itemData, _ := json.Marshal(item)
-		_ = q.client.HSet(ctx, q.key+":items", item.URL, itemData)
+		pipe.RPush(ctx, q.key, string(data))
+		pipe.HSet(ctx, q.key+":items", item.URL, data)
 	}
 	for url := range visited {
-		_ = q.client.SAdd(ctx, q.key+":seen", url)
+		pipe.SAdd(ctx, q.key+":seen", url)
 	}
+	_, _ = pipe.Exec(ctx)
 }
 
 func (q *RedisQueue) Close() error {

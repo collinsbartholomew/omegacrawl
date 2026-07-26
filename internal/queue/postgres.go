@@ -56,11 +56,14 @@ func (q *PostgresQueue) PushURL(url string, depth int) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	item := URLItem{URL: url, Depth: depth}
-	itemData, _ := json.Marshal(item)
-	_, err := q.pool.Exec(ctx,
+	itemData, err := json.Marshal(item)
+	if err != nil {
+		return false
+	}
+	result, err := q.pool.Exec(ctx,
 		`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, $2, $3, TRUE)
 		 ON CONFLICT (url) DO NOTHING`, url, depth, itemData)
-	return err == nil
+	return err == nil && result.RowsAffected() > 0
 }
 
 func (q *PostgresQueue) PopURL() (URLItem, bool) {
@@ -69,8 +72,8 @@ func (q *PostgresQueue) PopURL() (URLItem, bool) {
 	var item URLItem
 	var itemData []byte
 	err := q.pool.QueryRow(ctx,
-		`DELETE FROM crawl_queue WHERE url = (
-			SELECT url FROM crawl_queue ORDER BY depth ASC LIMIT 1
+		`DELETE FROM crawl_queue WHERE ctid = (
+			SELECT ctid FROM crawl_queue ORDER BY depth ASC LIMIT 1 FOR UPDATE SKIP LOCKED
 		) RETURNING url, depth, item_data`,
 	).Scan(&item.URL, &item.Depth, &itemData)
 	if err != nil {

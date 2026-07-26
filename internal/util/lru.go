@@ -51,6 +51,24 @@ func (s *LRUSet) Add(key string) {
 	}
 }
 
+func (s *LRUSet) AddIfAbsent(key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.items[key]; ok {
+		return false
+	}
+
+	node := &lruNode{key: key}
+	s.items[key] = node
+	s.addToHead(node)
+
+	if len(s.items) > s.capacity {
+		s.removeLRU()
+	}
+	return true
+}
+
 func (s *LRUSet) Contains(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -133,6 +151,7 @@ func (q *BoundedQueue) Push(item interface{}) {
 	defer q.mu.Unlock()
 
 	if len(q.items) >= q.capacity {
+		q.items[0] = nil
 		q.items = q.items[1:]
 	}
 	q.items = append(q.items, item)

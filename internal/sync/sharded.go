@@ -3,7 +3,6 @@ package sync
 import (
 	"runtime"
 	"sync"
-	"time"
 )
 
 func shardCount() uint32 {
@@ -11,7 +10,14 @@ func shardCount() uint32 {
 	if n < 4 {
 		n = 4
 	}
-	return uint32(n * 4)
+	n *= 4
+	n--
+	n |= n >> 1
+	n |= n >> 2
+	n |= n >> 4
+	n |= n >> 8
+	n |= n >> 16
+	return uint32(n + 1)
 }
 
 type Shard[K comparable, V any] struct {
@@ -43,7 +49,10 @@ func NewShardedMap[K comparable, V any](opts ...func(*ShardedMap[K, V])) *Sharde
 }
 
 func defaultHash[K comparable](key K) uint32 {
-	s := interface{}(key).(string)
+	s, ok := interface{}(key).(string)
+	if !ok {
+		return 0
+	}
 	var h uint32
 	for i := 0; i < len(s); i++ {
 		h = h*31 + uint32(s[i])
@@ -131,102 +140,5 @@ func (sm *ShardedMap[K, V]) Clear() {
 		sm.shards[i].mu.Lock()
 		sm.shards[i].items = make(map[K]V)
 		sm.shards[i].mu.Unlock()
-	}
-}
-
-type ShardedCounter struct {
-	shards []Shard[string, int64]
-	mask   uint32
-}
-
-func NewShardedCounter() *ShardedCounter {
-	count := shardCount()
-	return &ShardedCounter{
-		shards: make([]Shard[string, int64], count),
-		mask:   count - 1,
-	}
-}
-
-func (sc *ShardedCounter) getShard(key string) *Shard[string, int64] {
-	return &sc.shards[defaultHash[string](key)&sc.mask]
-}
-
-func (sc *ShardedCounter) Inc(key string, delta int64) int64 {
-	shard := sc.getShard(key)
-	shard.mu.Lock()
-	shard.items[key] += delta
-	newVal := shard.items[key]
-	shard.mu.Unlock()
-	return newVal
-}
-
-func (sc *ShardedCounter) Get(key string) int64 {
-	shard := sc.getShard(key)
-	shard.mu.RLock()
-	v := shard.items[key]
-	shard.mu.RUnlock()
-	return v
-}
-
-func (sc *ShardedCounter) Reset(key string) {
-	shard := sc.getShard(key)
-	shard.mu.Lock()
-	delete(shard.items, key)
-	shard.mu.Unlock()
-}
-
-type ShardedTimeMap struct {
-	shards []Shard[string, time.Time]
-	mask   uint32
-}
-
-func NewShardedTimeMap() *ShardedTimeMap {
-	count := shardCount()
-	sm := &ShardedTimeMap{
-		shards: make([]Shard[string, time.Time], count),
-		mask:   count - 1,
-	}
-	for i := range sm.shards {
-		sm.shards[i].items = make(map[string]time.Time)
-	}
-	return sm
-}
-
-func (stm *ShardedTimeMap) getShard(key string) *Shard[string, time.Time] {
-	return &stm.shards[defaultHash[string](key)&stm.mask]
-}
-
-func (stm *ShardedTimeMap) Set(key string, t time.Time) {
-	shard := stm.getShard(key)
-	shard.mu.Lock()
-	shard.items[key] = t
-	shard.mu.Unlock()
-}
-
-func (stm *ShardedTimeMap) Get(key string) (time.Time, bool) {
-	shard := stm.getShard(key)
-	shard.mu.RLock()
-	t, ok := shard.items[key]
-	shard.mu.RUnlock()
-	return t, ok
-}
-
-func (stm *ShardedTimeMap) Delete(key string) {
-	shard := stm.getShard(key)
-	shard.mu.Lock()
-	delete(shard.items, key)
-	shard.mu.Unlock()
-}
-
-func (stm *ShardedTimeMap) Range(fn func(key string, val time.Time) bool) {
-	for i := range stm.shards {
-		stm.shards[i].mu.RLock()
-		for k, v := range stm.shards[i].items {
-			if !fn(k, v) {
-				stm.shards[i].mu.RUnlock()
-				return
-			}
-		}
-		stm.shards[i].mu.RUnlock()
 	}
 }

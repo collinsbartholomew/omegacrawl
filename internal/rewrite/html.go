@@ -416,18 +416,18 @@ func rewriteScriptStyleURLs(text []byte, baseURL string, mappings map[string]str
 
 		if strings.HasPrefix(urlStr, "http://") || strings.HasPrefix(urlStr, "https://") {
 			if relPath, ok := pathCache[urlStr]; ok {
-				return append(append(quote, relPath...), quote...)
+				return []byte(string(quote) + relPath + string(quote))
 			}
 			if relPath, ok := absRelCache[urlStr]; ok {
-				return append(append(quote, relPath...), quote...)
+				return []byte(string(quote) + relPath + string(quote))
 			}
 		} else if baseURL != "" {
 			resolved := ResolveURL(baseURL, urlStr)
 			if relPath, ok := pathCache[resolved]; ok {
-				return append(append(quote, relPath...), quote...)
+				return []byte(string(quote) + relPath + string(quote))
 			}
 			if relPath, ok := absRelCache[resolved]; ok {
-				return append(append(quote, relPath...), quote...)
+				return []byte(string(quote) + relPath + string(quote))
 			}
 		}
 		return match

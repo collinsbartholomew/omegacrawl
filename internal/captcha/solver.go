@@ -229,11 +229,14 @@ func (s *Solver) poll2Captcha(ctx context.Context, taskID string) (*SolveRespons
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
+	pollTick := time.NewTicker(2 * time.Second)
+	defer pollTick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+		case <-pollTick.C:
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/getTaskResult", nil)
@@ -301,11 +304,14 @@ func (s *Solver) pollCapMonster(ctx context.Context, taskID string) (*SolveRespo
 	ctx, cancel := context.WithTimeout(ctx, s.timeout)
 	defer cancel()
 
+	pollTick := time.NewTicker(2 * time.Second)
+	defer pollTick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
+		case <-pollTick.C:
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.baseURL+"/getTaskResult", nil)
