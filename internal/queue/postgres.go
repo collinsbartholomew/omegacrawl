@@ -2,7 +2,6 @@ package queue
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"time"
@@ -54,20 +53,13 @@ func NewPostgresQueueWithSize(pgDSN string, maxSize int) (*PostgresQueue, error)
 }
 
 func (q *PostgresQueue) PushURL(url string, depth int) bool {
-	if q.HasSeen(url) {
-		return false
-	}
-	if q.Size() >= q.maxSize {
-		return false
-	}
-	item := URLItem{URL: url, Depth: depth}
-	itemData, err := json.Marshal(item)
-	if err != nil {
-		return false
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_, err = q.pool.Exec(ctx, `INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, $2, $3, TRUE)`, url, depth, itemData)
+	item := URLItem{URL: url, Depth: depth}
+	itemData, _ := json.Marshal(item)
+	_, err := q.pool.Exec(ctx,
+		`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, $2, $3, TRUE)
+		 ON CONFLICT (url) DO NOTHING`, url, depth, itemData)
 	return err == nil
 }
 
@@ -76,16 +68,16 @@ func (q *PostgresQueue) PopURL() (URLItem, bool) {
 	defer cancel()
 	var item URLItem
 	var itemData []byte
-	err := q.pool.QueryRow(ctx, `SELECT url, depth, item_data FROM crawl_queue ORDER BY depth ASC LIMIT 1`).Scan(&item.URL, &item.Depth, &itemData)
+	err := q.pool.QueryRow(ctx,
+		`DELETE FROM crawl_queue WHERE url = (
+			SELECT url FROM crawl_queue ORDER BY depth ASC LIMIT 1
+		) RETURNING url, depth, item_data`,
+	).Scan(&item.URL, &item.Depth, &itemData)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return URLItem{}, false
-		}
 		return URLItem{}, false
 	}
-	_, err = q.pool.Exec(ctx, `DELETE FROM crawl_queue WHERE url = $1`, item.URL)
-	if err != nil {
-		return URLItem{}, false
+	if itemData != nil {
+		json.Unmarshal(itemData, &item)
 	}
 	return item, true
 }

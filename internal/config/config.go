@@ -60,7 +60,11 @@ type Config struct {
 	EnableIframes      bool          `json:"enable_iframes"`
 	EnableRouteDiscovery bool        `json:"enable_route_discovery"`
 	EnableMediaCapture bool          `json:"enable_media_capture"`
-	EnableStructuredData bool        `json:"enable_structured_data"`
+	EnableStructuredData bool          `json:"enable_structured_data"`
+	MaxSPARoutes         int           `json:"max_spa_routes"`
+
+	EnableInteractionEngine bool `json:"enable_interaction_engine"`
+	MaxInteractionsPerPage  int  `json:"max_interactions_per_page"`
 
 	ViewportWidth      int           `json:"viewport_width"`
 	ViewportHeight     int           `json:"viewport_height"`
@@ -218,25 +222,29 @@ func DefaultConfig() *Config {
 		EnableRouteDiscovery: true,
 		EnableMediaCapture:   true,
 		EnableStructuredData: true,
+		MaxSPARoutes:        50,
 
-	ViewportWidth:    1920,
-	ViewportHeight:   1080,
+		EnableInteractionEngine: false,
+		MaxInteractionsPerPage:  50,
 
-	NormalizeURLs:      true,
+		ViewportWidth:    1920,
+		ViewportHeight:   1080,
 
-	MaxIframeDepth:     2,
-	IframeSkipPatterns: []string{"googleads", "doubleclick", "facebook.com/tr"},
+		NormalizeURLs:      true,
 
-EnableAPICapture: true,
-	DisableTLSVerify: false,
-	Incremental:      false,
-	IncCacheFile:     "",
+		MaxIframeDepth:     2,
+		IframeSkipPatterns: []string{"googleads", "doubleclick", "facebook.com/tr"},
 
-	AuthConfig:            &AuthConfig{},
-	CAPTCHAConfig:         &CAPTCHAConfig{},
-	QueueConfig:           &QueueConfig{Backend: "local"},
-	ChangeDetectionConfig: &ChangeDetectionConfig{Enabled: false, MaxSnapshots: 10},
-}
+		EnableAPICapture: true,
+		DisableTLSVerify: false,
+		Incremental:      false,
+		IncCacheFile:     "",
+
+		AuthConfig:            &AuthConfig{},
+		CAPTCHAConfig:         &CAPTCHAConfig{},
+		QueueConfig:           &QueueConfig{Backend: "local"},
+		ChangeDetectionConfig: &ChangeDetectionConfig{Enabled: false, MaxSnapshots: 10},
+	}
 }
 
 func (c *Config) TLSConfig() *tls.Config {

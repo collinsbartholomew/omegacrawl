@@ -18,6 +18,7 @@ type KafkaQueue struct {
 	seenSet   map[string]bool
 	seenTopic string
 	brokers   []string
+	closeCh   chan struct{}
 }
 
 func NewKafkaQueue(kafkaURL string) (*KafkaQueue, error) {
@@ -47,6 +48,7 @@ func NewKafkaQueueWithSize(kafkaURL string, maxSize int) (*KafkaQueue, error) {
 		seenSet:   make(map[string]bool),
 		seenTopic: "crawl_seen",
 		brokers:   []string{kafkaURL},
+		closeCh:   make(chan struct{}),
 	}
 
 	go q.consumeSeenTopic()
@@ -67,10 +69,21 @@ func (q *KafkaQueue) consumeSeenTopic() {
 	defer seenReader.Close()
 
 	for {
+		select {
+		case <-q.closeCh:
+			return
+		default:
+		}
+
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		msg, err := seenReader.FetchMessage(ctx)
 		cancel()
 		if err != nil {
+			select {
+			case <-q.closeCh:
+				return
+			default:
+			}
 			continue
 		}
 		if msg.Value != nil {
@@ -83,6 +96,13 @@ func (q *KafkaQueue) consumeSeenTopic() {
 		}
 		seenReader.CommitMessages(ctx, msg)
 	}
+}
+
+func (q *KafkaQueue) Close() error {
+	close(q.closeCh)
+	q.writer.Close()
+	q.reader.Close()
+	return nil
 }
 
 func (q *KafkaQueue) PushURL(url string, depth int) bool {
@@ -195,10 +215,4 @@ func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool
 	for url := range visited {
 		q.markSeen(url)
 	}
-}
-
-func (q *KafkaQueue) Close() error {
-	q.writer.Close()
-	q.reader.Close()
-	return nil
 }

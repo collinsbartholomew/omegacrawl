@@ -12,56 +12,163 @@ import (
 
 const (
 	StealthScript = `
-		// Override webdriver detection
-		Object.defineProperty(navigator, 'webdriver', {
-			get: () => undefined
-		});
-
-		// Override plugins
-		Object.defineProperty(navigator, 'plugins', {
-			get: () => {
-				const plugins = [
-					{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-					{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-					{ name: 'Native Client', filename: 'internal-nacl-plugin' }
-				];
-				plugins.length = 3;
-				return plugins;
+		(function() {
+			// Remove CDP-specific $cdc_ properties from window
+			for (const key of Object.getOwnPropertyNames(window)) {
+				if (key.startsWith('$cdc_') || key.startsWith('$chrome_')) {
+					delete window[key];
+				}
 			}
-		});
 
-		// Override languages
-		Object.defineProperty(navigator, 'languages', {
-			get: () => ['en-US', 'en']
-		});
+			// Override webdriver detection
+			Object.defineProperty(navigator, 'webdriver', {
+				get: () => undefined,
+				configurable: true,
+			});
 
-		// Override permissions
-		const originalQuery = window.navigator.permissions.query;
-		window.navigator.permissions.query = (parameters) => (
-			parameters.name === 'notifications' ?
-				Promise.resolve({ state: Notification.permission }) :
-				originalQuery(parameters)
-		);
+			// Override plugins
+			Object.defineProperty(navigator, 'plugins', {
+				get: () => {
+					const plugins = [
+						{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+						{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+						{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }
+					];
+					plugins.length = 3;
+					plugins.item = function(i) { return this[i]; };
+					plugins.namedItem = function(name) {
+						for (var j = 0; j < this.length; j++) {
+							if (this[j].name === name) return this[j];
+						}
+						return null;
+					};
+					return plugins;
+				},
+				configurable: true,
+			});
 
-		// Chrome runtime
-		window.chrome = {
-			runtime: {},
-			loadTimes: function() {},
-			csi: function() {},
-			app: {}
-		};
+			// Override languages
+			Object.defineProperty(navigator, 'languages', {
+				get: () => ['en-US', 'en'],
+				configurable: true,
+			});
 
-		// Override WebGL vendor and renderer
-		const getParameter = WebGLRenderingContext.prototype.getParameter;
-		WebGLRenderingContext.prototype.getParameter = function(parameter) {
-			if (parameter === 37445) {
-				return 'Intel Inc.';
+			// Override permissions
+			const originalQuery = window.navigator.permissions.query;
+			window.navigator.permissions.query = function(parameters) {
+				if (parameters.name === 'notifications') {
+					return Promise.resolve({ state: 'prompt', onchange: null });
+				}
+				return originalQuery(parameters);
+			};
+
+			// Chrome runtime - complete mock
+			window.chrome = {
+				runtime: {
+					id: 'abcdefghijklmnopqrstuvwxyz',
+					onConnect: { addListener: function() {} },
+					onMessage: { addListener: function() {} },
+					onInstalled: { addListener: function() {} },
+					connect: function() { return null; },
+					sendMessage: function() {},
+					getManifest: function() { return {}; },
+					getURL: function(path) { return path; },
+				},
+				loadTimes: function() {
+					return {
+						requestTime: 0,
+						startLoadTime: 0,
+						commitLoadTime: 0,
+						finishDocumentLoadTime: 0,
+						finishLoadTime: 0,
+						firstPaintTime: 0,
+						firstPaintAfterLoadTime: 0,
+						wasFetchedViaSpdy: false,
+						wasNpnNegotiated: false,
+						wasAlternateProtocolAvailable: false,
+						connectionInfo: ''
+					};
+				},
+				csi: function() {
+					return { startE: 0, onloadT: 0, pageT: 0, tran: 0 };
+				},
+				app: {
+					isInstalled: false,
+					InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+					RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+					getDetails: function() {},
+					getIsInstalled: function() {},
+					installState: function() { return 'not_installed'; },
+					runningState: function() { return 'cannot_run'; }
+				},
+				webstore: {
+					onInstallStageChanged: {},
+					onDownloadProgress: {},
+				}
+			};
+
+			// Override WebGL vendor and renderer
+			try {
+				const getParameter = WebGLRenderingContext.prototype.getParameter;
+				WebGLRenderingContext.prototype.getParameter = function(parameter) {
+					if (parameter === 37445) {
+						return 'Intel Inc.';
+					}
+					if (parameter === 37446) {
+						return 'Intel Iris OpenGL Engine';
+					}
+					return getParameter.apply(this, arguments);
+				};
+			} catch(e) {}
+
+			// Fix navigator.hardwareConcurrency
+			Object.defineProperty(navigator, 'hardwareConcurrency', {
+				get: () => 8,
+				configurable: true,
+			});
+
+			// Fix navigator.deviceMemory
+			Object.defineProperty(navigator, 'deviceMemory', {
+				get: () => 8,
+				configurable: true,
+			});
+
+			// Fix navigator.maxTouchPoints
+			Object.defineProperty(navigator, 'maxTouchPoints', {
+				get: () => 0,
+				configurable: true,
+			});
+
+			// Override navigator.connection to look real
+			if (navigator.connection) {
+				Object.defineProperty(navigator.connection, 'effectiveType', {
+					get: () => '4g',
+					configurable: true,
+				});
 			}
-			if (parameter === 37446) {
-				return 'Intel Iris OpenGL Engine';
+
+			// Hide headless by fixing Screen properties
+			Object.defineProperty(screen, 'width', { get: () => 1920, configurable: true });
+			Object.defineProperty(screen, 'height', { get: () => 1080, configurable: true });
+			Object.defineProperty(screen, 'availWidth', { get: () => 1920, configurable: true });
+			Object.defineProperty(screen, 'availHeight', { get: () => 1040, configurable: true });
+			Object.defineProperty(screen, 'colorDepth', { get: () => 24, configurable: true });
+			Object.defineProperty(screen, 'pixelDepth', { get: () => 24, configurable: true });
+
+			// Add missing window properties
+			if (window.speechSynthesis) {
+				Object.defineProperty(window.speechSynthesis, 'speaking', { get: () => false });
 			}
-			return getParameter.apply(this, arguments);
-		};
+			if (window.AudioContext) {
+				const origCreateOscillator = AudioContext.prototype.createOscillator;
+				AudioContext.prototype.createOscillator = function() {
+					const osc = origCreateOscillator.apply(this, arguments);
+					osc.type = 'sine';
+					osc.frequency.value = 440;
+					return osc;
+				};
+			}
+		})();
 	`
 
 	LazyLoadScript = `
@@ -910,46 +1017,54 @@ const (
 	`
 
 	SingleFileScript = `
-		(function() {
-			function inlineResources() {
-				// Inline CSS
-				const styles = document.querySelectorAll('link[rel="stylesheet"]');
-				styles.forEach(link => {
-					const href = link.href;
+		(async function() {
+			const tasks = [];
+
+			// Inline CSS
+			document.querySelectorAll('link[rel="stylesheet"]').forEach(link => {
+				const href = link.href;
+				if (!href) return;
+				tasks.push(
 					fetch(href).then(r => r.text()).then(css => {
 						const style = document.createElement('style');
 						style.textContent = css;
 						link.parentNode.replaceChild(style, link);
-					}).catch(() => {});
-				});
+					}).catch(() => {})
+				);
+			});
 
-				// Inline scripts
-				const scripts = document.querySelectorAll('script[src]');
-				scripts.forEach(script => {
-					const src = script.src;
+			// Inline scripts
+			document.querySelectorAll('script[src]').forEach(script => {
+				const src = script.src;
+				if (!src) return;
+				tasks.push(
 					fetch(src).then(r => r.text()).then(js => {
 						const inline = document.createElement('script');
 						inline.textContent = js;
 						script.parentNode.replaceChild(inline, script);
-					}).catch(() => {});
-				});
+					}).catch(() => {})
+				);
+			});
 
-				// Inline images as data URLs (optional, can be large)
-				const images = document.querySelectorAll('img[src]');
-				images.forEach(img => {
-					const src = img.src;
-					if (src.startsWith('data:')) return;
+			// Inline images as data URLs
+			document.querySelectorAll('img[src]').forEach(img => {
+				const src = img.src;
+				if (!src || src.startsWith('data:')) return;
+				tasks.push(
 					fetch(src).then(r => r.blob()).then(blob => {
-						const reader = new FileReader();
-						reader.onloadend = () => {
-							img.src = reader.result;
-						};
-						reader.readAsDataURL(blob);
-					}).catch(() => {});
-				});
-			}
+						return new Promise((resolve) => {
+							const reader = new FileReader();
+							reader.onloadend = () => {
+								img.src = reader.result;
+								resolve();
+							};
+							reader.readAsDataURL(blob);
+						});
+					}).catch(() => {})
+				);
+			});
 
-			inlineResources();
+			await Promise.all(tasks);
 			return document.documentElement.outerHTML;
 		})()
 	`

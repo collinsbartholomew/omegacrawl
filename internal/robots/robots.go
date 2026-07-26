@@ -1,6 +1,7 @@
 package robots
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/url"
@@ -10,8 +11,10 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/user/clone/internal/config"
+	"github.com/user/clone/internal/httpclient"
 	"github.com/user/clone/internal/util"
 )
 
@@ -24,10 +27,13 @@ type RobotsEntry struct {
 }
 
 type RobotsParser struct {
-	cache      map[string]*RobotsEntry
-	mu         sync.RWMutex
-	cacheTTL   time.Duration
-	userAgent  string
+	cache        map[string]*RobotsEntry
+	mu           sync.RWMutex
+	cacheTTL     time.Duration
+	userAgent    string
+	ruleCache    map[string]*regexp.Regexp
+	ruleCacheMu  sync.RWMutex
+	fetchGroup   singleflight.Group
 }
 
 func NewRobotsParser() *RobotsParser {
@@ -35,6 +41,7 @@ func NewRobotsParser() *RobotsParser {
 		cache:     make(map[string]*RobotsEntry),
 		cacheTTL:  24 * time.Hour,
 		userAgent: "*",
+		ruleCache: make(map[string]*regexp.Regexp),
 	}
 }
 
@@ -64,10 +71,14 @@ func (rp *RobotsParser) CanCrawl(rawURL string, userAgent string, cfg *config.Co
 		return rp.evaluateRules(entry, u.Path, cfg)
 	}
 
-	entry = rp.fetchRobots(robotsURL)
-	rp.mu.Lock()
-	rp.cache[robotsURL] = entry
-	rp.mu.Unlock()
+	res, _, _ := rp.fetchGroup.Do(robotsURL, func() (interface{}, error) {
+		entry := rp.fetchRobots(robotsURL)
+		rp.mu.Lock()
+		rp.cache[robotsURL] = entry
+		rp.mu.Unlock()
+		return entry, nil
+	})
+	entry = res.(*RobotsEntry)
 
 	return rp.evaluateRules(entry, u.Path, cfg)
 }
@@ -123,6 +134,29 @@ func (rp *RobotsParser) evaluateRules(entry *RobotsEntry, path string, cfg *conf
 	return true, delay
 }
 
+func (rp *RobotsParser) compileRule(rule string) *regexp.Regexp {
+	rp.ruleCacheMu.RLock()
+	if re, ok := rp.ruleCache[rule]; ok {
+		rp.ruleCacheMu.RUnlock()
+		return re
+	}
+	rp.ruleCacheMu.RUnlock()
+
+	regexPattern := "^" + regexp.QuoteMeta(rule)
+	regexPattern = strings.ReplaceAll(regexPattern, "\\*", ".*")
+	regexPattern = strings.ReplaceAll(regexPattern, "\\$", "$")
+
+	re, err := regexp.Compile(regexPattern)
+	if err != nil {
+		return nil
+	}
+
+	rp.ruleCacheMu.Lock()
+	rp.ruleCache[rule] = re
+	rp.ruleCacheMu.Unlock()
+	return re
+}
+
 func (rp *RobotsParser) matchPath(rule, path string) bool {
 	if rule == "" {
 		return false
@@ -132,16 +166,12 @@ func (rp *RobotsParser) matchPath(rule, path string) bool {
 		return strings.HasPrefix(path, rule)
 	}
 
-	regexPattern := "^" + regexp.QuoteMeta(rule)
-	regexPattern = strings.ReplaceAll(regexPattern, "\\*", ".*")
-	regexPattern = strings.ReplaceAll(regexPattern, "\\$", "$")
-
-	matched, err := regexp.MatchString(regexPattern, path)
-	if err != nil {
+	re := rp.compileRule(rule)
+	if re == nil {
 		return strings.HasPrefix(path, strings.TrimSuffix(rule, "*"))
 	}
 
-	return matched
+	return re.MatchString(path)
 }
 
 func (rp *RobotsParser) fetchRobots(robotsURL string) *RobotsEntry {
@@ -149,11 +179,15 @@ func (rp *RobotsParser) fetchRobots(robotsURL string) *RobotsEntry {
 		fetchedAt: time.Now(),
 	}
 
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", robotsURL, nil)
+	if err != nil {
+		util.LogDebug("failed to create robots.txt request", zap.Error(err))
+		return entry
 	}
 
-	resp, err := client.Get(robotsURL)
+	resp, err := httpclient.GlobalClient().Do(req)
 	if err != nil {
 		util.LogDebug("failed to fetch robots.txt", zap.String("url", robotsURL), zap.Error(err))
 		return entry
@@ -289,8 +323,13 @@ func (rp *RobotsParser) ClearExpired() {
 func (rp *RobotsParser) FetchSitemapURLs(sitemapURL string) []string {
 	var urls []string
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(sitemapURL)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", sitemapURL, nil)
+	if err != nil {
+		return nil
+	}
+	resp, err := httpclient.GlobalClient().Do(req)
 	if err != nil {
 		util.LogDebug("failed to fetch sitemap", zap.String("url", sitemapURL), zap.Error(err))
 		return nil

@@ -2,9 +2,7 @@ package crawler
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -15,24 +13,26 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/time/rate"
-
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/cdproto/page"
 	cdpruntime "github.com/chromedp/cdproto/runtime"
-	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
+	"golang.org/x/net/html"
+	"golang.org/x/sync/errgroup"
 	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/auth"
 	"github.com/user/clone/internal/captcha"
 	"github.com/user/clone/internal/changedetection"
 	"github.com/user/clone/internal/config"
+	"github.com/user/clone/internal/jsanalyzer"
 	"github.com/user/clone/internal/jsengine"
 	netintercept "github.com/user/clone/internal/network"
 	"github.com/user/clone/internal/queue"
@@ -40,19 +40,13 @@ import (
 	"github.com/user/clone/internal/robots"
 	"github.com/user/clone/internal/storage"
 	"github.com/user/clone/internal/util"
+
+	"github.com/cespare/xxhash/v2"
+	clientpool "github.com/user/clone/internal/httpclient"
+	crawlerrors "github.com/user/clone/internal/errors"
+	"github.com/user/clone/internal/ratelimit"
+	"github.com/user/clone/internal/resilience"
 )
-
-var randSource = &lockedRand{src: rand.NewSource(time.Now().UnixNano())}
-type lockedRand struct {
-	src rand.Source
-	mu  sync.Mutex
-}
-
-func (r *lockedRand) Intn(n int) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return rand.New(r.src).Intn(n)
-}
 
 type JSError struct {
 	URL     string `json:"url"`
@@ -122,8 +116,6 @@ type Crawler struct {
 	cfg                *config.Config
 	storage            *storage.Filesystem
 	warc               *storage.WARCWriter
-	activeWarc         bool
-	warcMutex          sync.Mutex
 
 	hostSemaphores     map[string]*hostSem
 	exactDedup         *util.LRUSet
@@ -132,37 +124,17 @@ type Crawler struct {
 	jsErrors           *util.BoundedQueue
 	wsMessages         *util.BoundedQueue
 	apiResponses       *util.BoundedQueue
-	warcWriterPool     chan struct{}
-	hostBackoffs       map[string]time.Duration
-	hostActiveRequests atomic.Int64
-	nextHostBackoff    atomic.Int32
-	hostLock           sync.RWMutex
 
 	browserMu          sync.Mutex
-	activeTabContexts  map[*chromedp.Context]bool
 	browserCancel      context.CancelFunc
-	chromeCtx          context.Context
-	browserPoolSize    int
-
-	visitedURLs        map[string]*URLVisitInfo
-	lastVisitTime      map[string]time.Time
-	visitLock          sync.RWMutex
-
-	rateLimiter        *rate.Limiter
-	hostRateLimiters   map[string]*rate.Limiter
-	rateLimiterLock    sync.RWMutex
-
-	pageCount          atomic.Int64
-	assetCount         atomic.Int64
-	errorCount         atomic.Int64
-	pageBytes          atomic.Int64
 
 	robotsParser       *robots.RobotsParser
 	rewriter           *rewrite.Rewriter
 	urlQueue        queue.Queue
 	persistentQueue *queue.PersistentQueue
 	bloomFilter        *queue.BloomDedup
-	adaptiveLimiter    *AdaptiveRateLimiter
+	rateLimiter        *ratelimit.RateLimiter
+	circuitBreaker     *resilience.HostCircuitBreaker
 	retryConfig        *RetryConfig
 	checkpoint         *Checkpoint
 	semaphore          chan struct{}
@@ -193,22 +165,39 @@ type Crawler struct {
 	authManager        *auth.AuthManager
 	changeDetector    *changedetection.Detector
 	captchaSolver     *captcha.Solver
+
 }
+
+
 
 type hostSem struct {
 	ch       chan struct{}
 	closed   atomic.Bool
-	waiters  atomic.Int64
 }
 
-type URLVisitInfo struct {
-	URL           string
-	Depth         int
-	FirstVisit    time.Time
-	VisitCount    int
-	LastError     error
-	ParentURL     string
-	DiscoveredFrom map[string]bool
+type BrowserPool struct {
+	browsers   chan context.Context
+	workers    int
+}
+
+func NewBrowserPool(workSize int) *BrowserPool {
+	browsers := make(chan context.Context, workSize)
+	return &BrowserPool{
+		browsers: browsers,
+		workers:  workSize,
+	}
+}
+
+func (bp *BrowserPool) GetContext() context.Context {
+	return <-bp.browsers
+}
+
+func (bp *BrowserPool) ReleaseContext(ctx context.Context) {
+	bp.browsers <- ctx
+}
+
+func (bp *BrowserPool) Close() {
+	close(bp.browsers)
 }
 
 func NewCrawler(cfg *config.Config) (*Crawler, error) {
@@ -244,6 +233,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 
 	urlQueue, err := queue.NewQueueFromConfig(cfg.QueueConfig)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("failed to create queue: %w", err)
 	}
 	var persistentQueue *queue.PersistentQueue
@@ -251,31 +241,17 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		persistentQueue = pq
 	}
 
-	httpClient := &http.Client{
-		Timeout: 15 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("too many redirects")
-			}
-			if len(cfg.AllowedDomains) > 0 {
-				host := getHost(req.URL.String())
-				allowed := false
-				for _, domain := range cfg.AllowedDomains {
-					if host == domain || strings.HasSuffix(host, "."+domain) {
-						allowed = true
-						break
-					}
-				}
-				if !allowed {
-					return fmt.Errorf("redirect to non-allowed domain: %s", host)
-				}
-			}
-			return nil
-		},
-		Transport: &http.Transport{
-			TLSClientConfig: cfg.TLSConfig(),
-		},
-	}
+	clientPool := clientpool.NewClientPool(&clientpool.ClientConfig{
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       10,
+		IdleConnTimeout:       90 * time.Second,
+		ConnectTimeout:        15 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		DisableCompression:    false,
+	})
+	httpClient := clientPool.Client()
 
 	lruSize := cfg.MaxTotalURLs
 	if lruSize < 100000 {
@@ -285,11 +261,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	hostLastCrawl := make(map[string]time.Time)
 	hostURLCount := make(map[string]int)
 	hostSemaphores := make(map[string]*hostSem)
-	hostBackoffs := make(map[string]time.Duration)
-	visitedURLs := make(map[string]*URLVisitInfo)
-	lastVisitTime := make(map[string]time.Time)
 	discoveredRoutes := make(map[string]bool)
-	hostRateLimiters := make(map[string]*rate.Limiter)
 
 	c := &Crawler{
 		cfg:              cfg,
@@ -300,7 +272,8 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		persistentQueue: persistentQueue,
 		bloomFilter:      bloomFilter,
 		exactDedup:       util.NewLRUSet(lruSize),
-		adaptiveLimiter:  NewAdaptiveRateLimiter(cfg.CrawlDelay, 1),
+		rateLimiter:      ratelimit.New(cfg.CrawlDelay, 1),
+		circuitBreaker:   resilience.NewHostCircuitBreaker(),
 		retryConfig:      retryConfig,
 		checkpoint:       NewCheckpoint(cfg.CheckpointFile),
 		semaphore:        sem,
@@ -310,8 +283,6 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		hostLastCrawl:    hostLastCrawl,
 		hostURLCount:     hostURLCount,
 		hostSemaphores:   hostSemaphores,
-		hostBackoffs:     hostBackoffs,
-		hostRateLimiters: hostRateLimiters,
 		contentHashes:    util.NewLRUSet(maxContentHashes),
 		discoveredRoutes: discoveredRoutes,
 		jsErrors:         util.NewBoundedQueue(maxJSErrors),
@@ -322,19 +293,9 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		incCache:         storage.NewResourceCache(cfg.IncCacheFile),
 		cookieJar:        make(map[string][]*http.Cookie),
 		wsURLs:           make(map[network.RequestID]string),
-		visitedURLs:      visitedURLs,
-		lastVisitTime:    lastVisitTime,
-		activeTabContexts: make(map[*chromedp.Context]bool),
-		warcWriterPool:   make(chan struct{}, 1),
-		warcMutex:        sync.Mutex{},
-		rateLimiter:      rate.NewLimiter(rate.Every(cfg.CrawlDelay), 1),
-		rateLimiterLock:  sync.RWMutex{},
-		hostLock:         sync.RWMutex{},
-		visitLock:        sync.RWMutex{},
 		hostMu:           sync.RWMutex{},
 		routeMu:          sync.RWMutex{},
 		browserMu:        sync.Mutex{},
-		browserPoolSize:  3,
 	}
 
 	c.authManager = auth.NewAuthManager(c.cfg.AuthConfig)
@@ -361,6 +322,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 func (c *Crawler) Stop() {
 	c.shutdown.Store(true)
 	c.cancel()
+	c.rateLimiter.Stop()
 }
 
 func (c *Crawler) Start(seeds []string) error {
@@ -418,11 +380,14 @@ func (c *Crawler) Start(seeds []string) error {
 		chromedp.Flag("disable-sync", true),
 		chromedp.Flag("no-first-run", true),
 		chromedp.Flag("window-size", fmt.Sprintf("%d,%d", c.cfg.ViewportWidth, c.cfg.ViewportHeight)),
+		chromedp.Flag("disable-features", "TranslateUI,ChromeWhatsNewUI"),
+		chromedp.Flag("disable-component-update", true),
 	)
 	if c.cfg.EnableStealth {
 		c.allocOpts = append(c.allocOpts,
 			chromedp.Flag("disable-blink-features", "AutomationControlled"),
 			chromedp.Flag("excludeSwitches", "enable-automation"),
+			chromedp.Flag("disable-renderer-backgrounding", true),
 		)
 	}
 	proxy := c.selectProxy()
@@ -438,6 +403,8 @@ func (c *Crawler) Start(seeds []string) error {
 	go c.periodicCheckpoint()
 	go c.reportProgress()
 	go c.periodicCleanup()
+
+	c.loadCookieJar()
 
 	util.LogInfo("starting crawl",
 		zap.Int("seeds", len(seeds)),
@@ -482,9 +449,12 @@ Loop:
 		c.hostURLCount[host]++
 		c.hostMu.Unlock()
 
-hostSem := c.getHostSem(host)
+hs := c.getHostSem(host)
+	if hs.closed.Load() {
+		hs = &hostSem{ch: make(chan struct{}, 2)}
+	}
 	select {
-	case hostSem.ch <- struct{}{}:
+	case hs.ch <- struct{}{}:
 	case <-c.ctx.Done():
 		continue
 	}
@@ -492,31 +462,37 @@ hostSem := c.getHostSem(host)
 	ua := cfgUserAgent(c.cfg)
 	canCrawl, crawlDelay := c.robotsParser.CanCrawl(item.URL, ua, c.cfg)
 	if !canCrawl {
-		<-hostSem.ch
+		<-hs.ch
 		util.LogDebug("blocked by robots.txt", zap.String("url", item.URL))
 		continue
 	}
 
 	startTime := time.Now()
-	c.adaptiveLimiter.Wait(c.ctx, host, crawlDelay)
+	c.rateLimiter.Wait(c.ctx, host, crawlDelay)
+
+	if !c.circuitBreaker.Allow(host) {
+		<-hs.ch
+		util.LogDebug("circuit open, skipping", zap.String("host", host))
+		continue
+	}
 
 	c.wg.Add(1)
 	select {
 	case c.semaphore <- struct{}{}:
 	case <-c.ctx.Done():
-		<-hostSem.ch
-			c.wg.Done()
-			break Loop
-		}
+		<-hs.ch
+		c.wg.Done()
+		break Loop
+	}
 
-		go func(url string, depth int, hst string, start time.Time) {
-			defer c.wg.Done()
-			defer func() { <-c.semaphore }()
-			defer func() { <-c.getHostSem(hst).ch }()
-			defer func() {
-				latency := time.Since(start)
-				c.adaptiveLimiter.ObserveLatency(hst, latency)
-			}()
+	go func(url string, depth int, hst string, start time.Time) {
+		defer c.wg.Done()
+		defer func() { <-c.semaphore }()
+		defer func() { <-c.getHostSem(hst).ch }()
+		defer func() {
+			latency := time.Since(start)
+			c.rateLimiter.ObserveLatency(hst, latency)
+		}()
 
 			defer func() {
 				if r := recover(); r != nil {
@@ -535,6 +511,7 @@ hostSem := c.getHostSem(host)
 		}(item.URL, item.Depth, host, startTime)
 	}
 
+	drainTimer := time.NewTimer(drainTimeout)
 	drainDone := make(chan struct{})
 	go func() {
 		c.wg.Wait()
@@ -543,7 +520,8 @@ hostSem := c.getHostSem(host)
 
 	select {
 	case <-drainDone:
-	case <-time.After(drainTimeout):
+		drainTimer.Stop()
+	case <-drainTimer.C:
 		util.LogInfo("drain timeout reached, continuing")
 	}
 	close(c.checkpointDone)
@@ -551,10 +529,14 @@ hostSem := c.getHostSem(host)
 	c.storage.WriteIndex()
 	c.writeJSErrors()
 	c.writeWSMessages()
-	c.writeAPIResponses()
-	c.writeHAR()
-	c.writeSW()
+
+	apiResponses := c.apiResponses.GetAll()
+	wsRaw := c.wsMessages.GetAll()
+	c.writeAPIResponses(apiResponses)
+	c.writeHAR(apiResponses)
+	c.writeSW(apiResponses, wsRaw)
 	c.writeSitemap()
+	c.saveCookieJar()
 	if c.warc != nil {
 		c.warc.Close()
 	}
@@ -570,12 +552,15 @@ hostSem := c.getHostSem(host)
 	}
 
 	pages, assets, errors, bytes := c.metrics.Snapshot()
+	c.routeMu.RLock()
+	routes := len(c.discoveredRoutes)
+	c.routeMu.RUnlock()
 	util.LogInfo("crawl completed",
 		zap.Int64("pages", pages),
 		zap.Int64("assets", assets),
 		zap.Int64("errors", errors),
 		zap.Int64("bytes", bytes),
-		zap.Int("routes", len(c.discoveredRoutes)),
+		zap.Int("routes", routes),
 	)
 
 	if c.cfg.Incremental && c.incCache != nil {
@@ -662,8 +647,7 @@ func (c *Crawler) writeWSMessages() {
 	util.LogInfo("wrote WS messages", zap.String("path", path), zap.Int("count", len(wsMessages)))
 }
 
-func (c *Crawler) writeAPIResponses() {
-	responses := c.apiResponses.GetAll()
+func (c *Crawler) writeAPIResponses(responses []interface{}) {
 	if len(responses) == 0 {
 		return
 	}
@@ -754,8 +738,7 @@ type harFile struct {
 	Log harLog `json:"log"`
 }
 
-func (c *Crawler) writeHAR() {
-	responses := c.apiResponses.GetAll()
+func (c *Crawler) writeHAR(responses []interface{}) {
 	if len(responses) == 0 {
 		return
 	}
@@ -827,12 +810,11 @@ func (c *Crawler) writeHAR() {
 				HTTPVersion: "HTTP/2",
 				Headers:     headers,
 				Cookies:     cookies,
-				Content: harContent{
-					Size:     bodySize,
-					MimeType: mimeType,
-					Text:     string(a.Body),
-					Encoding: "base64",
-				},
+			Content: harContent{
+				Size:     bodySize,
+				MimeType: mimeType,
+				Text:     string(a.Body),
+			},
 				RedirectURL: "",
 				HeadersSize: headersSize,
 				BodySize:    bodySize,
@@ -871,8 +853,7 @@ func (c *Crawler) writeHAR() {
 	util.LogInfo("wrote HAR", zap.String("path", path), zap.Int("count", len(entries)))
 }
 
-func (c *Crawler) writeSW() {
-	responses := c.apiResponses.GetAll()
+func (c *Crawler) writeSW(responses []interface{}, wsRaw []interface{}) {
 	apiResp := make([]CapturedAPIResponse, 0, len(responses))
 	for _, r := range responses {
 		if a, ok := r.(CapturedAPIResponse); ok {
@@ -880,7 +861,6 @@ func (c *Crawler) writeSW() {
 		}
 	}
 
-	wsRaw := c.wsMessages.GetAll()
 	wsByURL := make(map[string][]WSMsg)
 	for _, w := range wsRaw {
 		if m, ok := w.(WSMsg); ok && m.URL != "" {
@@ -1224,12 +1204,12 @@ self.addEventListener('fetch', event => {
 }
 
 func (c *Crawler) writeSitemap() {
-	c.visitLock.RLock()
-	urls := make([]string, 0, len(c.visitedURLs))
-	for u := range c.visitedURLs {
+	c.routeMu.RLock()
+	urls := make([]string, 0, len(c.discoveredRoutes))
+	for u := range c.discoveredRoutes {
 		urls = append(urls, u)
 	}
-	c.visitLock.RUnlock()
+	c.routeMu.RUnlock()
 	if len(urls) == 0 {
 		return
 	}
@@ -1337,8 +1317,6 @@ func (c *Crawler) getBrowserCtx() context.Context {
 
 func (c *Crawler) restartBrowser() context.Context {
 	c.browserMu.Lock()
-	defer c.browserMu.Unlock()
-
 	if c.browserCancel != nil {
 		c.browserCancel()
 	}
@@ -1349,6 +1327,7 @@ func (c *Crawler) restartBrowser() context.Context {
 	if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
 		allocCancel()
 		browserCancel()
+		c.browserMu.Unlock()
 		util.LogError("browser restart failed", err)
 		return nil
 	}
@@ -1363,13 +1342,15 @@ func (c *Crawler) restartBrowser() context.Context {
 		allocCancel()
 		browserCancel()
 	}
+	c.browserMu.Unlock()
 	util.LogInfo("browser restarted successfully")
-	return c.browserCtx
+	return browserCtx
 }
 
 func (c *Crawler) crawlPage(ctx context.Context, urlStr string, depth int) {
 	c.totalURLs.Add(1)
 
+	host := getHost(urlStr)
 	util.LogInfo("crawling", zap.String("url", urlStr), zap.Int("depth", depth))
 
 	var lastErr error
@@ -1410,17 +1391,18 @@ func (c *Crawler) crawlPage(ctx context.Context, urlStr string, depth int) {
 
 		lastErr = c.doCrawl(browserCtx, urlStr, depth)
 		if lastErr == nil {
+			c.circuitBreaker.Success(host)
 			return
 		}
 
-		if retryErr, ok := lastErr.(*RetryableError); ok {
-			if !retryErr.Retryable {
-				break
-			}
+		crawlErr := crawlerrors.Classify(lastErr)
+		if !crawlErr.Retryable {
+			break
 		}
 	}
 
 	if lastErr != nil {
+		c.circuitBreaker.Failure(host)
 		util.LogError("failed", lastErr, zap.String("url", urlStr))
 		c.metrics.IncErrors()
 	}
@@ -1588,6 +1570,11 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		}
 	}
 
+	// Systematic interaction engine - click all links, fill forms, etc.
+	if c.cfg.EnableInteractionEngine {
+		c.runInteractionEngine(tabCtx, urlStr)
+	}
+
 	if c.cfg.EnableRouteDiscovery {
 		routeInfo, err := jsengine.DiscoverRoutes(tabCtx)
 		if err == nil && routeInfo != nil {
@@ -1606,18 +1593,82 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		// Collect pushState/hashchange/popstate routes
 		pushRoutes, err := jsengine.GetPushStateRoutes(tabCtx)
 		if err == nil && len(pushRoutes) > 0 {
+			routesToCrawl := make([]string, 0, len(pushRoutes))
 			c.routeMu.Lock()
 			for _, pr := range pushRoutes {
 				absURL := rewrite.ResolveURL(urlStr, pr.URL)
 				if absURL != "" {
-					c.discoveredRoutes[absURL] = true
+					if !c.discoveredRoutes[absURL] {
+						c.discoveredRoutes[absURL] = true
+						routesToCrawl = append(routesToCrawl, absURL)
+					}
 				}
 			}
 			c.routeMu.Unlock()
+
 			util.LogDebug("discovered pushState routes",
 				zap.String("url", urlStr),
 				zap.Int("count", len(pushRoutes)),
+				zap.Int("new_routes", len(routesToCrawl)),
 			)
+
+			// Navigate to discovered SPA routes to capture dynamically rendered content
+			if c.cfg.MaxSPARoutes > 0 && len(routesToCrawl) > c.cfg.MaxSPARoutes {
+				routesToCrawl = routesToCrawl[:c.cfg.MaxSPARoutes]
+			}
+			for _, routeURL := range routesToCrawl {
+				select {
+				case <-c.ctx.Done():
+					break
+				default:
+				}
+				util.LogDebug("navigating to SPA route", zap.String("route", routeURL))
+				navCtx, navCancel := context.WithTimeout(tabCtx, 30*time.Second)
+				err := chromedp.Run(navCtx,
+					chromedp.ActionFunc(func(ctx context.Context) error {
+						_, _, errorText, err := page.Navigate(routeURL).Do(ctx)
+						if err != nil {
+							return err
+						}
+						if errorText != "" {
+							return fmt.Errorf("navigation error: %s", errorText)
+						}
+						return nil
+					}),
+				)
+				navCancel()
+				if err != nil {
+					util.LogDebug("failed to navigate to SPA route",
+						zap.String("route", routeURL),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				// Wait for SPA to hydrate and render
+				waitCtx, waitCancel := context.WithTimeout(tabCtx, 15*time.Second)
+				chromedp.Run(waitCtx, chromedp.WaitReady("body", chromedp.ByQuery))
+				// Wait for network idle after SPA navigation
+				jsengine.WaitForNetworkIdle(waitCtx, 1*time.Second)
+				// Additional wait for dynamic content
+				chromedp.Sleep(2 * time.Second).Do(waitCtx)
+				waitCancel()
+
+				// Capture the rendered HTML
+				var spaHTML string
+				if err := chromedp.Run(tabCtx, chromedp.OuterHTML("html", &spaHTML)); err != nil || spaHTML == "" {
+					continue
+				}
+
+				// Save the SPA route content
+				spaPath, err := c.storage.SaveHTML(routeURL, []byte(spaHTML))
+				if err != nil {
+					util.LogDebug("failed to save SPA route HTML", zap.Error(err))
+					continue
+				}
+				c.rewriter.AddMapping(routeURL, spaPath)
+				util.LogDebug("captured SPA route", zap.String("route", routeURL), zap.String("path", spaPath))
+			}
 		}
 	}
 
@@ -1674,11 +1725,48 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	}
 
 	var html string
-	if err := chromedp.Run(tabCtx, chromedp.OuterHTML("html", &html)); err != nil || html == "" {
-		chromedp.Run(tabCtx, chromedp.Evaluate(`document.documentElement ? document.documentElement.outerHTML : document.body ? document.body.outerHTML : ''`, &html))
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(`
+		(function() {
+			function serializeShadowDOM(root) {
+				var elements = root.querySelectorAll('*');
+				elements.forEach(function(el) {
+					if (el.shadowRoot) {
+						var template = document.createElement('template');
+						template.innerHTML = '<!---- shadowrootmode=open ---->' + el.shadowRoot.innerHTML + '<!---- /shadowrootmode ---->';
+						el.appendChild(template.content);
+					}
+				});
+			}
+			serializeShadowDOM(document);
+			var doc = document.documentElement;
+			if (!doc) return document.body ? document.body.outerHTML : '';
+			return '<!DOCTYPE html>' + doc.outerHTML;
+		})()
+	`, &html)); err != nil || html == "" {
+		chromedp.Run(tabCtx, chromedp.Evaluate(`
+			(function() {
+				function serializeShadowDOM(root) {
+					root.querySelectorAll('*').forEach(function(el) {
+						if (el.shadowRoot) {
+							var t = document.createElement('template');
+							t.innerHTML = el.shadowRoot.innerHTML;
+							el.appendChild(t.content);
+						}
+					});
+				}
+				serializeShadowDOM(document);
+				return document.documentElement ? '<!DOCTYPE html>' + document.documentElement.outerHTML : '';
+			})()
+		`, &html))
+		if html == "" {
+			chromedp.Run(tabCtx, chromedp.OuterHTML("html", &html))
+			if html != "" {
+				html = "<!DOCTYPE html>\n" + html
+			}
+		}
 	}
 	if html == "" {
-		chromedp.Run(tabCtx, chromedp.Evaluate(`document.body ? document.body.innerHTML : document.documentElement ? document.documentElement.textContent : ''`, &html))
+		chromedp.Run(tabCtx, chromedp.Evaluate(`document.body ? document.body.innerHTML : ''`, &html))
 	}
 
 	if c.changeDetector != nil {
@@ -1765,13 +1853,14 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 
 	netIntercept.FetchBodies(rawTabCtx)
 
+	// First pass: save all CDP-captured resources
+	cdpSaved := make(map[string]bool)
 	for origURL, resource := range netIntercept.GetResources() {
 		if c.cfg.Incremental && resource.StatusCode == 304 {
 			continue
 		}
 
-		hash := sha256.Sum256(resource.Body)
-		hashStr := hex.EncodeToString(hash[:])
+		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
 
 		dup := c.contentHashes.Contains(hashStr)
 		if !dup {
@@ -1816,6 +1905,40 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		if c.cfg.Incremental && c.incCache != nil {
 			c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
 		}
+		cdpSaved[origURL] = true
+	}
+
+	// HTTP fallback: download CDP-seen resources where body fetch failed
+	for _, missingURL := range netIntercept.GetMissingResources() {
+		if !isValidURL(missingURL) || !c.isAllowedDomain(missingURL) || c.isExcluded(missingURL) {
+			continue
+		}
+		if cdpSaved[missingURL] {
+			continue
+		}
+		resource, err := netIntercept.DownloadResourceViaHTTP(missingURL)
+		if err != nil || resource == nil || len(resource.Body) == 0 {
+			continue
+		}
+		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
+		if c.contentHashes.Contains(hashStr) {
+			continue
+		}
+		c.contentHashes.Add(hashStr)
+		localPath, err := c.storage.SaveFile(missingURL, resource.Body, resource.MimeType)
+		if err != nil {
+			continue
+		}
+		c.rewriter.AddMapping(missingURL, localPath)
+		relPath, _ := filepath.Rel(filepath.Dir(htmlLocalPath), localPath)
+		c.rewriter.AddAbsoluteToRelMapping(missingURL, filepath.ToSlash(relPath))
+		c.metrics.IncAssetsCaptured()
+		c.metrics.AddBytes(int64(len(resource.Body)))
+	}
+
+	// Download assets from HTML not seen by CDP at all
+	if html != "" {
+		c.downloadHTMLAssets(urlStr, html, htmlLocalPath, netIntercept, cdpSaved)
 	}
 
 	for cssPath := range c.rewriter.GetCSSFiles() {
@@ -1828,9 +1951,7 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			for _, fontURL := range fontURLs {
 				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
 				if absFontURL != "" && isValidURL(absFontURL) {
-					// Check if already downloaded
 					if !c.bloomFilter.HasSeen(absFontURL) && !c.exactDedup.Contains(absFontURL) {
-						// Download the font
 						fontResp, err := c.httpClient.Get(absFontURL)
 						if err == nil && fontResp.StatusCode == 200 {
 							fontBody, _ := io.ReadAll(fontResp.Body)
@@ -1847,8 +1968,32 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 					}
 				}
 			}
+
+			// Extract and download ALL CSS url() references (background images, etc.)
+			cssURLs := c.rewriter.ExtractAllCSSURLs(cssData)
+			for _, cssURL := range cssURLs {
+				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
+				if absCSSURL != "" && isValidURL(absCSSURL) {
+					if !c.bloomFilter.HasSeen(absCSSURL) && !c.exactDedup.Contains(absCSSURL) {
+						cssResp, err := c.httpClient.Get(absCSSURL)
+						if err == nil && cssResp.StatusCode == 200 {
+							cssBody, _ := io.ReadAll(cssResp.Body)
+							cssResp.Body.Close()
+							if len(cssBody) > 0 {
+								localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
+								if err == nil {
+									c.rewriter.AddMapping(absCSSURL, localPath)
+									c.metrics.IncAssetsCaptured()
+									c.metrics.AddBytes(int64(len(cssBody)))
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 	}
+	c.resolveJSDependencies(htmlLocalPath, urlStr)
 	c.rewriter.ProcessFiles(map[string]string{htmlLocalPath: "html"})
 
 	links := c.rewriter.ExtractLinks(urlStr, []byte(html))
@@ -1992,6 +2137,303 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	return nil
 }
 
+func (c *Crawler) downloadHTMLAssets(baseURL, pageHTML, htmlLocalPath string, netIntercept *netintercept.Interceptor, cdpSaved map[string]bool) {
+	c.rewriter.SetBaseURL(baseURL)
+
+	assetURLs := make(map[string]bool)
+	tokenizer := html.NewTokenizer(strings.NewReader(pageHTML))
+	for {
+		tt := tokenizer.Next()
+		if tt == html.ErrorToken {
+			break
+		}
+		if tt != html.StartTagToken && tt != html.SelfClosingTagToken {
+			continue
+		}
+		_, hasAttr := tokenizer.TagName()
+
+		var attrs []struct{ k, v string }
+		if hasAttr {
+			for {
+				k, v, more := tokenizer.TagAttr()
+				attrs = append(attrs, struct{ k, v string }{string(k), string(v)})
+				if !more {
+					break
+				}
+			}
+		}
+
+		for _, attr := range attrs {
+			ak := attr.k
+			av := attr.v
+			if av == "" || av == "#" || strings.HasPrefix(av, "javascript:") || strings.HasPrefix(av, "mailto:") || strings.HasPrefix(av, "data:") {
+				continue
+			}
+			var resourceURL string
+			switch ak {
+			case "src", "href", "action", "poster", "data":
+				resourceURL = av
+			case "srcset":
+				parts := strings.Split(av, ",")
+				for _, part := range parts {
+					urlPart := strings.TrimSpace(strings.Split(strings.TrimSpace(part), " ")[0])
+					if urlPart != "" {
+						absURL := rewrite.ResolveURL(baseURL, urlPart)
+						if absURL != "" && isValidURL(absURL) {
+							assetURLs[absURL] = true
+						}
+					}
+				}
+				continue
+			default:
+				if strings.HasPrefix(ak, "data-") && (strings.Contains(ak, "src") || strings.Contains(ak, "url") || strings.Contains(ak, "bg") || strings.Contains(ak, "image") || strings.Contains(ak, "lazy")) {
+					resourceURL = av
+				}
+			}
+			if resourceURL == "" {
+				continue
+			}
+			absURL := rewrite.ResolveURL(baseURL, resourceURL)
+			if absURL != "" && isValidURL(absURL) {
+				assetURLs[absURL] = true
+			}
+		}
+	}
+
+	var g errgroup.Group
+	g.SetLimit(5)
+	for assetURL := range assetURLs {
+		if cdpSaved[assetURL] {
+			continue
+		}
+		if c.bloomFilter.HasSeen(assetURL) || c.exactDedup.Contains(assetURL) {
+			continue
+		}
+		if !c.isAllowedDomain(assetURL) || c.isExcluded(assetURL) {
+			continue
+		}
+
+		u := assetURL
+		g.Go(func() error {
+			resource, err := netIntercept.DownloadResourceViaHTTP(u)
+			if err != nil || resource == nil || len(resource.Body) == 0 {
+				return nil
+			}
+
+			hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
+			if c.contentHashes.Contains(hashStr) {
+				return nil
+			}
+			c.contentHashes.Add(hashStr)
+
+			localPath, err := c.storage.SaveFile(u, resource.Body, resource.MimeType)
+			if err != nil {
+				return nil
+			}
+			c.rewriter.AddMapping(u, localPath)
+			relPath, _ := filepath.Rel(filepath.Dir(htmlLocalPath), localPath)
+			c.rewriter.AddAbsoluteToRelMapping(u, filepath.ToSlash(relPath))
+			c.metrics.IncAssetsCaptured()
+			c.metrics.AddBytes(int64(len(resource.Body)))
+			return nil
+		})
+	}
+	g.Wait()
+}
+
+func (c *Crawler) resolveJSDependencies(htmlLocalPath, baseURL string) {
+	htmlDir := filepath.Dir(htmlLocalPath)
+	jsFiles := make(map[string]string)
+
+	for filePath := range c.rewriter.GetMappings() {
+		if strings.HasSuffix(filePath, ".js") {
+			localPath := c.rewriter.GetMappings()[filePath]
+			if localPath != "" {
+				jsFiles[filePath] = localPath
+			}
+		}
+	}
+
+	for _, localPath := range jsFiles {
+		jsData, err := os.ReadFile(localPath)
+		if err != nil {
+			continue
+		}
+
+		analyzedURLs := jsanalyzer.ExtractJSURLs(string(jsData), baseURL)
+
+		for _, au := range analyzedURLs {
+			if c.bloomFilter.HasSeen(au.URL) || c.exactDedup.Contains(au.URL) {
+				continue
+			}
+			if !c.isAllowedDomain(au.URL) || c.isExcluded(au.URL) {
+				continue
+			}
+
+			resp, err := c.httpClient.Get(au.URL)
+			if err != nil || resp.StatusCode != 200 {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
+
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(body) == 0 {
+				continue
+			}
+
+			hashStr := strconv.FormatUint(xxhash.Sum64(body), 36)
+			if c.contentHashes.Contains(hashStr) {
+				continue
+			}
+			c.contentHashes.Add(hashStr)
+
+			savedPath, err := c.storage.SaveFile(au.URL, body, resp.Header.Get("Content-Type"))
+			if err != nil {
+				continue
+			}
+			c.rewriter.AddMapping(au.URL, savedPath)
+
+			relPath, _ := filepath.Rel(htmlDir, savedPath)
+			relPath = filepath.ToSlash(relPath)
+			c.rewriter.AddAbsoluteToRelMapping(au.URL, relPath)
+
+			c.metrics.IncAssetsCaptured()
+			c.metrics.AddBytes(int64(len(body)))
+
+			if strings.HasSuffix(au.URL, ".js") {
+				c.resolveJSDependenciesRecursive(au.URL, baseURL, htmlDir, 0)
+			}
+		}
+
+		htmlURLs := jsanalyzer.ExtractFromHTML(string(jsData), baseURL)
+		for _, au := range htmlURLs {
+			if c.bloomFilter.HasSeen(au.URL) || c.exactDedup.Contains(au.URL) {
+				continue
+			}
+			if !c.isAllowedDomain(au.URL) || c.isExcluded(au.URL) {
+				continue
+			}
+			resp, err := c.httpClient.Get(au.URL)
+			if err != nil || resp.StatusCode != 200 {
+				if resp != nil {
+					resp.Body.Close()
+				}
+				continue
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(body) == 0 {
+				continue
+			}
+
+			savedPath, err := c.storage.SaveFile(au.URL, body, resp.Header.Get("Content-Type"))
+			if err != nil {
+				continue
+			}
+			c.rewriter.AddMapping(au.URL, savedPath)
+			relPath, _ := filepath.Rel(htmlDir, savedPath)
+			relPath = filepath.ToSlash(relPath)
+			c.rewriter.AddAbsoluteToRelMapping(au.URL, relPath)
+
+			c.metrics.IncAssetsCaptured()
+			c.metrics.AddBytes(int64(len(body)))
+		}
+	}
+}
+
+func (c *Crawler) resolveJSDependenciesRecursive(jsURL, baseURL, htmlDir string, depth int) {
+	if depth > 3 {
+		return
+	}
+
+	if c.bloomFilter.HasSeen(jsURL) || c.exactDedup.Contains(jsURL) {
+		return
+	}
+	if !c.isAllowedDomain(jsURL) || c.isExcluded(jsURL) {
+		return
+	}
+
+	resp, err := c.httpClient.Get(jsURL)
+	if err != nil || resp.StatusCode != 200 {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(body) == 0 {
+		return
+	}
+
+	hashStr := strconv.FormatUint(xxhash.Sum64(body), 36)
+	if c.contentHashes.Contains(hashStr) {
+		return
+	}
+	c.contentHashes.Add(hashStr)
+
+	savedPath, err := c.storage.SaveFile(jsURL, body, resp.Header.Get("Content-Type"))
+	if err != nil {
+		return
+	}
+	c.rewriter.AddMapping(jsURL, savedPath)
+
+	relPath, _ := filepath.Rel(htmlDir, savedPath)
+	relPath = filepath.ToSlash(relPath)
+	c.rewriter.AddAbsoluteToRelMapping(jsURL, relPath)
+
+	c.metrics.IncAssetsCaptured()
+	c.metrics.AddBytes(int64(len(body)))
+
+	analyzedURLs := jsanalyzer.ExtractJSURLs(string(body), baseURL)
+	for _, au := range analyzedURLs {
+		if strings.HasSuffix(au.URL, ".js") {
+			c.resolveJSDependenciesRecursive(au.URL, baseURL, htmlDir, depth+1)
+		} else {
+			if c.bloomFilter.HasSeen(au.URL) || c.exactDedup.Contains(au.URL) {
+				continue
+			}
+			if !c.isAllowedDomain(au.URL) || c.isExcluded(au.URL) {
+				continue
+			}
+			resp2, err := c.httpClient.Get(au.URL)
+			if err != nil || resp2.StatusCode != 200 {
+				if resp2 != nil {
+					resp2.Body.Close()
+				}
+				continue
+			}
+			body2, _ := io.ReadAll(resp2.Body)
+			resp2.Body.Close()
+			if len(body2) == 0 {
+				continue
+			}
+
+			hashStr2 := strconv.FormatUint(xxhash.Sum64(body2), 36)
+			if c.contentHashes.Contains(hashStr2) {
+				continue
+			}
+			c.contentHashes.Add(hashStr2)
+
+			savedPath2, err := c.storage.SaveFile(au.URL, body2, resp2.Header.Get("Content-Type"))
+			if err != nil {
+				continue
+			}
+			c.rewriter.AddMapping(au.URL, savedPath2)
+			relPath2, _ := filepath.Rel(htmlDir, savedPath2)
+			relPath2 = filepath.ToSlash(relPath2)
+			c.rewriter.AddAbsoluteToRelMapping(au.URL, relPath2)
+
+			c.metrics.IncAssetsCaptured()
+			c.metrics.AddBytes(int64(len(body2)))
+		}
+	}
+}
+
 func (c *Crawler) waitForPage(ctx context.Context) {
 	waitCtx, cancel := context.WithTimeout(ctx, c.cfg.WaitForPageTimeout)
 	defer cancel()
@@ -2028,6 +2470,355 @@ func (c *Crawler) setCookies(ctx context.Context) {
 	}
 }
 
+func (c *Crawler) runInteractionEngine(ctx context.Context, urlStr string) {
+	if !c.cfg.EnableInteractionEngine {
+		return
+	}
+
+	maxInteractions := c.cfg.MaxInteractionsPerPage
+	if maxInteractions <= 0 {
+		maxInteractions = 50
+	}
+
+	interactionCount := 0
+
+	interactedElements := make(map[string]bool)
+
+	for interactionCount < maxInteractions {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		script := `
+			(function() {
+				var results = [];
+				var selectors = [
+					'button:not([disabled]):not([type="submit"]):not([type="reset"])',
+					'a[href]:not([href^="mailto:"]):not([href^="tel:"]):not([href^="javascript:"]):not([target="_blank"])',
+					'input[type="button"]:not([disabled])',
+					'input[type="submit"]:not([disabled])',
+					'[role="button"]:not([aria-disabled="true"])',
+					'[onclick]',
+					'.btn:not([disabled])',
+					'button.btn:not([disabled])',
+					'[data-action]',
+					'[data-click]',
+					'[data-toggle]',
+					'[data-dismiss]',
+					'summary',
+					'details:not([open]) > summary',
+					'.accordion-header',
+					'.accordion-trigger',
+					'[aria-expanded="false"]',
+					'.collapsible:not(.active)',
+					'[data-bs-toggle="collapse"]',
+					'[data-bs-toggle="modal"]',
+					'[data-toggle="tab"]',
+					'[data-toggle="pill"]'
+				];
+
+				for (var i = 0; i < selectors.length; i++) {
+					var elements = document.querySelectorAll(selectors[i]);
+					for (var j = 0; j < elements.length; j++) {
+						var el = elements[j];
+						if (!el.offsetParent && el.tagName !== 'SUMMARY') continue;
+						var rect = el.getBoundingClientRect();
+						if (rect.width === 0 && rect.height === 0) continue;
+						var xpath = getXPath(el);
+						if (xpath) {
+							results.push({
+								xpath: xpath,
+								tag: el.tagName.toLowerCase(),
+								text: (el.textContent || '').trim().substring(0, 100),
+								href: el.href || '',
+								type: 'click'
+							});
+						}
+					}
+				}
+
+				var forms = document.querySelectorAll('form');
+				for (var i = 0; i < forms.length; i++) {
+					var form = forms[i];
+					var action = form.action || '';
+					var method = (form.method || 'GET').toUpperCase();
+					if (action && action.indexOf('javascript:') === -1) {
+						var xpath = getXPath(form);
+						if (xpath) {
+							results.push({
+								xpath: xpath,
+								tag: 'form',
+								action: action,
+								method: method,
+								type: 'form'
+							});
+						}
+					}
+				}
+
+				var inputs = document.querySelectorAll('input[type="text"], input[type="email"], input[type="password"], input[type="search"], textarea, select');
+				for (var i = 0; i < inputs.length; i++) {
+					var input = inputs[i];
+					if (!input.offsetParent) continue;
+					var xpath = getXPath(input);
+					if (xpath) {
+						results.push({
+							xpath: xpath,
+							tag: input.tagName.toLowerCase(),
+							type: input.type || '',
+							name: input.name || '',
+							placeholder: input.placeholder || '',
+							type: 'fill'
+						});
+					}
+				}
+
+				return results;
+
+				function getXPath(element) {
+					if (element.id !== '') {
+						return 'id("' + element.id + '")';
+					}
+					if (element === document.body) {
+						return '/html/body';
+					}
+					var ix = 0;
+					var siblings = element.parentNode.childNodes;
+					for (var i = 0; i < siblings.length; i++) {
+						var sibling = siblings[i];
+						if (sibling === element) {
+							return getXPath(element.parentNode) + '/' + element.tagName.toLowerCase() + '[' + (ix + 1) + ']';
+						}
+						if (sibling.nodeType === 1 && sibling.tagName === element.tagName) {
+							ix++;
+						}
+					}
+					return null;
+				}
+			})()
+		`
+
+		var result []map[string]interface{}
+		err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+		if err != nil {
+			util.LogDebug("interaction discovery failed", zap.Error(err))
+			break
+		}
+
+		if len(result) == 0 {
+			break
+		}
+
+		foundNew := false
+		for _, item := range result {
+			if interactionCount >= maxInteractions {
+				break
+			}
+
+			xpath := ""
+			if x, ok := item["xpath"].(string); ok {
+				xpath = x
+			}
+
+			if xpath == "" || interactedElements[xpath] {
+				continue
+			}
+
+			itemType := ""
+			if t, ok := item["type"].(string); ok {
+				itemType = t
+			}
+
+			handled := false
+
+			switch itemType {
+			case "click":
+				handled = c.clickElement(ctx, xpath, item)
+			case "form":
+				handled = c.interactWithForm(ctx, xpath, item)
+			case "fill":
+				handled = c.fillInput(ctx, xpath, item)
+			}
+
+			if handled {
+				interactedElements[xpath] = true
+				interactionCount++
+				foundNew = true
+
+				waitCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+				jsengine.WaitForNetworkIdle(waitCtx, 1*time.Second)
+				cancel()
+
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+
+		if !foundNew {
+			break
+		}
+	}
+
+	if c.cfg.EnableLazyLoad {
+		jsengine.InjectLazyLoad(ctx)
+	}
+
+	scrollCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	jsengine.InfiniteScroll(scrollCtx, &jsengine.InfiniteScrollConfig{
+		Enabled:          true,
+		MaxScrolls:       10,
+		MaxDuration:      10 * time.Second,
+		StablePasses:     2,
+		ItemSelector:     "article, .card, .list-item, [data-infinite-scroll-item], .feed-item",
+		ScrollContainer:  "",
+		LoadMoreSelector: "",
+		ScrollDelay:      1 * time.Second,
+		ScrollDistance:   500,
+	})
+	cancel()
+}
+
+func (c *Crawler) clickElement(ctx context.Context, xpath string, item map[string]interface{}) bool {
+	script := fmt.Sprintf(`
+		(function(xpath) {
+			var result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+			var el = result.singleNodeValue;
+			if (!el) return { success: false, reason: 'not found' };
+			if (el.tagName === 'A' && el.href) {
+				var url = el.href;
+				if (url.startsWith('http') && !url.startsWith(window.location.origin)) {
+					return { success: false, reason: 'external link' };
+				}
+			}
+			try {
+				el.click();
+				return { success: true, tag: el.tagName };
+			} catch(e) {
+				return { success: false, reason: e.message };
+			}
+		})("%s")
+	`, xpath)
+
+	var result map[string]interface{}
+	err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+	if err != nil {
+		return false
+	}
+
+	if success, ok := result["success"].(bool); ok && success {
+		tag := ""
+		if t, ok := result["tag"].(string); ok {
+			tag = t
+		}
+		util.LogDebug("interaction: clicked element", zap.String("xpath", xpath), zap.String("tag", tag))
+		return true
+	}
+	return false
+}
+
+func (c *Crawler) interactWithForm(ctx context.Context, xpath string, item map[string]interface{}) bool {
+	action := ""
+	if a, ok := item["action"].(string); ok {
+		action = a
+	}
+	method := ""
+	if m, ok := item["method"].(string); ok {
+		method = m
+	}
+
+	util.LogDebug("interaction: found form", zap.String("xpath", xpath), zap.String("action", action), zap.String("method", method))
+	return false
+}
+
+func (c *Crawler) fillInput(ctx context.Context, xpath string, item map[string]interface{}) bool {
+	inputType := ""
+	if t, ok := item["type"].(string); ok {
+		inputType = t
+	}
+	name := ""
+	if n, ok := item["name"].(string); ok {
+		name = n
+	}
+	placeholder := ""
+	if p, ok := item["placeholder"].(string); ok {
+		placeholder = p
+	}
+
+	value := "test"
+	if inputType == "email" {
+		value = "test@example.com"
+	} else if inputType == "password" {
+		value = "testpassword123"
+	} else if strings.Contains(strings.ToLower(name), "search") || strings.Contains(strings.ToLower(placeholder), "search") {
+		value = "test query"
+	}
+
+	script := fmt.Sprintf(`
+		(function(xpath, value) {
+			var result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+			var el = result.singleNodeValue;
+			if (!el) return { success: false, reason: 'not found' };
+			try {
+				el.focus();
+				el.value = value;
+				el.dispatchEvent(new Event('input', { bubbles: true }));
+				el.dispatchEvent(new Event('change', { bubbles: true }));
+				return { success: true };
+			} catch(e) {
+				return { success: false, reason: e.message };
+			}
+		})("%s", "%s")
+	`, xpath, value)
+
+	var result map[string]interface{}
+	err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+	if err != nil {
+		return false
+	}
+
+	if success, ok := result["success"].(bool); ok && success {
+		util.LogDebug("interaction: filled input", zap.String("xpath", xpath), zap.String("name", name))
+		return true
+	}
+	return false
+}
+
+const cookieJarFile = "cookies.json"
+
+func (c *Crawler) saveCookieJar() {
+	c.cookieMu.RLock()
+	defer c.cookieMu.RUnlock()
+	if len(c.cookieJar) == 0 {
+		return
+	}
+	data, err := json.MarshalIndent(c.cookieJar, "", "  ")
+	if err != nil {
+		return
+	}
+	path := filepath.Join(c.cfg.OutputDir, cookieJarFile)
+	os.MkdirAll(c.cfg.OutputDir, 0755)
+	os.WriteFile(path, data, 0644)
+}
+
+func (c *Crawler) loadCookieJar() {
+	path := filepath.Join(c.cfg.OutputDir, cookieJarFile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var jar map[string][]*http.Cookie
+	if err := json.Unmarshal(data, &jar); err != nil {
+		return
+	}
+	c.cookieMu.Lock()
+	for domain, cookies := range jar {
+		c.cookieJar[domain] = cookies
+	}
+	c.cookieMu.Unlock()
+	util.LogInfo("loaded cookie jar", zap.Int("domains", len(jar)))
+}
+
 func (c *Crawler) persistCookies(ctx context.Context, urlStr string) {
 	parsed, err := url.Parse(urlStr)
 	if err != nil {
@@ -2044,17 +2835,7 @@ func (c *Crawler) persistCookies(ctx context.Context, urlStr string) {
 		if err != nil {
 			return err
 		}
-		for _, c := range cdpCookies {
-			cookies = append(cookies, &http.Cookie{
-				Name:     c.Name,
-				Value:    c.Value,
-				Domain:   c.Domain,
-				Path:     c.Path,
-				Secure:   c.Secure,
-				HttpOnly: c.HTTPOnly,
-				Expires:  time.Unix(int64(c.Expires), 0),
-			})
-		}
+		cookies = util.CDPCookiesToHTTP(cdpCookies)
 		return nil
 	})); err != nil {
 		util.LogDebug("failed to persist cookies", zap.Error(err))
@@ -2176,7 +2957,7 @@ func (c *Crawler) setupWSCapture(ctx context.Context) {
 			isBinary := e.Response.Opcode == 2
 			data := e.Response.PayloadData
 			if isBinary {
-				data = base64EncodePayload(data)
+				data = base64.StdEncoding.EncodeToString([]byte(data))
 			}
 			c.wsMessages.Push(WSMsg{
 				URL:       wsURL,
@@ -2196,7 +2977,7 @@ func (c *Crawler) setupWSCapture(ctx context.Context) {
 			isBinary := e.Response.Opcode == 2
 			data := e.Response.PayloadData
 			if isBinary {
-				data = base64EncodePayload(data)
+				data = base64.StdEncoding.EncodeToString([]byte(data))
 			}
 			c.wsMessages.Push(WSMsg{
 				URL:       wsURL,
@@ -2218,10 +2999,6 @@ func (c *Crawler) setupWSCapture(ctx context.Context) {
 			})
 		}
 	})
-}
-
-func base64EncodePayload(payload string) string {
-	return base64.StdEncoding.EncodeToString([]byte(payload))
 }
 
 func (c *Crawler) fetchPageMetadata(ctx context.Context, urlStr string) {
@@ -2441,13 +3218,9 @@ func (c *Crawler) pruneUnboundedMaps() {
 			delete(c.hostLastCrawl, host)
 			delete(c.hostURLCount, host)
 			if sem, ok := c.hostSemaphores[host]; ok {
-				if !sem.closed.Load() {
-					sem.closed.Store(true)
-					close(sem.ch)
-				}
+				sem.closed.Store(true)
 				delete(c.hostSemaphores, host)
 			}
-			delete(c.hostBackoffs, host)
 		}
 	}
 	c.hostMu.Unlock()
@@ -2457,13 +3230,6 @@ func (c *Crawler) pruneUnboundedMaps() {
 		c.discoveredRoutes = make(map[string]bool)
 	}
 	c.routeMu.Unlock()
-
-	c.visitLock.Lock()
-	if len(c.visitedURLs) > 100000 {
-		c.visitedURLs = make(map[string]*URLVisitInfo)
-		c.lastVisitTime = make(map[string]time.Time)
-	}
-	c.visitLock.Unlock()
 }
 
 func (c *Crawler) periodicCheckpoint() {
@@ -2538,28 +3304,50 @@ func (c *Crawler) detectCaptchaElements(tabCtx context.Context, urlStr string) (
 	script := `
 		(function() {
 			var result = {};
-			var recaptcha = document.querySelector('[data-sitekey], .g-recaptcha, [data-runtime="google/recaptcha"]');
+
+			// reCAPTCHA v2/v3
+			var recaptcha = document.querySelector('.g-recaptcha, div[data-sitekey], [data-runtime="google/recaptcha"], iframe[src*="google.com/recaptcha"], .recaptcha');
 			if (recaptcha) {
 				result["sitekey"] = recaptcha.getAttribute("data-sitekey") || recaptcha.dataset.sitekey || "";
 				result["type"] = "recaptcha";
+				result["found"] = true;
 			}
-			var hcaptcha = document.querySelector('[data-sitekey="hcaptcha"]');
-			if (hcaptcha) {
+
+			// hCaptcha
+			var hcaptcha = document.querySelector('.h-captcha, iframe[src*="hcaptcha.com"], div[data-sitekey][data-theme]');
+			if (hcaptcha && !result.found) {
 				result["sitekey"] = hcaptcha.getAttribute("data-sitekey") || "";
 				result["type"] = "hcaptcha";
+				result["found"] = true;
 			}
-			var turnstile = document.querySelector('[data-sitekey="turnstile"]');
-			if (turnstile) {
+
+			// Cloudflare Turnstile
+			var turnstile = document.querySelector('.cf-turnstile, div[data-sitekey][data-appearance], iframe[src*="challenges.cloudflare.com"]');
+			if (turnstile && !result.found) {
 				result["sitekey"] = turnstile.getAttribute("data-sitekey") || "";
 				result["type"] = "turnstile";
+				result["found"] = true;
 			}
-			if (!result["sitekey"]) {
+
+			// Generic fallback: any element with data-sitekey attribute
+			if (!result.found) {
 				var allSiteKeys = document.querySelectorAll('[data-sitekey]');
 				if (allSiteKeys.length > 0) {
 					result["sitekey"] = allSiteKeys[0].getAttribute("data-sitekey") || "";
 					result["type"] = "generic";
+					result["found"] = true;
 				}
 			}
+
+			// Check for loaded CAPTCHA scripts
+			if (!result.found) {
+				var scripts = document.querySelectorAll('script[src*="recaptcha"], script[src*="hcaptcha"], script[src*="challenges.cloudflare"]');
+				if (scripts.length > 0) {
+					result["type"] = "detected_via_script";
+					result["found"] = true;
+				}
+			}
+
 			return JSON.stringify(result);
 		})()
 	`

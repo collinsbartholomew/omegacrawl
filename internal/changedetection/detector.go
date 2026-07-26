@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"sync"
 	"time"
+
+	"golang.org/x/net/html"
 )
 
 type Snapshot struct {
@@ -142,6 +144,16 @@ func (d *Detector) DetectChanges(url string, old, new *Snapshot) *DiffReport {
 }
 
 func computeDiff(oldContent, newContent []byte) []Change {
+	oldDoc, oldErr := html.Parse(bytes.NewReader(oldContent))
+	newDoc, newErr := html.Parse(bytes.NewReader(newContent))
+	if oldErr == nil && newErr == nil {
+		changes := diffNodes(oldDoc, newDoc, "/")
+		if len(changes) > 100 {
+			changes = changes[:100]
+		}
+		return changes
+	}
+
 	oldLines := bytes.Split(oldContent, []byte("\n"))
 	newLines := bytes.Split(newContent, []byte("\n"))
 	changes := make([]Change, 0)
@@ -170,6 +182,107 @@ func computeDiff(oldContent, newContent []byte) []Change {
 				NewValue:  string(newLines[i]),
 			})
 		}
+	}
+	if len(changes) > 100 {
+		changes = changes[:100]
+	}
+	return changes
+}
+
+func diffNodes(old, new *html.Node, path string) []Change {
+	var changes []Change
+	if old.Type != new.Type {
+		changes = append(changes, Change{
+			Type:     ChangeModified,
+			Path:     path,
+			OldValue: old.Data,
+			NewValue: new.Data,
+		})
+		return changes
+	}
+	if old.Type == html.TextNode || old.Type == html.CommentNode {
+		if !bytes.Equal([]byte(old.Data), []byte(new.Data)) {
+			changes = append(changes, Change{
+				Type:     ChangeModified,
+				Path:     path,
+				OldValue: old.Data,
+				NewValue: new.Data,
+			})
+		}
+		return changes
+	}
+	if old.Data != new.Data {
+		changes = append(changes, Change{
+			Type:     ChangeModified,
+			Path:     path,
+			OldValue: old.Data,
+			NewValue: new.Data,
+			Tag:      old.Data,
+		})
+	}
+	oldAttrs := make(map[string]string)
+	for _, a := range old.Attr {
+		oldAttrs[a.Key] = a.Val
+	}
+	newAttrs := make(map[string]string)
+	for _, a := range new.Attr {
+		newAttrs[a.Key] = a.Val
+	}
+	for k, ov := range oldAttrs {
+		if nv, ok := newAttrs[k]; ok {
+			if ov != nv {
+				changes = append(changes, Change{
+					Type:      ChangeModified,
+					Path:      path + "@" + k,
+					OldValue:  ov,
+					NewValue:  nv,
+					Attribute: k,
+				})
+			}
+		} else {
+			changes = append(changes, Change{
+				Type:     ChangeRemoved,
+				Path:     path + "@" + k,
+				OldValue: ov,
+			})
+		}
+	}
+	for k, nv := range newAttrs {
+		if _, ok := oldAttrs[k]; !ok {
+			changes = append(changes, Change{
+				Type:    ChangeAdded,
+				Path:    path + "@" + k,
+				NewValue: nv,
+			})
+		}
+	}
+
+	oldChild := old.FirstChild
+	newChild := new.FirstChild
+	idx := 0
+	for oldChild != nil && newChild != nil {
+		childPath := fmt.Sprintf("%s/%s[%d]", path, oldChild.Data, idx)
+		changes = append(changes, diffNodes(oldChild, newChild, childPath)...)
+		oldChild = oldChild.NextSibling
+		newChild = newChild.NextSibling
+		idx++
+	}
+	for oldChild != nil {
+		changes = append(changes, Change{
+			Type: ChangeRemoved,
+			Path: fmt.Sprintf("%s/%s[%d]", path, oldChild.Data, idx),
+		})
+		oldChild = oldChild.NextSibling
+		idx++
+	}
+	for newChild != nil {
+		changes = append(changes, Change{
+			Type:    ChangeAdded,
+			Path:    fmt.Sprintf("%s/%s[%d]", path, newChild.Data, idx),
+			NewValue: newChild.Data,
+		})
+		newChild = newChild.NextSibling
+		idx++
 	}
 	if len(changes) > 100 {
 		changes = changes[:100]

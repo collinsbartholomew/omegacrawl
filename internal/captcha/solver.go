@@ -10,7 +10,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chromedp/chromedp"
+
 	"github.com/user/clone/internal/config"
+	"github.com/user/clone/internal/httpclient"
 )
 
 type Provider string
@@ -41,12 +44,12 @@ type Solver struct {
 }
 
 type SolveRequest struct {
-	SiteURL string `json:"sitekey"`
-	SiteKey string `json:"sitekey_rewrite"`
-	URL     string
-	Type    CAPTCHAType
-	PageHTML string
-	Proxy    string
+	SiteURL  string      `json:"siteurl"`
+	SiteKey  string      `json:"sitekey"`
+	URL      string      `json:"url"`
+	Type     CAPTCHAType `json:"type"`
+	PageHTML string      `json:"page_html"`
+	Proxy    string      `json:"proxy"`
 }
 
 type SolveResponse struct {
@@ -76,9 +79,7 @@ func NewSolver(cfg *config.CAPTCHAConfig) *Solver {
 		baseURL:  baseURL,
 		timeout:  cfg.Timeout,
 		retryCnt: cfg.RetryCount,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		client: httpclient.GlobalClient(),
 	}
 }
 
@@ -87,10 +88,24 @@ func (s *Solver) Solve(ctx context.Context, req SolveRequest) (*SolveResponse, e
 		return nil, fmt.Errorf("captcha solver not configured")
 	}
 
+	taskType := "RecaptchaV2Task"
+	switch req.Type {
+	case TypeRecaptchaV2:
+		taskType = "RecaptchaV2Task"
+	case TypeRecaptchaV3:
+		taskType = "RecaptchaV3Task"
+	case TypeHCaptcha:
+		taskType = "HCaptchaTask"
+	case TypeTurnstile:
+		taskType = "TurnstileTask"
+	case TypeImageCaptcha:
+		taskType = "ImageToTextTask"
+	}
+
 	task := map[string]interface{}{
-		"type":       "NoTask",
-		"websiteURL": req.URL,
-		"websiteKey": req.SiteKey,
+		"type":        taskType,
+		"websiteURL":  req.URL,
+		"websiteKey":  req.SiteKey,
 		"isInvisible": false,
 		"proxyType":   "none",
 	}
@@ -236,15 +251,18 @@ func (s *Solver) poll2Captcha(ctx context.Context, taskID string) (*SolveRespons
 		if err != nil {
 			return nil, fmt.Errorf("failed to send request: %w", err)
 		}
-		defer resp.Body.Close()
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("provider API error (status %d): %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("provider API error (status %d): %s", resp.StatusCode, string(bodyBytes))
 		}
 
 		var result map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
@@ -305,15 +323,18 @@ func (s *Solver) pollCapMonster(ctx context.Context, taskID string) (*SolveRespo
 		if err != nil {
 			return nil, fmt.Errorf("failed to send request: %w", err)
 		}
-		defer resp.Body.Close()
+		bodyBytes, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read response: %w", err)
+		}
 
 		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("provider API error (status %d): %s", resp.StatusCode, string(body))
+			return nil, fmt.Errorf("provider API error (status %d): %s", resp.StatusCode, string(bodyBytes))
 		}
 
 		var result map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
@@ -360,9 +381,39 @@ func detectCAPTCHAType(html string) CAPTCHAType {
 }
 
 func FindCAPTCHAElements(ctx context.Context) map[string]string {
-	return make(map[string]string)
+	result := make(map[string]string)
+
+	script := `
+		(function() {
+			var result = {};
+			var el = document.querySelector('.g-recaptcha, div[data-sitekey], .h-captcha, .cf-turnstile');
+			if (el) {
+				result.sitekey = el.getAttribute('data-sitekey') || '';
+				result.type = el.classList.contains('g-recaptcha') ? 'recaptcha' :
+					el.classList.contains('h-captcha') ? 'hcaptcha' : 'turnstile';
+			}
+			return JSON.stringify(result);
+		})()
+	`
+	var res string
+	_ = chromedp.Run(ctx, chromedp.Evaluate(script, &res))
+	_ = json.Unmarshal([]byte(res), &result)
+	return result
 }
 
 func (s *Solver) InjectSolution(ctx context.Context, token string) error {
-	return nil
+	safeToken, _ := json.Marshal(token)
+
+	script := fmt.Sprintf(`
+		(function(token) {
+			var recaptcha = document.getElementById('g-recaptcha-response');
+			if (recaptcha) { recaptcha.innerHTML = token; }
+			var hcaptcha = document.querySelector('[data-hcaptcha-response]');
+			if (hcaptcha) { hcaptcha.innerHTML = token; }
+			var turnstile = document.querySelector('[data-turnstile-response]');
+			if (turnstile) { turnstile.innerHTML = token; }
+		})(%s)
+	`, string(safeToken))
+
+	return chromedp.Run(ctx, chromedp.Evaluate(script, nil))
 }

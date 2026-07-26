@@ -55,6 +55,7 @@ Examples:
 	rootCmd.Flags().Duration("delay", 1*time.Second, "delay between requests")
 	rootCmd.Flags().Int("max-urls", 10000, "max URLs per host")
 	rootCmd.Flags().Bool("scroll", true, "infinite scroll detection")
+	rootCmd.Flags().Bool("interact", false, "enable systematic interaction engine (click links, fill forms)")
 
 	serveCmd := &cobra.Command{
 		Use:   "serve [directory]",
@@ -180,6 +181,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 	delay, _ := cmd.Flags().GetDuration("delay")
 	maxURLs, _ := cmd.Flags().GetInt("max-urls")
 	scroll, _ := cmd.Flags().GetBool("scroll")
+	interact, _ := cmd.Flags().GetBool("interact")
 
 	cfg.MaxDepth = maxDepth
 	cfg.MaxConcurrentPages = concurrency
@@ -192,6 +194,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 	cfg.RespectRobots = !noRobots
 	cfg.CrawlDelay = delay
 	cfg.MaxURLsPerHost = maxURLs
+	cfg.EnableInteractionEngine = interact
 
 	if cfg.InfiniteScroll == nil {
 		cfg.InfiniteScroll = &config.InfiniteScrollConfig{}

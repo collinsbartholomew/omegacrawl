@@ -16,6 +16,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/config"
+	"github.com/user/clone/internal/httpclient"
 	"github.com/user/clone/internal/util"
 )
 
@@ -120,17 +121,7 @@ func (am *AuthManager) formLogin(ctx context.Context, targetURL string) error {
 		if err != nil {
 			return err
 		}
-		for _, c := range cdpCookies {
-			cookies = append(cookies, &http.Cookie{
-				Name:     c.Name,
-				Value:    c.Value,
-				Domain:   c.Domain,
-				Path:     c.Path,
-				Secure:   c.Secure,
-				HttpOnly: c.HTTPOnly,
-				Expires:  time.Unix(int64(c.Expires), 0),
-			})
-		}
+		cookies = util.CDPCookiesToHTTP(cdpCookies)
 		return nil
 	})); err != nil {
 		util.LogDebug("failed to get cookies after login", zap.Error(err))
@@ -215,8 +206,7 @@ func (am *AuthManager) exchangeOAuthToken(ctx context.Context) (*OAuthToken, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := httpclient.GlobalClient().Do(req)
 	if err != nil {
 		return nil, err
 	}

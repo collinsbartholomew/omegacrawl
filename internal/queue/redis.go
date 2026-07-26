@@ -46,23 +46,16 @@ func (q *RedisQueue) PushURL(url string, depth int) bool {
 		return false
 	}
 	item := URLItem{URL: url, Depth: depth}
-	data, err := json.Marshal(item)
-	if err != nil {
-		return false
-	}
+	data, _ := json.Marshal(item)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := q.client.RPush(ctx, q.key, string(data)).Err(); err != nil {
-		return false
-	}
-	itemData, _ := json.Marshal(item)
-	if err := q.client.HSet(ctx, q.key+":items", url, itemData).Err(); err != nil {
-		return false
-	}
-	if err := q.client.SAdd(ctx, q.key+":seen", url).Err(); err != nil {
-		return false
-	}
-	return true
+
+	pipe := q.client.Pipeline()
+	pipe.RPush(ctx, q.key, string(data))
+	pipe.HSet(ctx, q.key+":items", url, data)
+	pipe.SAdd(ctx, q.key+":seen", url)
+	_, err := pipe.Exec(ctx)
+	return err == nil
 }
 
 func (q *RedisQueue) PopURL() (URLItem, bool) {

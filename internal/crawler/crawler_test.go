@@ -81,7 +81,7 @@ func TestBase64EncodePayload(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := base64EncodePayload(tt.input)
+			result := base64.StdEncoding.EncodeToString([]byte(tt.input))
 			decoded, err := base64.StdEncoding.DecodeString(result)
 			if err != nil {
 				t.Fatalf("base64 decode failed: %v", err)
@@ -102,11 +102,13 @@ func TestWriteSitemap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCrawler failed: %v", err)
 	}
-	c.visitedURLs = map[string]*URLVisitInfo{
-		"https://example.com/":      {URL: "https://example.com/"},
-		"https://example.com/about": {URL: "https://example.com/about"},
-		"https://example.com/contact": {URL: "https://example.com/contact"},
+	c.routeMu.Lock()
+	c.discoveredRoutes = map[string]bool{
+		"https://example.com/":      true,
+		"https://example.com/about": true,
+		"https://example.com/contact": true,
 	}
+	c.routeMu.Unlock()
 
 	c.writeSitemap()
 

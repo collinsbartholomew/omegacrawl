@@ -55,12 +55,8 @@ func (s *LRUSet) Contains(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	node, ok := s.items[key]
-	if !ok {
-		return false
-	}
-	s.moveToHead(node)
-	return true
+	_, ok := s.items[key]
+	return ok
 }
 
 func (s *LRUSet) Len() int {
@@ -94,6 +90,17 @@ func (s *LRUSet) removeNode(node *lruNode) {
 func (s *LRUSet) moveToHead(node *lruNode) {
 	s.removeNode(node)
 	s.addToHead(node)
+}
+
+func (s *LRUSet) Keys() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	keys := make([]string, 0, len(s.items))
+	for k := range s.items {
+		keys = append(keys, k)
+	}
+	return keys
 }
 
 func (s *LRUSet) removeLRU() {

@@ -146,9 +146,11 @@ func (r *Rewriter) RewriteHTML(htmlContent []byte, htmlLocalPath string) []byte 
 	r.mu.RUnlock()
 
 	if len(mappings) == 0 && len(absToRel) == 0 {
+		util.LogDebug("rewrite: no mappings, skipping rewrite", zap.String("html", htmlLocalPath))
 		result := rewriteBaseTag(htmlContent)
 		return injectWSReplayScript(result)
 	}
+	util.LogDebug("rewrite: mappings count", zap.Int("mappings", len(mappings)), zap.Int("absToRel", len(absToRel)), zap.String("baseURL", baseURL))
 
 	sortedURLs := make([]string, 0, len(mappings))
 	for origURL := range mappings {
@@ -267,6 +269,8 @@ func rewriteHTMLTokens(
 	var buf bytes.Buffer
 	buf.Grow(len(input))
 
+	inScriptOrStyle := false
+
 	for {
 		tt := z.Next()
 		if tt == html.ErrorToken {
@@ -281,24 +285,54 @@ func rewriteHTMLTokens(
 		case html.StartTagToken, html.SelfClosingTagToken:
 			name, hasAttr := z.TagName()
 			nameStr := strings.ToLower(string(name))
+			tagAtom := atom.Lookup(name)
+			if tagAtom == atom.Script || tagAtom == atom.Style {
+				inScriptOrStyle = true
+			}
 
 			var attrs []attrPair
 			var rewrites []attrRewrite
+			isCSPMeta := false
 
 			if hasAttr {
+				// First pass: detect if this is a CSP meta tag
 				for {
 					k, v, more := z.TagAttr()
 					attrs = append(attrs, attrPair{k, v})
-					keyStr := string(k)
-					valStr := string(v)
+					if !more {
+						break
+					}
+				}
+				// Check all attrs for CSP http-equiv
+				for _, attr := range attrs {
+					keyStr := string(attr.key)
+					valStr := string(attr.val)
+					if keyStr == "http-equiv" && strings.EqualFold(valStr, "content-security-policy") {
+						isCSPMeta = true
+						break
+					}
+				}
+				// Second pass: apply rewrites
+				for _, attr := range attrs {
+					keyStr := string(attr.key)
+					valStr := string(attr.val)
+
+					if isURLAttr([]byte(keyStr)) {
+						util.LogDebug("rewriteHTMLTokens: checking attr",
+							zap.String("tag", nameStr),
+							zap.String("attr", keyStr),
+							zap.String("val", valStr),
+							zap.String("baseURL", baseURL),
+						)
+					}
 
 					if keyStr == "integrity" {
 						rewrites = append(rewrites, attrRewrite{keyStr, valStr, ""})
-					} else if keyStr == "http-equiv" && strings.ToLower(valStr) == "content-security-policy" {
-						rewrites = append(rewrites, attrRewrite{keyStr, valStr, "Content-Security-Policy"})
-					} else if keyStr == "content" && nameStr == "meta" {
+					} else if isCSPMeta && keyStr == "content" && nameStr == "meta" {
 						rewrites = append(rewrites, attrRewrite{keyStr, valStr, "default-src * 'unsafe-inline' 'unsafe-eval' data: blob:;"})
-					} else if isURLAttr(k) {
+					} else if keyStr == "http-equiv" && strings.EqualFold(valStr, "content-security-policy") {
+						rewrites = append(rewrites, attrRewrite{keyStr, valStr, "Content-Security-Policy"})
+					} else if isURLAttr([]byte(keyStr)) {
 						if newVal, ok := rewriteAttrVal(valStr, htmlDir, baseURL, mappings, pathCache, absRelCache); ok {
 							rewrites = append(rewrites, attrRewrite{keyStr, valStr, newVal})
 						}
@@ -309,10 +343,6 @@ func rewriteHTMLTokens(
 						if string(newVal) != valStr {
 							rewrites = append(rewrites, attrRewrite{keyStr, valStr, string(newVal)})
 						}
-					}
-
-					if !more {
-						break
 					}
 				}
 			}
@@ -328,8 +358,16 @@ func rewriteHTMLTokens(
 				writeTag(&buf, name, attrs, rewrites, tt)
 			}
 
+		case html.EndTagToken:
+			name, _ := z.TagName()
+			tagAtom := atom.Lookup(name)
+			if tagAtom == atom.Script || tagAtom == atom.Style {
+				inScriptOrStyle = false
+			}
+			buf.Write(z.Raw())
+
 		case html.TextToken:
-			if isScriptOrStyle(z) {
+			if inScriptOrStyle {
 				buf.Write(z.Raw())
 			} else {
 				text := z.Text()
@@ -345,35 +383,18 @@ func rewriteHTMLTokens(
 	return buf.Bytes()
 }
 
-func isScriptOrStyle(z *html.Tokenizer) bool {
-	for {
-		tt := z.Next()
-		if tt == html.ErrorToken {
-			return false
-		}
-		if tt == html.StartTagToken || tt == html.SelfClosingTagToken {
-			name, _ := z.TagName()
-			if atom.Lookup(name) == atom.Script || atom.Lookup(name) == atom.Style {
-				return true
-			}
-			return false
-		}
-	}
-}
-
 func rewriteScriptStyleURLs(text []byte, baseURL string, mappings map[string]string, pathCache map[string]string, absRelCache map[string]string) []byte {
 	result := text
 
+	var pairs [][2][]byte
 	for absURL, relPath := range absRelCache {
-		old := []byte(absURL)
-		new := []byte(relPath)
-		result = bytes.ReplaceAll(result, old, new)
+		pairs = append(pairs, [2][]byte{[]byte(absURL), []byte(relPath)})
 	}
-
 	for absURL, relPath := range pathCache {
-		old := []byte(absURL)
-		new := []byte(relPath)
-		result = bytes.ReplaceAll(result, old, new)
+		pairs = append(pairs, [2][]byte{[]byte(absURL), []byte(relPath)})
+	}
+	if len(pairs) > 0 {
+		result = batchReplace(result, pairs)
 	}
 
 	result = scriptURLPattern.ReplaceAllFunc(result, func(match []byte) []byte {
@@ -636,33 +657,24 @@ func writeAttr(buf *bytes.Buffer, key, val []byte) {
 }
 
 func replaceQuotedURLs(input []byte, sortedURLs []string, pathCache map[string]string) []byte {
-	result := input
+	var pairs [][2][]byte
 	for _, origURL := range sortedURLs {
 		relPath := pathCache[origURL]
-
-		old := []byte(`"` + origURL + `"`)
-		new := []byte(`"` + relPath + `"`)
-		result = bytes.ReplaceAll(result, old, new)
-
-		old = []byte(`'` + origURL + `'`)
-		new = []byte(`'` + relPath + `'`)
-		result = bytes.ReplaceAll(result, old, new)
-
-		old = []byte("`" + origURL + "`")
-		new = []byte("`" + relPath + "`")
-		result = bytes.ReplaceAll(result, old, new)
+		pairs = append(pairs,
+			[2][]byte{[]byte(`"` + origURL + `"`), []byte(`"` + relPath + `"`)},
+			[2][]byte{[]byte(`'` + origURL + `'`), []byte(`'` + relPath + `'`)},
+			[2][]byte{[]byte("`" + origURL + "`"), []byte("`" + relPath + "`")},
+		)
 	}
-	return result
+	return batchReplace(input, pairs)
 }
 
 func replaceAbsoluteURLs(input []byte, absRelCache map[string]string) []byte {
-	result := input
+	var pairs [][2][]byte
 	for absURL, relPath := range absRelCache {
-		old := []byte(absURL)
-		new := []byte(relPath)
-		result = bytes.ReplaceAll(result, old, new)
+		pairs = append(pairs, [2][]byte{[]byte(absURL), []byte(relPath)})
 	}
-	return result
+	return batchReplace(input, pairs)
 }
 
 func (r *Rewriter) RewriteCSS(css []byte, cssLocalPath string) []byte {
@@ -688,6 +700,7 @@ func (r *Rewriter) RewriteCSS(css []byte, cssLocalPath string) []byte {
 		return len(sortedURLs[i]) > len(sortedURLs[j])
 	})
 
+	var pairs [][2][]byte
 	for _, origURL := range sortedURLs {
 		localPath := mappings[origURL]
 		relPath, err := filepath.Rel(cssDir, localPath)
@@ -696,13 +709,13 @@ func (r *Rewriter) RewriteCSS(css []byte, cssLocalPath string) []byte {
 		}
 		relPath = filepath.ToSlash(relPath)
 
-		old := []byte(`"` + origURL + `"`)
-		new := []byte(`"` + relPath + `"`)
-		result = bytes.ReplaceAll(result, old, new)
-
-		old = []byte(`'` + origURL + `'`)
-		new = []byte(`'` + relPath + `'`)
-		result = bytes.ReplaceAll(result, old, new)
+		pairs = append(pairs,
+			[2][]byte{[]byte(`"` + origURL + `"`), []byte(`"` + relPath + `"`)},
+			[2][]byte{[]byte(`'` + origURL + `'`), []byte(`'` + relPath + `'`)},
+		)
+	}
+	if len(pairs) > 0 {
+		result = batchReplace(result, pairs)
 	}
 
 	result = cssURLPattern.ReplaceAllFunc(result, func(match []byte) []byte {
@@ -897,13 +910,21 @@ func (r *Rewriter) ExtractLinks(baseURL string, htmlContent []byte) []string {
 			continue
 		}
 
+		var allAttrs []struct{ k, v []byte }
 		for {
 			k, v, more := z.TagAttr()
-			keyStr := string(k)
-			valStr := string(v)
+			allAttrs = append(allAttrs, struct{ k, v []byte }{k, v})
+			if !more {
+				break
+			}
+		}
+
+		for _, attr := range allAttrs {
+			keyStr := string(attr.k)
+			valStr := string(attr.v)
 
 			var link string
-			if isURLAttr(k) && !strings.HasPrefix(keyStr, "data-srcset") {
+			if isURLAttr(attr.k) && !strings.HasPrefix(keyStr, "data-srcset") {
 				link = valStr
 			} else if keyStr == "srcset" || keyStr == "data-srcset" {
 				parts := strings.Split(valStr, ",")
@@ -917,10 +938,6 @@ func (r *Rewriter) ExtractLinks(baseURL string, htmlContent []byte) []string {
 						}
 					}
 				}
-				if !more {
-					break
-				}
-				continue
 			} else if tag == atom.Source || tag == atom.Img {
 				if keyStr == "srcset" {
 					parts := strings.Split(valStr, ",")
@@ -933,25 +950,19 @@ func (r *Rewriter) ExtractLinks(baseURL string, htmlContent []byte) []string {
 								links = append(links, absURL)
 							}
 						}
-					} else if keyStr == "src" || keyStr == "data-src" || keyStr == "data-lazy-src" {
-						link = valStr
-					} else {
+					}
+				} else if keyStr == "src" || keyStr == "data-src" || keyStr == "data-lazy-src" {
+					link = valStr
+				}
 			}
 
 			if link == "" || strings.HasPrefix(link, "#") || strings.HasPrefix(link, "javascript:") || strings.HasPrefix(link, "mailto:") {
-				if !more {
-					break
-				}
 				continue
 			}
 
 			absURL := ResolveURL(baseURL, link)
 			if absURL != "" && isSameHost(baseParsed, absURL) {
 				links = append(links, absURL)
-			}
-
-			if !more {
-				break
 			}
 		}
 	}
@@ -974,6 +985,21 @@ func (r *Rewriter) ExtractFontURLs(cssContent []byte) []string {
 					seen[u] = true
 					urls = append(urls, u)
 				}
+			}
+		}
+	}
+	return urls
+}
+
+func (r *Rewriter) ExtractAllCSSURLs(cssContent []byte) []string {
+	var urls []string
+	seen := make(map[string]bool)
+	for _, um := range cssURLPattern.FindAllStringSubmatch(string(cssContent), -1) {
+		if len(um) > 1 {
+			u := um[1]
+			if !seen[u] && !strings.HasPrefix(u, "data:") {
+				seen[u] = true
+				urls = append(urls, u)
 			}
 		}
 	}
@@ -1014,47 +1040,132 @@ func ResolveURL(base, href string) string {
 	return resolved.String()
 }
 
-// GenerateSingleFileHTML inlines all local resources (CSS, JS, images, fonts) into a single HTML file
-// This creates a truly offline-capable HTML file
 func (r *Rewriter) GenerateSingleFileHTML(htmlContent []byte, htmlLocalPath string) ([]byte, error) {
-	// First, rewrite the HTML to use local paths
 	rewritten := r.RewriteHTML(htmlContent, htmlLocalPath)
 
-	// For now, return the rewritten HTML - full inlining is a complex operation
-	// that can be done in a separate pass
-	return rewritten, nil
+	htmlDir := filepath.Dir(htmlLocalPath)
+
+	doc, err := html.Parse(bytes.NewReader(rewritten))
+	if err != nil {
+		return rewritten, nil
+	}
+
+	var inlineCSS, inlineJS, inlineImages func(*html.Node)
+	inlineCSS = func(n *html.Node) {
+		if n.Type == html.ElementNode {
+			if n.Data == "link" {
+				var rel, href string
+				for _, attr := range n.Attr {
+					if attr.Key == "rel" {
+						rel = attr.Val
+					}
+					if attr.Key == "href" {
+						href = attr.Val
+					}
+				}
+				if rel == "stylesheet" && href != "" {
+					cssPath := filepath.Join(htmlDir, href)
+					cssData, err := os.ReadFile(cssPath)
+					if err == nil {
+						styleNode := &html.Node{
+							Type: html.ElementNode,
+							Data: "style",
+						}
+						styleNode.AppendChild(&html.Node{
+							Type: html.TextNode,
+							Data: string(cssData),
+						})
+						n.Parent.InsertBefore(styleNode, n)
+						n.Parent.RemoveChild(n)
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			inlineCSS(c)
+		}
+	}
+
+	inlineJS = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "script" {
+			var src string
+			var srcIdx int
+			for i, attr := range n.Attr {
+				if attr.Key == "src" {
+					src = attr.Val
+					srcIdx = i
+				}
+			}
+			if src != "" && !strings.HasPrefix(src, "data:") {
+				jsPath := filepath.Join(htmlDir, src)
+				jsData, err := os.ReadFile(jsPath)
+				if err == nil {
+					n.Attr = append(n.Attr[:srcIdx], n.Attr[srcIdx+1:]...)
+					n.AppendChild(&html.Node{
+						Type: html.TextNode,
+						Data: string(jsData),
+					})
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			inlineJS(c)
+		}
+	}
+
+	inlineImages = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "img" {
+			var src string
+			var srcIdx int
+			for i, attr := range n.Attr {
+				if attr.Key == "src" {
+					src = attr.Val
+					srcIdx = i
+				}
+			}
+			if src != "" && !strings.HasPrefix(src, "data:") && !strings.HasPrefix(src, "http") {
+				imgPath := filepath.Join(htmlDir, src)
+				imgData, err := os.ReadFile(imgPath)
+				if err == nil {
+					ext := strings.TrimPrefix(filepath.Ext(src), ".")
+					switch ext {
+					case "png":
+						n.Attr[srcIdx].Val = "data:image/png;base64," + base64.StdEncoding.EncodeToString(imgData)
+					case "jpg", "jpeg":
+						n.Attr[srcIdx].Val = "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(imgData)
+					case "gif":
+						n.Attr[srcIdx].Val = "data:image/gif;base64," + base64.StdEncoding.EncodeToString(imgData)
+					case "svg":
+						n.Attr[srcIdx].Val = "data:image/svg+xml;base64," + base64.StdEncoding.EncodeToString(imgData)
+					case "webp":
+						n.Attr[srcIdx].Val = "data:image/webp;base64," + base64.StdEncoding.EncodeToString(imgData)
+					case "ico":
+						n.Attr[srcIdx].Val = "data:image/x-icon;base64," + base64.StdEncoding.EncodeToString(imgData)
+					}
+				}
+			}
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			inlineImages(c)
+		}
+	}
+
+	inlineCSS(doc)
+	inlineJS(doc)
+	inlineImages(doc)
+
+	var buf bytes.Buffer
+	if err := html.Render(&buf, doc); err != nil {
+		return rewritten, nil
+	}
+
+	return buf.Bytes(), nil
 }
 
-func isSameHost(base *url.URL, rawURL string) bool {
-	if base == nil {
-		return true
+func batchReplace(input []byte, pairs [][2][]byte) []byte {
+	oldNew := make([]string, 0, len(pairs)*2)
+	for _, p := range pairs {
+		oldNew = append(oldNew, string(p[0]), string(p[1]))
 	}
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return false
-	}
-	return parsed.Hostname() == "" || parsed.Hostname() == base.Hostname()
-}
-
-func ResolveURL(base, href string) string {
-	if href == "" {
-		return ""
-	}
-
-	if strings.HasPrefix(href, "http://") || strings.HasPrefix(href, "https://") {
-		return href
-	}
-
-	baseURL, err := url.Parse(base)
-	if err != nil {
-		return ""
-	}
-
-	refURL, err := url.Parse(href)
-	if err != nil {
-		return ""
-	}
-
-	resolved := baseURL.ResolveReference(refURL)
-	return resolved.String()
+	return []byte(strings.NewReplacer(oldNew...).Replace(string(input)))
 }

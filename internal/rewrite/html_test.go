@@ -201,3 +201,53 @@ func TestExtractFontURLs_NoDoubleCounting(t *testing.T) {
 		t.Errorf("expected 1 unique URL, got %d: %v", len(urls), urls)
 	}
 }
+
+func TestExtractAllCSSURLs(t *testing.T) {
+	r := NewRewriter()
+
+	tests := []struct {
+		name     string
+		css      string
+		expected []string
+	}{
+		{
+			name: "background images",
+			css: `body { background: url("https://example.com/bg.png"); } .card { background-image: url('card.jpg'); }`,
+			expected: []string{"https://example.com/bg.png", "card.jpg"},
+		},
+		{
+			name: "font-face and background",
+			css: `@font-face { src: url('font.woff2'); } body { background: url(bg.jpg); }`,
+			expected: []string{"font.woff2", "bg.jpg"},
+		},
+		{
+			name: "data URIs excluded",
+			css: `body { background: url("data:image/png;base64,abc"); }`,
+			expected: nil,
+		},
+		{
+			name: "no urls",
+			css: `body { color: red; }`,
+			expected: nil,
+		},
+		{
+			name: "empty CSS",
+			css: "",
+			expected: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			urls := r.ExtractAllCSSURLs([]byte(tt.css))
+			if len(urls) != len(tt.expected) {
+				t.Fatalf("expected %d URLs, got %d: %v", len(tt.expected), len(urls), urls)
+			}
+			for i, u := range tt.expected {
+				if urls[i] != u {
+					t.Errorf("URL[%d]: expected %q, got %q", i, u, urls[i])
+				}
+			}
+		})
+	}
+}

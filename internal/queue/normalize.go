@@ -243,7 +243,11 @@ func NormalizeAndClean(rawURL string) string {
 		return normalized
 	}
 
-	u.Fragment = ""
+	// Preserve hash fragments for SPA routing
+	if u.Fragment != "" && !strings.HasPrefix(u.Fragment, "~") {
+		return u.String()
+	}
 
+	u.Fragment = ""
 	return u.String()
 }

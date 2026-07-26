@@ -1,6 +1,7 @@
 package queue
 
 import (
+	"container/heap"
 	"encoding/json"
 	"os"
 	"sync"
@@ -39,6 +40,7 @@ func NewPersistentQueue(filePath string, maxSize int) *PersistentQueue {
 				}
 				pq.seen = state.Seen
 				pq.mu.Unlock()
+				heap.Init(&pq.PriorityQueue)
 			}
 		}
 	}

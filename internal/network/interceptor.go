@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"path"
 	"strings"
@@ -12,12 +13,16 @@ import (
 	"github.com/chromedp/chromedp"
 	"go.uber.org/zap"
 
+	"github.com/user/clone/internal/httpclient"
 	"github.com/user/clone/internal/util"
 )
 
 const (
 	MaxResponseBodySize = 50 * 1024 * 1024
 	maxRetries          = 3
+	maxSeenURLs        = 200000
+	maxResources       = 50000
+	maxAPIResponses    = 10000
 )
 
 type CapturedResource struct {
@@ -27,15 +32,6 @@ type CapturedResource struct {
 	StatusCode int64
 	Timestamp  time.Time
 	Headers    map[string]string
-}
-
-type pendingResponse struct {
-	url       string
-	requestID network.RequestID
-	mimeType  string
-	status    int64
-	headers   map[string]string
-	method    string
 }
 
 type APIRequest struct {
@@ -58,17 +54,30 @@ type APIResponse struct {
 	Request    *APIRequest       `json:"request,omitempty"`
 }
 
+type pendingResource struct {
+	requestID network.RequestID
+	url       string
+	mimeType  string
+	status    int64
+	headers   map[string]string
+	method    string
+	request   *APIRequest
+}
+
 type Interceptor struct {
+	mu              sync.RWMutex
 	resources       map[string]*CapturedResource
 	apiResponses    []APIResponse
 	apiCallback     func(APIResponse)
-	seen            map[string]bool
-	mu              sync.RWMutex
-	baseURL         string
-	pending         []pendingResponse
-	workerSem       chan struct{}
+	seen            *util.LRUSet
+	pending         map[network.RequestID]*pendingResource
 	pendingMethods  map[network.RequestID]string
 	pendingRequests map[network.RequestID]*APIRequest
+	workerSem       chan struct{}
+	baseURL         string
+	fetchWg         sync.WaitGroup
+	fetchCtx        context.Context
+	fetchCancel     context.CancelFunc
 }
 
 func NewInterceptor() *Interceptor {
@@ -81,11 +90,12 @@ func NewInterceptorWithWorkers(workerCount int) *Interceptor {
 	}
 	return &Interceptor{
 		resources:       make(map[string]*CapturedResource),
-		apiResponses:    make([]APIResponse, 0),
-		seen:            make(map[string]bool),
-		workerSem:       make(chan struct{}, workerCount),
+		apiResponses:    make([]APIResponse, 0, maxAPIResponses),
+		seen:            util.NewLRUSet(maxSeenURLs),
+		pending:         make(map[network.RequestID]*pendingResource),
 		pendingMethods:  make(map[network.RequestID]string),
 		pendingRequests: make(map[network.RequestID]*APIRequest),
+		workerSem:       make(chan struct{}, workerCount),
 	}
 }
 
@@ -98,40 +108,50 @@ func (i *Interceptor) SetAPICallback(fn func(APIResponse)) {
 func (i *Interceptor) Start(ctx context.Context, targetURL string) {
 	i.mu.Lock()
 	i.baseURL = targetURL
+	if i.fetchCancel != nil {
+		i.fetchCancel()
+	}
+	i.fetchCtx, i.fetchCancel = context.WithCancel(ctx)
 	i.mu.Unlock()
 
 	chromedp.ListenTarget(ctx, func(ev interface{}) {
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
-			i.mu.Lock()
-			i.pendingMethods[e.RequestID] = e.Request.Method
-			// Capture request body for non-GET requests
-			if e.Request.Method != "GET" && e.Request.PostData != "" {
-				i.pendingRequests[e.RequestID] = &APIRequest{
-					URL:    e.Request.URL,
-					Method: e.Request.Method,
-					Body:   []byte(e.Request.PostData),
-					Headers: func() map[string]string {
-						h := make(map[string]string)
-						for k, v := range e.Request.Headers {
-							if s, ok := v.(string); ok {
-								h[k] = s
-							}
-						}
-						return h
-					}(),
-					Timestamp: time.Now(),
-				}
-			}
-			i.mu.Unlock()
+			i.onRequest(e)
 		case *network.EventResponseReceived:
 			i.onResponse(e)
 		case *network.EventLoadingFinished:
+			i.onLoadingFinished(ctx, e)
 		}
 	})
 
 	if err := chromedp.Run(ctx, network.Enable()); err != nil {
 		util.LogDebug("network enable failed", zap.Error(err))
+	}
+}
+
+func (i *Interceptor) onRequest(ev *network.EventRequestWillBeSent) {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	i.pendingMethods[ev.RequestID] = ev.Request.Method
+
+	if ev.Request.Method != "GET" && ev.Request.PostData != "" {
+		i.pendingRequests[ev.RequestID] = &APIRequest{
+			URL:    ev.Request.URL,
+			Method: ev.Request.Method,
+			Body:   []byte(ev.Request.PostData),
+			Headers: func() map[string]string {
+				h := make(map[string]string)
+				for k, v := range ev.Request.Headers {
+					if s, ok := v.(string); ok {
+						h[k] = s
+					}
+				}
+				return h
+			}(),
+			Timestamp: time.Now(),
+		}
 	}
 }
 
@@ -149,103 +169,106 @@ func (i *Interceptor) onResponse(ev *network.EventResponseReceived) {
 	}
 
 	i.mu.Lock()
-			if i.seen[respURL] {
-				i.mu.Unlock()
-				return
-			}
-			i.seen[respURL] = true
+	defer i.mu.Unlock()
 
-			method := i.pendingMethods[ev.RequestID]
-			delete(i.pendingMethods, ev.RequestID)
+	if i.seen.Contains(respURL) {
+		return
+	}
+	i.seen.Add(respURL)
 
-			delete(i.pendingRequests, ev.RequestID)
+	method := i.pendingMethods[ev.RequestID]
+	delete(i.pendingMethods, ev.RequestID)
 
-	i.pending = append(i.pending, pendingResponse{
-		url:       respURL,
+	req := i.pendingRequests[ev.RequestID]
+	delete(i.pendingRequests, ev.RequestID)
+
+	i.pending[ev.RequestID] = &pendingResource{
 		requestID: ev.RequestID,
+		url:       respURL,
 		mimeType:  ev.Response.MimeType,
 		status:    ev.Response.Status,
 		headers:   h,
 		method:    method,
-	})
-	i.mu.Unlock()
+		request:   req,
+	}
 }
 
-func (i *Interceptor) FetchBodies(ctx context.Context) {
-	i.mu.RLock()
-	pending := make([]pendingResponse, len(i.pending))
-	copy(pending, i.pending)
-	i.mu.RUnlock()
-
-	util.LogDebug("fetching response bodies via CDP", zap.Int("count", len(pending)))
-
-	var wg sync.WaitGroup
-	for _, p := range pending {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		wg.Add(1)
-		i.workerSem <- struct{}{}
-		go func(p pendingResponse) {
-			defer wg.Done()
-			defer func() { <-i.workerSem }()
-
-			body := i.fetchWithRetry(ctx, p.requestID, p.url)
-			if body == nil {
-				return
-			}
-
-			if int64(len(body)) > MaxResponseBodySize {
-				body = body[:MaxResponseBodySize]
-			}
-
-			isJSON := isJSONContentType(p.mimeType)
-			isAPI := isJSON || isAPIContentType(p.url, p.mimeType)
-
-			resource := &CapturedResource{
-				URL:        p.url,
-				Body:       body,
-				MimeType:   p.mimeType,
-				StatusCode: p.status,
-				Timestamp:  time.Now(),
-				Headers:    p.headers,
-			}
-
-			i.mu.Lock()
-			i.resources[p.url] = resource
-			if isJSON || isAPI {
-				var req *APIRequest
-				if r, ok := i.pendingRequests[p.requestID]; ok {
-					req = r
-				}
-				ar := APIResponse{
-					URL:        p.url,
-					Body:       body,
-					MimeType:   p.mimeType,
-					StatusCode: int(p.status),
-					Headers:    p.headers,
-					Method:     p.method,
-					Request:    req,
-				}
-				i.apiResponses = append(i.apiResponses, ar)
-				if i.apiCallback != nil {
-					i.apiCallback(ar)
-				}
-			}
-			i.mu.Unlock()
-		}(p)
+func (i *Interceptor) onLoadingFinished(ctx context.Context, ev *network.EventLoadingFinished) {
+	i.mu.Lock()
+	p, ok := i.pending[ev.RequestID]
+	if !ok {
+		i.mu.Unlock()
+		return
 	}
-	wg.Wait()
+	delete(i.pending, ev.RequestID)
+	i.mu.Unlock()
+
+	select {
+	case i.workerSem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	i.fetchWg.Add(1)
+	go func() {
+		defer i.fetchWg.Done()
+		defer func() { <-i.workerSem }()
+		i.fetchAndProcess(ctx, p)
+	}()
+}
+
+func (i *Interceptor) fetchAndProcess(ctx context.Context, p *pendingResource) {
+	body := i.fetchWithRetry(ctx, p.requestID, p.url)
+	if body == nil {
+		return
+	}
+
+	if int64(len(body)) > MaxResponseBodySize {
+		body = body[:MaxResponseBodySize]
+	}
+
+	resource := &CapturedResource{
+		URL:        p.url,
+		Body:       body,
+		MimeType:   p.mimeType,
+		StatusCode: p.status,
+		Timestamp:  time.Now(),
+		Headers:    p.headers,
+	}
+
+	isJSON := isJSONContentType(p.mimeType) || isAPIContentType(p.url, p.mimeType)
+
+	i.mu.Lock()
+	if len(i.resources) < maxResources {
+		i.resources[p.url] = resource
+	}
+
+	if isJSON {
+		ar := APIResponse{
+			URL:        p.url,
+			Body:       body,
+			MimeType:   p.mimeType,
+			StatusCode: int(p.status),
+			Headers:    p.headers,
+			Method:     p.method,
+			Timestamp:  time.Now(),
+			Size:       len(body),
+			Request:    p.request,
+		}
+		if len(i.apiResponses) < maxAPIResponses {
+			i.apiResponses = append(i.apiResponses, ar)
+		}
+		if i.apiCallback != nil {
+			i.apiCallback(ar)
+		}
+	}
+	i.mu.Unlock()
 }
 
 func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestID, url string) []byte {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			select {
-			case <-time.After(time.Duration(attempt*500) * time.Millisecond):
+			case <-time.After(time.Duration(attempt*300) * time.Millisecond):
 			case <-ctx.Done():
 				return nil
 			}
@@ -264,10 +287,92 @@ func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestI
 	return nil
 }
 
+func (i *Interceptor) FetchBodies(ctx context.Context) {
+	i.fetchWg.Wait()
+
+	i.mu.Lock()
+	remaining := make([]*pendingResource, 0, len(i.pending))
+	for _, p := range i.pending {
+		remaining = append(remaining, p)
+	}
+	i.pending = make(map[network.RequestID]*pendingResource)
+	i.mu.Unlock()
+
+	if len(remaining) == 0 {
+		return
+	}
+
+	util.LogDebug("fetching remaining response bodies via CDP", zap.Int("count", len(remaining)))
+
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer fetchCancel()
+
+	var wg sync.WaitGroup
+	for _, p := range remaining {
+		wg.Add(1)
+		i.workerSem <- struct{}{}
+		go func(pr *pendingResource) {
+			defer wg.Done()
+			defer func() { <-i.workerSem }()
+
+			body := i.fetchWithRetry(fetchCtx, pr.requestID, pr.url)
+			if body == nil {
+				return
+			}
+
+			if int64(len(body)) > MaxResponseBodySize {
+				body = body[:MaxResponseBodySize]
+			}
+
+			resource := &CapturedResource{
+				URL:        pr.url,
+				Body:       body,
+				MimeType:   pr.mimeType,
+				StatusCode: pr.status,
+				Timestamp:  time.Now(),
+				Headers:    pr.headers,
+			}
+
+			isJSON := isJSONContentType(pr.mimeType) || isAPIContentType(pr.url, pr.mimeType)
+
+			i.mu.Lock()
+			if len(i.resources) < maxResources {
+				i.resources[pr.url] = resource
+			}
+
+			if isJSON {
+				ar := APIResponse{
+					URL:        pr.url,
+					Body:       body,
+					MimeType:   pr.mimeType,
+					StatusCode: int(pr.status),
+					Headers:    pr.headers,
+					Method:     pr.method,
+					Timestamp:  time.Now(),
+					Size:       len(body),
+					Request:    pr.request,
+				}
+				if len(i.apiResponses) < maxAPIResponses {
+					i.apiResponses = append(i.apiResponses, ar)
+				}
+				if i.apiCallback != nil {
+					i.apiCallback(ar)
+				}
+			}
+			i.mu.Unlock()
+		}(p)
+	}
+	wg.Wait()
+}
+
 func (i *Interceptor) GetResources() map[string]*CapturedResource {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	return i.resources
+	result := make(map[string]*CapturedResource, len(i.resources))
+	for k, v := range i.resources {
+		result[k] = v
+	}
+	return result
 }
 
 func (i *Interceptor) GetResource(url string) (*CapturedResource, bool) {
@@ -288,7 +393,67 @@ func (i *Interceptor) GetAPIResponses() []APIResponse {
 func (i *Interceptor) IsCaptured(url string) bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
-	return i.seen[url]
+	return i.seen.Contains(url)
+}
+
+func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource, error) {
+	if i.baseURL == "" {
+		return nil, nil
+	}
+
+	req, err := http.NewRequest("GET", rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Referer", i.baseURL)
+
+	resp, err := httpclient.GlobalClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil
+	}
+
+	var body []byte
+	for {
+		buf := make([]byte, 32768)
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			body = append(body, buf[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	if int64(len(body)) > MaxResponseBodySize {
+		body = body[:MaxResponseBodySize]
+	}
+
+	if len(body) == 0 {
+		return nil, nil
+	}
+
+	contentType := resp.Header.Get("Content-Type")
+
+	headers := make(map[string]string)
+	for k := range resp.Header {
+		headers[k] = resp.Header.Get(k)
+	}
+
+	return &CapturedResource{
+		URL:        rawURL,
+		Body:       body,
+		MimeType:   contentType,
+		StatusCode: int64(resp.StatusCode),
+		Timestamp:  time.Now(),
+		Headers:    headers,
+	}, nil
 }
 
 func AssetPath(urlStr string, mimeType string) string {
@@ -313,26 +478,36 @@ func AssetPath(urlStr string, mimeType string) string {
 
 func extensionForMime(mime string) string {
 	switch {
-	case mime == "text/html":
+	case strings.Contains(mime, "text/html"):
 		return ".html"
-	case mime == "text/css":
+	case strings.Contains(mime, "text/css"):
 		return ".css"
-	case mime == "text/javascript" || mime == "application/javascript":
+	case strings.Contains(mime, "javascript"):
 		return ".js"
-	case mime == "image/png":
+	case strings.Contains(mime, "image/png"):
 		return ".png"
-	case mime == "image/jpeg":
+	case strings.Contains(mime, "image/jpeg"):
 		return ".jpg"
-	case mime == "image/gif":
+	case strings.Contains(mime, "image/gif"):
 		return ".gif"
-	case mime == "image/svg+xml":
+	case strings.Contains(mime, "image/svg"):
 		return ".svg"
-	case mime == "font/woff":
-		return ".woff"
-	case mime == "font/woff2":
+	case strings.Contains(mime, "image/webp"):
+		return ".webp"
+	case strings.Contains(mime, "image/x-icon"):
+		return ".ico"
+	case strings.Contains(mime, "font/woff2"):
 		return ".woff2"
-	case mime == "application/json":
+	case strings.Contains(mime, "font/woff"):
+		return ".woff"
+	case strings.Contains(mime, "font/ttf"):
+		return ".ttf"
+	case strings.Contains(mime, "font/eot"):
+		return ".eot"
+	case strings.Contains(mime, "application/json"):
 		return ".json"
+	case strings.Contains(mime, "application/pdf"):
+		return ".pdf"
 	default:
 		return ""
 	}
@@ -373,3 +548,37 @@ func isAPIContentType(urlStr, mime string) bool {
 	}
 	return false
 }
+
+func (i *Interceptor) HasURL(rawURL string) bool {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	_, ok := i.resources[rawURL]
+	return ok
+}
+
+func (i *Interceptor) GetMissingResources() []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	var missing []string
+	for _, urlStr := range i.seen.Keys() {
+		if _, ok := i.resources[urlStr]; !ok {
+			missing = append(missing, urlStr)
+		}
+	}
+	return missing
+}
+
+func (i *Interceptor) GetAllSeenURLs() []string {
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return i.seen.Keys()
+}
+
+func (i *Interceptor) Close() {
+	if i.fetchCancel != nil {
+		i.fetchCancel()
+	}
+	i.fetchWg.Wait()
+}
+
+
