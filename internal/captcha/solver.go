@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/chromedp/chromedp"
@@ -371,40 +370,6 @@ func (s *Solver) pollCapMonster(ctx context.Context, taskID string) (*SolveRespo
 
 		return nil, fmt.Errorf("unexpected response: %v", result)
 	}
-}
-
-func detectCAPTCHAType(html string) CAPTCHAType {
-	if strings.Contains(html, "recaptcha") || strings.Contains(html, "google.com/recaptcha") {
-		return TypeRecaptchaV2
-	}
-	if strings.Contains(html, "hcaptcha") || strings.Contains(html, "hcaptcha.com") {
-		return TypeHCaptcha
-	}
-	if strings.Contains(html, "cf-turnstile") || strings.Contains(html, "challenges.cloudflare.com") {
-		return TypeTurnstile
-	}
-	return TypeImageCaptcha
-}
-
-func FindCAPTCHAElements(ctx context.Context) map[string]string {
-	result := make(map[string]string)
-
-	script := `
-		(function() {
-			var result = {};
-			var el = document.querySelector('.g-recaptcha, div[data-sitekey], .h-captcha, .cf-turnstile');
-			if (el) {
-				result.sitekey = el.getAttribute('data-sitekey') || '';
-				result.type = el.classList.contains('g-recaptcha') ? 'recaptcha' :
-					el.classList.contains('h-captcha') ? 'hcaptcha' : 'turnstile';
-			}
-			return JSON.stringify(result);
-		})()
-	`
-	var res string
-	_ = chromedp.Run(ctx, chromedp.Evaluate(script, &res))
-	_ = json.Unmarshal([]byte(res), &result)
-	return result
 }
 
 func (s *Solver) InjectSolution(ctx context.Context, token string) error {

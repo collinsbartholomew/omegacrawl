@@ -205,7 +205,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	}
 
 	maxConcurrent := cfg.MaxConcurrentPages
-	if maxConcurrent < 1 {
+	if maxConcurrent < 1 || cfg.Interactive {
 		maxConcurrent = 1
 	}
 	sem := make(chan struct{}, maxConcurrent)
@@ -306,7 +306,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		c.changeDetector = changedetection.NewDetector(snapDir)
 	}
 
-	if cfg.CAPTCHAConfig != nil && cfg.CAPTCHAConfig.Enabled {
+	if !cfg.Interactive && cfg.CAPTCHAConfig != nil && cfg.CAPTCHAConfig.Enabled {
 		c.captchaSolver = captcha.NewSolver(cfg.CAPTCHAConfig)
 	}
 
@@ -365,7 +365,7 @@ func (c *Crawler) Start(seeds []string) error {
 	}
 
 	c.allocOpts = append(chromedp.DefaultExecAllocatorOptions[:],
-		chromedp.Flag("headless", true),
+		chromedp.Flag("headless", !c.cfg.Interactive),
 		chromedp.Flag("disable-gpu", true),
 		chromedp.Flag("no-sandbox", true),
 		chromedp.Flag("disable-dev-shm-usage", true),
@@ -389,6 +389,9 @@ func (c *Crawler) Start(seeds []string) error {
 	if proxy != "" {
 		c.allocOpts = append(c.allocOpts, chromedp.ProxyServer(proxy))
 	}
+	if c.cfg.Interactive {
+		c.allocOpts = append(c.allocOpts, chromedp.Flag("start-maximized", true))
+	}
 
 	if err := c.launchBrowser(); err != nil {
 		return err
@@ -398,8 +401,35 @@ func (c *Crawler) Start(seeds []string) error {
 	go c.periodicCheckpoint()
 	go c.reportProgress()
 	go c.periodicCleanup()
+	go c.periodicCookieSave()
 
 	c.loadCookieJar()
+
+	if c.cfg.Interactive && c.cfg.AuthConfig != nil && c.cfg.AuthConfig.Enabled && c.cfg.AuthConfig.LoginURL != "" {
+		fmt.Println("\n=== Pre-crawl Login Phase ===")
+		fmt.Printf("Login URL: %s\n", c.cfg.AuthConfig.LoginURL)
+		fmt.Println("Log in manually in the browser, then press Enter to begin crawling.")
+		fmt.Print("Press Enter when ready (or 'q' to quit): ")
+
+		loginCtx, loginCancel := chromedp.NewContext(browserCtx)
+		if err := chromedp.Run(loginCtx, chromedp.Navigate(c.cfg.AuthConfig.LoginURL)); err != nil {
+			loginCancel()
+			return fmt.Errorf("failed to navigate to login URL: %w", err)
+		}
+		c.waitForPage(loginCtx)
+
+		var input string
+		if _, err := fmt.Scanln(&input); err == nil {
+			if input == "q" || input == "Q" || input == "quit" || input == "exit" {
+				loginCancel()
+				util.LogInfo("user cancelled during pre-crawl login")
+				return nil
+			}
+		}
+		c.persistCookies(loginCtx, c.cfg.AuthConfig.LoginURL)
+		loginCancel()
+		fmt.Println("Login captured. Starting crawl...")
+	}
 
 	util.LogInfo("starting crawl",
 		zap.Int("seeds", len(seeds)),
@@ -410,7 +440,14 @@ func (c *Crawler) Start(seeds []string) error {
 		zap.Bool("infinite_scroll", c.cfg.InfiniteScroll.Enabled),
 		zap.Bool("stealth", c.cfg.EnableStealth),
 		zap.Bool("respect_robots", c.cfg.RespectRobots),
-	)
+		zap.Bool("interactive", c.cfg.Interactive),
+	) 
+	if c.cfg.Interactive {
+		fmt.Println("\n=== Interactive Mode ===")
+		fmt.Println("Browser is visible. Solve CAPTCHAs or fill forms manually.")
+		fmt.Println("You will be prompted on each page before content is captured.")
+		fmt.Println("========================")
+	}
 
 Loop:
 	for c.urlQueue.Size() > 0 {
@@ -1447,7 +1484,7 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	c.setCookies(tabCtx)
 	c.injectPersistedCookies(tabCtx, urlStr)
 
-	if c.authManager != nil && c.cfg.AuthConfig != nil && c.cfg.AuthConfig.Enabled {
+	if !c.cfg.Interactive && c.authManager != nil && c.cfg.AuthConfig != nil && c.cfg.AuthConfig.Enabled {
 		if err := c.authManager.Authenticate(tabCtx, urlStr); err != nil {
 			util.LogError("authentication failed", err, zap.String("url", urlStr))
 		}
@@ -1581,6 +1618,10 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		if err := chromedp.Run(tabCtx, chromedp.Evaluate(js, nil)); err != nil {
 			util.LogDebug("js after load failed", zap.Error(err))
 		}
+	}
+
+	if c.cfg.Interactive {
+		c.promptUser(tabCtx, urlStr)
 	}
 
 	// Systematic interaction engine - click all links, fill forms, etc.
@@ -2829,6 +2870,20 @@ func (c *Crawler) saveCookieJar() {
 	os.WriteFile(path, data, 0644)
 }
 
+func (c *Crawler) periodicCookieSave() {
+	cookieTicker := time.NewTicker(5 * time.Minute)
+	defer cookieTicker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			c.saveCookieJar()
+			return
+		case <-cookieTicker.C:
+			c.saveCookieJar()
+		}
+	}
+}
+
 func (c *Crawler) loadCookieJar() {
 	path := filepath.Join(c.cfg.OutputDir, cookieJarFile)
 	data, err := os.ReadFile(path)
@@ -3289,6 +3344,22 @@ func (c *Crawler) periodicCheckpoint() {
 	}
 }
 
+func (c *Crawler) promptUser(tabCtx context.Context, urlStr string) {
+	fmt.Printf("\n=== Interactive Mode ===\n")
+	fmt.Printf("Page: %s\n", urlStr)
+	fmt.Print("Press Enter after handling any challenges in the browser (or 'q' to quit): ")
+	var input string
+	_, err := fmt.Scanln(&input)
+	if err != nil {
+		util.LogDebug("interactive prompt error", zap.Error(err))
+		return
+	}
+	if input == "q" || input == "Q" || input == "quit" || input == "exit" {
+		util.LogInfo("user requested stop in interactive mode")
+		c.Stop()
+	}
+}
+
 func (c *Crawler) solveCaptcha(tabCtx context.Context, urlStr string, html string) {
 	if c.captchaSolver == nil || c.cfg.CAPTCHAConfig == nil || !c.cfg.CAPTCHAConfig.Enabled {
 		return
@@ -3423,13 +3494,19 @@ func (c *Crawler) injectCaptchaToken(tabCtx context.Context, token string, elems
 	captchaType := elems["type"]
 	switch captchaType {
 	case "hcaptcha":
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(
-			fmt.Sprintf(`document.querySelector('[data-hcaptcha-response]').innerHTML = %s;`, tokenStr), nil))
+		if err := chromedp.Run(tabCtx, chromedp.Evaluate(
+			fmt.Sprintf(`document.querySelector('[data-hcaptcha-response]').innerHTML = %s;`, tokenStr), nil)); err != nil {
+			util.LogDebug("failed to inject hcaptcha token", zap.Error(err))
+		}
 	case "turnstile":
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(
-			fmt.Sprintf(`document.querySelector('[data-turnstile-response]').innerHTML = %s;`, tokenStr), nil))
+		if err := chromedp.Run(tabCtx, chromedp.Evaluate(
+			fmt.Sprintf(`document.querySelector('[data-turnstile-response]').innerHTML = %s;`, tokenStr), nil)); err != nil {
+			util.LogDebug("failed to inject turnstile token", zap.Error(err))
+		}
 	default:
-		_ = chromedp.Run(tabCtx, chromedp.Evaluate(
-			fmt.Sprintf(`var e = document.getElementById("g-recaptcha-response"); if(e) e.innerHTML = %s;`, tokenStr), nil))
+		if err := chromedp.Run(tabCtx, chromedp.Evaluate(
+			fmt.Sprintf(`var e = document.getElementById("g-recaptcha-response"); if(e) e.innerHTML = %s;`, tokenStr), nil)); err != nil {
+			util.LogDebug("failed to inject recaptcha token", zap.Error(err))
+		}
 	}
 }

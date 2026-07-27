@@ -22,11 +22,10 @@ type RateLimiter struct {
 }
 
 type hostLimiter struct {
-	limiter      *rate.Limiter
-	lastSeen     time.Time
-	lastLatency  time.Duration
-	observedRate time.Duration
-	mu           sync.Mutex
+	limiter     *rate.Limiter
+	lastSeen    time.Time
+	lastLatency time.Duration
+	mu          sync.Mutex
 }
 
 func New(defaultDelay time.Duration, burstSize int) *RateLimiter {

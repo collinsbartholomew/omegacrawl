@@ -86,11 +86,6 @@ var trackingParams = map[string]bool{
 	"spm_":          true,
 }
 
-var defaultPorts = map[string]string{
-	"http":  "",
-	"https": "",
-}
-
 func NormalizeURL(rawURL string) string {
 	if rawURL == "" {
 		return ""

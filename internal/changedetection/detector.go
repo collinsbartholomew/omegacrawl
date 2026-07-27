@@ -50,11 +50,6 @@ type DiffReport struct {
 	NewHash     string    `json:"new_hash"`
 }
 
-type contentHash struct {
-	hash    string
-	element string
-}
-
 type Detector struct {
 	snapDir   string
 	snapshots map[string]*Snapshot

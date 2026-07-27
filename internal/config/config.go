@@ -78,6 +78,7 @@ type Config struct {
 	DisableTLSVerify bool `json:"disable_tls_verify"`
 	Incremental      bool   `json:"incremental"`
 	IncCacheFile     string `json:"inc_cache_file"`
+	Interactive      bool   `json:"interactive"` // show browser window, user handles CAPTCHAs and forms manually
 
 	AuthConfig           *AuthConfig           `json:"auth"`
 	CAPTCHAConfig        *CAPTCHAConfig        `json:"captcha"`

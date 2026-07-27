@@ -1047,6 +1047,7 @@ func (r *Rewriter) GenerateSingleFileHTML(htmlContent []byte, htmlLocalPath stri
 
 	doc, err := html.Parse(bytes.NewReader(rewritten))
 	if err != nil {
+		util.LogDebug("failed to parse HTML for single-file", zap.Error(err))
 		return rewritten, nil
 	}
 
@@ -1156,6 +1157,7 @@ func (r *Rewriter) GenerateSingleFileHTML(htmlContent []byte, htmlLocalPath stri
 
 	var buf bytes.Buffer
 	if err := html.Render(&buf, doc); err != nil {
+		util.LogDebug("failed to render single-file HTML", zap.Error(err))
 		return rewritten, nil
 	}
 
