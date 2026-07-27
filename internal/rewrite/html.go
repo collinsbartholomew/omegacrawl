@@ -786,7 +786,6 @@ func (r *Rewriter) processCSSImports(cssPath string, mappings map[string]string,
 	}
 	processed[cssPath] = true
 
-	cssDir := filepath.Dir(cssPath)
 	cssData, err := os.ReadFile(cssPath)
 	if err != nil {
 		return
@@ -806,38 +805,10 @@ func (r *Rewriter) processCSSImports(cssPath string, mappings map[string]string,
 			continue
 		}
 
-		importedCSS, err := os.ReadFile(localPath)
-		if err != nil {
-			continue
-		}
-
-		rewritten := importedCSS
-		rewritten = cssURLPattern.ReplaceAllFunc(rewritten, func(m []byte) []byte {
-			start := bytes.IndexByte(m, '(')
-			end := bytes.IndexByte(m, ')')
-			if start < 0 || end < 0 {
-				return m
-			}
-			urlStr := string(bytes.TrimSpace(m[start+1 : end]))
-			urlStr = strings.Trim(urlStr, `"' `)
-			if local, ok2 := mappings[urlStr]; ok2 {
-				relPath, err := filepath.Rel(cssDir, local)
-				if err != nil {
-					relPath = local
-				}
-				relPath = filepath.ToSlash(relPath)
-				quote := byte('"')
-				if bytes.Contains(m, []byte(`'`)) {
-					quote = byte('\'')
-				}
-				return []byte(`url(` + string(quote) + relPath + string(quote) + `)`)
-			}
-			return m
-		})
-
-		if err := os.WriteFile(localPath, rewritten, 0644); err != nil {
-			util.LogError("failed to write recursively rewritten CSS", err, zap.String("path", localPath))
-		}
+		// NOTE: We do NOT write back to imported files (localPath) to avoid
+		// mutating shared files. The URL rewriting for imports is handled
+		// at the entry-point CSS level. This prevents issues where the same
+		// imported file is used by multiple entry points with different relative paths.
 
 		r.processCSSImports(localPath, mappings, processed)
 	}

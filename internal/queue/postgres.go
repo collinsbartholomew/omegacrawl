@@ -8,6 +8,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/user/clone/internal/util"
 )
 
 type PostgresQueue struct {
@@ -157,16 +159,39 @@ func (q *PostgresQueue) AllVisited() map[string]bool {
 func (q *PostgresQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 10*time.Second)
 	defer opCancel()
-	_, _ = q.pool.Exec(opCtx, `DELETE FROM crawl_queue`)
+	tx, err := q.pool.Begin(opCtx)
+	if err != nil {
+		util.LogError("postgres checkpoint load: begin tx failed", err)
+		return
+	}
+	defer tx.Rollback(opCtx)
+
+	if _, err := tx.Exec(opCtx, `DELETE FROM crawl_queue`); err != nil {
+		util.LogError("postgres checkpoint load: delete failed", err)
+		return
+	}
+
 	batch := &pgx.Batch{}
 	for _, item := range items {
-		itemData, _ := json.Marshal(item)
+		itemData, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
 		batch.Queue(`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, $2, $3, TRUE)`, item.URL, item.Depth, itemData)
 	}
 	for url := range visited {
 		batch.Queue(`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, 0, '{}', TRUE) ON CONFLICT (url) DO NOTHING`, url)
 	}
-	_ = q.pool.SendBatch(opCtx, batch)
+
+	br := tx.SendBatch(opCtx, batch)
+	if err := br.Close(); err != nil {
+		util.LogError("postgres checkpoint load: batch failed", err)
+		return
+	}
+
+	if err := tx.Commit(opCtx); err != nil {
+		util.LogError("postgres checkpoint load: commit failed", err)
+	}
 }
 
 func (q *PostgresQueue) Close() error {

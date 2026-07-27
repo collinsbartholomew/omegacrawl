@@ -39,11 +39,13 @@ type CircuitBreaker struct {
 	timeout          time.Duration
 	lastFailure      time.Time
 	halfOpenProbes   int32
+	maxHalfOpenProbes int32
 }
 
 type HostCircuitBreaker struct {
 	breakers       *mysync.ShardedMap[string, *CircuitBreaker]
 	defaultConfig  *Config
+	createMu       sync.Mutex
 }
 
 type Config struct {
@@ -70,11 +72,19 @@ func NewHostCircuitBreaker() *HostCircuitBreaker {
 }
 
 func (hcb *HostCircuitBreaker) getOrCreate(host string) *CircuitBreaker {
-	cb, ok := hcb.breakers.Get(host)
-	if !ok {
-		cb = NewCircuitBreaker(hcb.defaultConfig)
-		hcb.breakers.Set(host, cb)
+	// Fast path - try to get existing
+	if cb, ok := hcb.breakers.Get(host); ok {
+		return cb
 	}
+	// Slow path - create new (serialized)
+	hcb.createMu.Lock()
+	defer hcb.createMu.Unlock()
+	// Double-check after acquiring lock
+	if cb, ok := hcb.breakers.Get(host); ok {
+		return cb
+	}
+	cb := NewCircuitBreaker(hcb.defaultConfig)
+	hcb.breakers.Set(host, cb)
 	return cb
 }
 
@@ -105,7 +115,11 @@ func (hcb *HostCircuitBreaker) Reset(host string) {
 
 func (hcb *HostCircuitBreaker) Cleanup() {
 	hcb.breakers.Range(func(key string, val *CircuitBreaker) bool {
-		if val.State() == StateClosed && val.failureCount == 0 {
+		val.mu.Lock()
+		state := State(atomic.LoadInt32((*int32)(&val.state)))
+		fc := val.failureCount
+		val.mu.Unlock()
+		if (state == StateClosed && fc == 0) || state == StateOpen || state == StateHalfOpen {
 			hcb.breakers.Delete(key)
 		}
 		return true
@@ -117,11 +131,12 @@ func NewCircuitBreaker(cfg *Config) *CircuitBreaker {
 		cfg = DefaultConfig()
 	}
 	return &CircuitBreaker{
-		state:            StateClosed,
-		failureThreshold: cfg.FailureThreshold,
-		successThreshold: cfg.SuccessThreshold,
-		timeout:          cfg.Timeout,
-		halfOpenProbes:   int32(cfg.HalfOpenMaxProbes),
+		state:             StateClosed,
+		failureThreshold:  cfg.FailureThreshold,
+		successThreshold:  cfg.SuccessThreshold,
+		timeout:           cfg.Timeout,
+		halfOpenProbes:    int32(cfg.HalfOpenMaxProbes),
+		maxHalfOpenProbes: int32(cfg.HalfOpenMaxProbes),
 	}
 }
 
@@ -133,9 +148,11 @@ func (cb *CircuitBreaker) Allow() bool {
 	case StateOpen:
 		if time.Since(cb.lastFailure) > cb.timeout {
 			if atomic.CompareAndSwapInt32((*int32)(&cb.state), int32(StateOpen), int32(StateHalfOpen)) {
-				atomic.StoreInt32(&cb.halfOpenProbes, 1)
+				atomic.StoreInt32(&cb.halfOpenProbes, int32(cb.maxHalfOpenProbes))
+				return true
 			}
-			return true
+			// CAS failed - another goroutine already transitioned, don't allow
+			return false
 		}
 		return false
 	case StateHalfOpen:
@@ -157,6 +174,7 @@ func (cb *CircuitBreaker) Success() {
 			atomic.StoreInt32((*int32)(&cb.state), int32(StateClosed))
 			cb.failureCount = 0
 			cb.successCount = 0
+			atomic.StoreInt32(&cb.halfOpenProbes, cb.maxHalfOpenProbes)
 		}
 	case StateClosed:
 		cb.failureCount = 0

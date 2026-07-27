@@ -46,7 +46,7 @@ Examples:
 	rootCmd.Flags().IntP("depth", "d", 10, "max crawl depth")
 	rootCmd.Flags().IntP("concurrency", "n", 5, "max concurrent pages")
 	rootCmd.Flags().StringP("output", "o", "output", "output directory")
-	rootCmd.Flags().BoolP("screenshot", "s", true, "take screenshots")
+	rootCmd.Flags().BoolP("screenshot", "s", false, "take screenshots")
 	rootCmd.Flags().BoolP("pdf", "p", false, "generate PDFs")
 	rootCmd.Flags().String("proxy", "", "proxy URL")
 	rootCmd.Flags().Duration("timeout", 120*time.Second, "page load timeout")
@@ -56,6 +56,7 @@ Examples:
 	rootCmd.Flags().Int("max-urls", 10000, "max URLs per host")
 	rootCmd.Flags().Bool("scroll", true, "infinite scroll detection")
 	rootCmd.Flags().Bool("interact", false, "enable systematic interaction engine (click links, fill forms)")
+	rootCmd.Flags().Bool("interactive", false, "interactive mode (visible browser, user handles CAPTCHAs and forms manually)")
 
 	serveCmd := &cobra.Command{
 		Use:   "serve [directory]",
@@ -182,6 +183,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 	maxURLs, _ := cmd.Flags().GetInt("max-urls")
 	scroll, _ := cmd.Flags().GetBool("scroll")
 	interact, _ := cmd.Flags().GetBool("interact")
+	interactive, _ := cmd.Flags().GetBool("interactive")
 
 	cfg.MaxDepth = maxDepth
 	cfg.MaxConcurrentPages = concurrency
@@ -195,6 +197,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 	cfg.CrawlDelay = delay
 	cfg.MaxURLsPerHost = maxURLs
 	cfg.EnableInteractionEngine = interact
+	cfg.Interactive = interactive
 
 	if cfg.InfiniteScroll == nil {
 		cfg.InfiniteScroll = &config.InfiniteScrollConfig{}

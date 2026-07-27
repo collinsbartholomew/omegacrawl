@@ -26,6 +26,10 @@ type AuthManager struct {
 	jarMu     sync.RWMutex
 	token     *OAuthToken
 	tokenMu   sync.RWMutex
+
+	formTabOnce   sync.Once
+	formTabCtx    context.Context
+	formTabCancel context.CancelFunc
 }
 
 func NewAuthManager(cfg *config.AuthConfig) *AuthManager {
@@ -67,8 +71,10 @@ func (am *AuthManager) formLogin(ctx context.Context, targetURL string) error {
 		zap.String("target", targetURL),
 	)
 
-	tabCtx, cancel := chromedp.NewContext(ctx)
-	defer cancel()
+	am.formTabOnce.Do(func() {
+		am.formTabCtx, am.formTabCancel = chromedp.NewContext(ctx)
+	})
+	tabCtx := am.formTabCtx
 
 	if err := chromedp.Run(tabCtx, chromedp.Navigate(am.cfg.LoginURL)); err != nil {
 		return fmt.Errorf("navigate to login page: %w", err)
@@ -180,19 +186,18 @@ func (am *AuthManager) oauthFlow(ctx context.Context, targetURL string) error {
 		return fmt.Errorf("oauth config required for oauth auth type")
 	}
 
-	am.tokenMu.RLock()
-	valid := am.token != nil && am.token.IsValid()
-	am.tokenMu.RUnlock()
-	if valid {
+	am.tokenMu.Lock()
+	if am.token != nil && am.token.IsValid() {
+		am.tokenMu.Unlock()
 		return am.injectOAuthToken(ctx)
 	}
 
 	token, err := am.exchangeOAuthToken(ctx)
 	if err != nil {
+		am.tokenMu.Unlock()
 		return fmt.Errorf("oauth token exchange failed: %w", err)
 	}
 
-	am.tokenMu.Lock()
 	am.token = token
 	am.tokenMu.Unlock()
 
@@ -298,4 +303,11 @@ func (t *OAuthToken) IsValid() bool {
 		return false
 	}
 	return time.Now().Before(t.ExpiresAt.Add(-30 * time.Second))
+}
+
+func (am *AuthManager) Close() {
+	if am.formTabCancel != nil {
+		am.formTabCancel()
+	}
+	am.formTabOnce = sync.Once{} // Allow re-initialization
 }

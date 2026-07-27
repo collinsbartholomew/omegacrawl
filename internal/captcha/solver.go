@@ -113,20 +113,28 @@ func (s *Solver) Solve(ctx context.Context, req SolveRequest) (*SolveResponse, e
 }
 
 func (s *Solver) createTaskAndPoll(ctx context.Context, task map[string]interface{}) (*SolveResponse, error) {
-	var endpoint string
+	var idField string
+	var poll func(context.Context, string) (*SolveResponse, error)
 	switch s.provider {
 	case Provider2Captcha, ProviderAntiCaptcha:
-		endpoint = s.baseURL + "/createTask"
-		return s.handle2Captcha(ctx, endpoint, task)
+		idField = "captchaId"
+		poll = s.poll2Captcha
 	case ProviderCapMonster:
-		endpoint = s.baseURL + "/createTask"
-		return s.handleCapMonster(ctx, endpoint, task)
+		idField = "taskId"
+		poll = s.pollCapMonster
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", s.provider)
 	}
+	return s.submitTaskAndPoll(ctx, s.baseURL+"/createTask", task, idField, poll)
 }
 
-func (s *Solver) handle2Captcha(ctx context.Context, endpoint string, task map[string]interface{}) (*SolveResponse, error) {
+func (s *Solver) submitTaskAndPoll(
+	ctx context.Context,
+	endpoint string,
+	task map[string]interface{},
+	idField string,
+	poll func(context.Context, string) (*SolveResponse, error),
+) (*SolveResponse, error) {
 	requestBody := map[string]interface{}{
 		"apiKey": s.apiKey,
 	}
@@ -165,63 +173,12 @@ func (s *Solver) handle2Captcha(ctx context.Context, endpoint string, task map[s
 		return nil, fmt.Errorf("provider error %d", int(errorID))
 	}
 
-	var taskID string
-	if captchaID, ok := result["captchaId"].(string); ok {
-		taskID = captchaID
-	} else {
-		return nil, fmt.Errorf("missing captchaId in response")
+	taskID, ok := result[idField].(string)
+	if !ok {
+		return nil, fmt.Errorf("missing %s in response", idField)
 	}
 
-	return s.poll2Captcha(ctx, taskID)
-}
-
-func (s *Solver) handleCapMonster(ctx context.Context, endpoint string, task map[string]interface{}) (*SolveResponse, error) {
-	requestBody := map[string]interface{}{
-		"apiKey": s.apiKey,
-	}
-	for k, v := range task {
-		requestBody[k] = v
-	}
-
-	jsonData, err := json.Marshal(requestBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal task request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBuffer(jsonData))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("provider API error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	var result map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if errorID, ok := result["errorId"].(float64); ok && errorID != 0 {
-		return nil, fmt.Errorf("provider error %d", int(errorID))
-	}
-
-	var taskID string
-	if id, ok := result["taskId"].(string); ok {
-		taskID = id
-	} else {
-		return nil, fmt.Errorf("missing taskId in response")
-	}
-
-	return s.pollCapMonster(ctx, taskID)
+	return poll(ctx, taskID)
 }
 
 func (s *Solver) poll2Captcha(ctx context.Context, taskID string) (*SolveResponse, error) {

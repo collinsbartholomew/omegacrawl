@@ -23,6 +23,8 @@ type KafkaQueue struct {
 	wg        sync.WaitGroup
 	pending   atomic.Int64
 	parentCtx context.Context
+	seenCtx    context.Context
+	seenCancel context.CancelFunc
 }
 
 func NewKafkaQueue(ctx context.Context, kafkaURL string) (*KafkaQueue, error) {
@@ -44,16 +46,19 @@ func NewKafkaQueueWithSize(ctx context.Context, kafkaURL string, maxSize int) (*
 		CommitInterval: 1 * time.Second,
 	})
 
+	seenCtx, seenCancel := context.WithCancel(ctx)
 	q := &KafkaQueue{
-		writer:    writer,
-		reader:    reader,
-		key:       "crawl:queue",
-		maxSize:   maxSize,
-		seenSet:   make(map[string]bool),
-		seenTopic: "crawl_seen",
-		brokers:   []string{kafkaURL},
-		closeCh:   make(chan struct{}),
-		parentCtx: ctx,
+		writer:     writer,
+		reader:     reader,
+		key:        "crawl:queue",
+		maxSize:    maxSize,
+		seenSet:    make(map[string]bool),
+		seenTopic:  "crawl_seen",
+		brokers:    []string{kafkaURL},
+		closeCh:    make(chan struct{}),
+		parentCtx:  ctx,
+		seenCtx:    seenCtx,
+		seenCancel: seenCancel,
 	}
 
 	q.wg.Add(1)
@@ -82,9 +87,7 @@ func (q *KafkaQueue) consumeSeenTopic() {
 		default:
 		}
 
-		fetchCtx, fetchCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
-		msg, err := seenReader.FetchMessage(fetchCtx)
-		fetchCancel()
+		msg, err := seenReader.FetchMessage(q.seenCtx)
 		if err != nil {
 			select {
 			case <-q.closeCh:
@@ -108,6 +111,7 @@ func (q *KafkaQueue) consumeSeenTopic() {
 }
 
 func (q *KafkaQueue) Close() error {
+	q.seenCancel()
 	close(q.closeCh)
 	q.wg.Wait()
 	q.writer.Close()

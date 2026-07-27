@@ -121,9 +121,10 @@ func (w *WARCWriter) openFile() error {
 		infoBody,
 	)
 	gzw.Write([]byte(header))
+	gzw.Write([]byte("\r\n\r\n")) // WARC record separator
 	w.gzipW = gzw
 	w.file = f
-	w.curSize = int64(len(header))
+	w.curSize = int64(len(header)) + 4
 	return nil
 }
 
@@ -140,7 +141,12 @@ func formatWARCRecord(rec *WARCRecord) []byte {
 	}
 	httpHeaderStr += "\r\n"
 
-	payload := httpHeaderStr + string(rec.Body)
+	// Build HTTP response with status line
+	statusLine := "HTTP/1.1 200 OK\r\n"
+	if rec.StatusCode > 0 {
+		statusLine = fmt.Sprintf("HTTP/1.1 %d %s\r\n", rec.StatusCode, httpStatusText(rec.StatusCode))
+	}
+	payload := statusLine + httpHeaderStr + string(rec.Body)
 	payloadLen := len(payload)
 
 	var b strings.Builder
@@ -169,6 +175,41 @@ func formatWARCRecord(rec *WARCRecord) []byte {
 	b.WriteString("\r\n\r\n")
 
 	return []byte(b.String())
+}
+
+func httpStatusText(code int) string {
+	switch code {
+	case 100:
+		return "Continue"
+	case 200:
+		return "OK"
+	case 201:
+		return "Created"
+	case 204:
+		return "No Content"
+	case 301:
+		return "Moved Permanently"
+	case 302:
+		return "Found"
+	case 304:
+		return "Not Modified"
+	case 400:
+		return "Bad Request"
+	case 401:
+		return "Unauthorized"
+	case 403:
+		return "Forbidden"
+	case 404:
+		return "Not Found"
+	case 500:
+		return "Internal Server Error"
+	case 502:
+		return "Bad Gateway"
+	case 503:
+		return "Service Unavailable"
+	default:
+		return "Unknown"
+	}
 }
 
 func newUUID() string {

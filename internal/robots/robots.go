@@ -150,7 +150,6 @@ func (rp *RobotsParser) compileRule(rule string) *regexp.Regexp {
 
 	regexPattern := "^" + regexp.QuoteMeta(rule)
 	regexPattern = strings.ReplaceAll(regexPattern, "\\*", ".*")
-	regexPattern = strings.ReplaceAll(regexPattern, "\\$", "$")
 
 	re, err := regexp.Compile(regexPattern)
 	if err != nil {
@@ -335,10 +334,11 @@ func (rp *RobotsParser) FetchSitemapURLs(sitemapURL string) []string {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 5*1024*1024)) // 5MB limit
 	if err != nil {
 		return nil
 	}

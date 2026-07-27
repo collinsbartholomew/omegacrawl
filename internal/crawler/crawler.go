@@ -251,7 +251,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		persistentQueue: persistentQueue,
 		bloomFilter:      bloomFilter,
 		exactDedup:       util.NewLRUSet(lruSize),
-		rateLimiter:      ratelimit.New(cfg.CrawlDelay, 1),
+		rateLimiter:      ratelimit.New(ctx, cfg.CrawlDelay, 1),
 		circuitBreaker:   resilience.NewHostCircuitBreaker(),
 		retryConfig:      retryConfig,
 		checkpoint:       NewCheckpoint(cfg.CheckpointFile),
@@ -414,6 +414,9 @@ func (c *Crawler) Start(seeds []string) error {
 		loginCtx, loginCancel := chromedp.NewContext(browserCtx)
 		if err := chromedp.Run(loginCtx, chromedp.Navigate(c.cfg.AuthConfig.LoginURL)); err != nil {
 			loginCancel()
+			if c.warc != nil {
+				c.warc.Close()
+			}
 			return fmt.Errorf("failed to navigate to login URL: %w", err)
 		}
 		c.waitForPage(loginCtx)
@@ -422,6 +425,9 @@ func (c *Crawler) Start(seeds []string) error {
 		if _, err := fmt.Scanln(&input); err == nil {
 			if input == "q" || input == "Q" || input == "quit" || input == "exit" {
 				loginCancel()
+				if c.warc != nil {
+					c.warc.Close()
+				}
 				util.LogInfo("user cancelled during pre-crawl login")
 				return nil
 			}
@@ -588,6 +594,9 @@ Loop:
 	}
 	if c.cfg.CheckpointFile != "" {
 		c.saveCheckpoint()
+	}
+	if c.authManager != nil {
+		c.authManager.Close()
 	}
 
 	pages, assets, errors, bytes := c.metrics.Snapshot()
@@ -1461,6 +1470,10 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	tabCtx, tabCancel2 := context.WithTimeout(rawTabCtx, c.cfg.PageTimeout)
 	defer tabCancel2()
 
+	// Context for asset downloads (fonts, CSS images) - derived from page context
+	assetCtx, assetCancel := context.WithTimeout(tabCtx, 30*time.Second)
+	defer assetCancel()
+
 	if c.cfg.EnableStealth {
 		if err := chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 			_, err := page.AddScriptToEvaluateOnNewDocument(jsengine.StealthScript).Do(ctx)
@@ -1495,6 +1508,7 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		workerCount = 5
 	}
 	netIntercept := netintercept.NewInterceptorWithWorkers(workerCount)
+	defer netIntercept.Close()
 	netIntercept.SetAPICallback(func(ar netintercept.APIResponse) {
 		var reqBody []byte
 		if ar.Request != nil && len(ar.Request.Body) > 0 {
@@ -2003,7 +2017,7 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
 				if absFontURL != "" && isValidURL(absFontURL) {
 				if !c.bloomFilter.HasSeen(absFontURL) {
-					fontReq, _ := http.NewRequestWithContext(c.ctx, "GET", absFontURL, nil)
+					fontReq, _ := http.NewRequestWithContext(assetCtx, "GET", absFontURL, nil)
 					if fontReq != nil {
 						fontResp, err := c.httpClient.Do(fontReq)
 						if err != nil {
@@ -2037,7 +2051,7 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
 				if absCSSURL != "" && isValidURL(absCSSURL) {
 				if !c.bloomFilter.HasSeen(absCSSURL) {
-					cssReq, _ := http.NewRequestWithContext(c.ctx, "GET", absCSSURL, nil)
+					cssReq, _ := http.NewRequestWithContext(assetCtx, "GET", absCSSURL, nil)
 					if cssReq != nil {
 						cssResp, err := c.httpClient.Do(cssReq)
 						if err != nil {
@@ -2206,6 +2220,8 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	pageCtx, pageCancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer pageCancel()
 	c.fetchPageMetadata(pageCtx, urlStr)
+
+	netIntercept.Close()
 
 	return nil
 }

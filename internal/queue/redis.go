@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"github.com/user/clone/internal/util"
 )
 
 type RedisQueue struct {
@@ -170,14 +172,19 @@ func (q *RedisQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool
 	pipe := q.client.Pipeline()
 	pipe.Del(opCtx, q.key, q.key+":seen", q.key+":items")
 	for _, item := range items {
-		data, _ := json.Marshal(item)
+		data, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
 		pipe.RPush(opCtx, q.key, string(data))
 		pipe.HSet(opCtx, q.key+":items", item.URL, data)
 	}
 	for url := range visited {
 		pipe.SAdd(opCtx, q.key+":seen", url)
 	}
-	_, _ = pipe.Exec(opCtx)
+	if _, err := pipe.Exec(opCtx); err != nil {
+		util.LogError("redis checkpoint load failed", err)
+	}
 }
 
 func (q *RedisQueue) Close() error {

@@ -3,6 +3,7 @@ package changedetection
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -286,13 +287,5 @@ func diffNodes(old, new *html.Node, path string) []Change {
 }
 
 func sanitizePath(url string) string {
-	var buf bytes.Buffer
-	for _, b := range []byte(url) {
-		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.' {
-			buf.WriteByte(b)
-		} else {
-			buf.WriteByte('_')
-		}
-	}
-	return buf.String()
+	return base64.URLEncoding.EncodeToString([]byte(url))
 }

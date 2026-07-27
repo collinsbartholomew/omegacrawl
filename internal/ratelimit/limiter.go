@@ -28,7 +28,7 @@ type hostLimiter struct {
 	mu          sync.Mutex
 }
 
-func New(defaultDelay time.Duration, burstSize int) *RateLimiter {
+func New(ctx context.Context, defaultDelay time.Duration, burstSize int) *RateLimiter {
 	if burstSize < 1 {
 		burstSize = 1
 	}
@@ -41,7 +41,7 @@ func New(defaultDelay time.Duration, burstSize int) *RateLimiter {
 		cleanupAt:   time.Now().Add(5 * time.Minute),
 		cleanupDone: make(chan struct{}),
 	}
-	go rl.periodicCleanup()
+	go rl.periodicCleanup(ctx)
 	return rl
 }
 
@@ -141,7 +141,7 @@ func (rl *RateLimiter) Cleanup() {
 	rl.cleanupAt = now.Add(5 * time.Minute)
 }
 
-func (rl *RateLimiter) periodicCleanup() {
+func (rl *RateLimiter) periodicCleanup(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for {
@@ -149,6 +149,8 @@ func (rl *RateLimiter) periodicCleanup() {
 		case <-ticker.C:
 			rl.Cleanup()
 		case <-rl.cleanupDone:
+			return
+		case <-ctx.Done():
 			return
 		}
 	}

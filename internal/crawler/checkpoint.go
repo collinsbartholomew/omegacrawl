@@ -85,15 +85,16 @@ func (c *Checkpoint) Load() (*CheckpointData, error) {
 	defer file.Close()
 
 	decoder := gob.NewDecoder(file)
-	c.data = &CheckpointData{
+	tmp := &CheckpointData{
 		Visited:       make(map[string]bool),
 		HostLastCrawl: make(map[string]time.Time),
 		HostURLCount:  make(map[string]int),
 	}
-	err = decoder.Decode(c.data)
+	err = decoder.Decode(tmp)
 	if err != nil {
 		return nil, err
 	}
+	c.data = tmp
 
 	return c.data, nil
 }

@@ -211,10 +211,7 @@ func resolvePath(basePath, refPath string) string {
 		}
 	}
 
-	if strings.HasPrefix(refPath, "/") || strings.HasPrefix(basePath, "/") {
-		return "/" + strings.Join(result, "/")
-	}
-	return strings.Join(result, "/")
+	return "/" + strings.Join(result, "/")
 }
 
 func (u *URL) String() string {

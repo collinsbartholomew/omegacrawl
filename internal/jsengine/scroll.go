@@ -57,6 +57,10 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 			result.Reason = "max_duration"
 			break
 		}
+		if ctx.Err() != nil {
+			result.Reason = "ctx_cancelled"
+			break
+		}
 
 		var currentCount int
 		selJSON, _ := json.Marshal(cfg.ItemSelector)

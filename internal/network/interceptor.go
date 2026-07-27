@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"path"
@@ -210,9 +211,9 @@ func (i *Interceptor) onLoadingFinished(ctx context.Context, ev *network.EventLo
 		return
 	}
 	delete(i.pending, ev.RequestID)
+	i.fetchWg.Add(1)
 	i.mu.Unlock()
 
-	i.fetchWg.Add(1)
 	go func() {
 		defer i.fetchWg.Done()
 		select {
@@ -277,7 +278,9 @@ func (i *Interceptor) fetchAndProcess(ctx context.Context, p *pendingResource) {
 func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestID, url string) []byte {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
-			retryTimer := time.NewTimer(time.Duration(attempt*300) * time.Millisecond)
+			base := time.Duration(attempt*300) * time.Millisecond
+			jitter := time.Duration(rand.Int63n(int64(base / 2 + 1)))
+			retryTimer := time.NewTimer(base + jitter)
 			select {
 			case <-retryTimer.C:
 			case <-ctx.Done():
@@ -324,7 +327,12 @@ func (i *Interceptor) FetchBodies(ctx context.Context) {
 	var wg sync.WaitGroup
 	for _, p := range remaining {
 		wg.Add(1)
-		i.workerSem <- struct{}{}
+		select {
+		case i.workerSem <- struct{}{}:
+		case <-fetchCtx.Done():
+			wg.Done()
+			continue
+		}
 		go func(pr *pendingResource) {
 			defer wg.Done()
 			defer func() { <-i.workerSem }()

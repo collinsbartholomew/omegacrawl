@@ -1,6 +1,8 @@
 package sync
 
 import (
+	"fmt"
+	"hash/maphash"
 	"runtime"
 	"sync"
 )
@@ -48,16 +50,13 @@ func NewShardedMap[K comparable, V any](opts ...func(*ShardedMap[K, V])) *Sharde
 	return sm
 }
 
+var hashSeed = maphash.MakeSeed()
+
 func defaultHash[K comparable](key K) uint32 {
-	s, ok := interface{}(key).(string)
-	if !ok {
-		return 0
-	}
-	var h uint32
-	for i := 0; i < len(s); i++ {
-		h = h*31 + uint32(s[i])
-	}
-	return h
+	var h maphash.Hash
+	h.SetSeed(hashSeed)
+	h.WriteString(fmt.Sprintf("%v", key))
+	return uint32(h.Sum64())
 }
 
 func WithHashFn[K comparable, V any](fn func(K) uint32) func(*ShardedMap[K, V]) {
