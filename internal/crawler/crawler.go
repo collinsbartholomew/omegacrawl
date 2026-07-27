@@ -82,6 +82,7 @@ const maxWSMessages = 5000
 const maxAPICaptures = 2000
 const maxQueueSize = 100000
 const drainTimeout = 30 * time.Second
+const maxCookiesPerDomain = 50
 
 func cfgUserAgent(cfg *config.Config) string {
 	if cfg.RotateUserAgents && len(cfg.UserAgents) > 0 {
@@ -164,8 +165,9 @@ type Crawler struct {
 	wsMu               sync.RWMutex
 
 	authManager        *auth.AuthManager
-	changeDetector    *changedetection.Detector
-	captchaSolver     *captcha.Solver
+	changeDetector     *changedetection.Detector
+	captchaSolver      *captcha.Solver
+	excludeFn          func(string) bool
 
 }
 
@@ -183,6 +185,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	rw := rewrite.NewRewriter()
 
 	ctx, cancel := context.WithCancel(context.Background())
+	robotsParser.SetContext(ctx)
 
 	var bloomFilter *queue.BloomDedup
 	expectedItems := uint(cfg.MaxTotalURLs * 10)
@@ -207,7 +210,7 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	}
 	sem := make(chan struct{}, maxConcurrent)
 
-	urlQueue, err := queue.NewQueueFromConfig(cfg.QueueConfig)
+	urlQueue, err := queue.NewQueueFromConfig(ctx, cfg.QueueConfig)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("failed to create queue: %w", err)
@@ -274,6 +277,21 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		browserMu:        sync.Mutex{},
 	}
 
+	if len(cfg.ExcludePatterns) > 0 {
+		patterns := make([]string, len(cfg.ExcludePatterns))
+		copy(patterns, cfg.ExcludePatterns)
+		c.excludeFn = func(rawURL string) bool {
+			for _, p := range patterns {
+				if strings.Contains(rawURL, p) {
+					return true
+				}
+			}
+			return false
+		}
+	} else {
+		c.excludeFn = func(string) bool { return false }
+	}
+
 	c.authManager = auth.NewAuthManager(c.cfg.AuthConfig)
 
 	if cfg.EnableWARC {
@@ -303,6 +321,7 @@ func (c *Crawler) Stop() {
 
 func (c *Crawler) Start(seeds []string) error {
 	defer c.cancel()
+	defer c.rateLimiter.Stop()
 
 	if c.cfg.CheckpointFile != "" && c.checkpoint.Exists() {
 		data, err := c.checkpoint.Load()
@@ -503,7 +522,9 @@ Loop:
 	case <-drainTimer.C:
 		util.LogInfo("drain timeout reached, continuing")
 	case <-c.ctx.Done():
-		drainTimer.Stop()
+		if !drainTimer.Stop() {
+			<-drainTimer.C
+		}
 	}
 	close(c.checkpointDone)
 
@@ -1347,10 +1368,14 @@ func (c *Crawler) crawlPage(ctx context.Context, urlStr string, depth int) {
 			select {
 			case <-timer.C:
 			case <-ctx.Done():
-				timer.Stop()
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
 			case <-c.ctx.Done():
-				timer.Stop()
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
 			}
 		}
@@ -1527,7 +1552,9 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		select {
 		case <-clickTimer.C:
 		case <-c.ctx.Done():
-			clickTimer.Stop()
+			if !clickTimer.Stop() {
+				<-clickTimer.C
+			}
 			return nil
 		}
 	}
@@ -1934,24 +1961,32 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			for _, fontURL := range fontURLs {
 				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
 				if absFontURL != "" && isValidURL(absFontURL) {
-					if !c.bloomFilter.HasSeen(absFontURL) {
-						fontReq, _ := http.NewRequestWithContext(c.ctx, "GET", absFontURL, nil)
-						if fontReq != nil {
-							fontResp, err := c.httpClient.Do(fontReq)
-							if err == nil && fontResp.StatusCode == 200 {
-								fontBody, _ := io.ReadAll(fontResp.Body)
+				if !c.bloomFilter.HasSeen(absFontURL) {
+					fontReq, _ := http.NewRequestWithContext(c.ctx, "GET", absFontURL, nil)
+					if fontReq != nil {
+						fontResp, err := c.httpClient.Do(fontReq)
+						if err != nil {
+							if fontResp != nil {
+								io.Copy(io.Discard, fontResp.Body)
 								fontResp.Body.Close()
-								if len(fontBody) > 0 {
-									localPath, err := c.storage.SaveFile(absFontURL, fontBody, fontResp.Header.Get("Content-Type"))
-									if err == nil {
-										c.rewriter.AddMapping(absFontURL, localPath)
-										c.metrics.IncAssetsCaptured()
-										c.metrics.AddBytes(int64(len(fontBody)))
-									}
+							}
+						} else if fontResp.StatusCode == 200 {
+							fontBody, _ := io.ReadAll(fontResp.Body)
+							fontResp.Body.Close()
+							if len(fontBody) > 0 {
+								localPath, err := c.storage.SaveFile(absFontURL, fontBody, fontResp.Header.Get("Content-Type"))
+								if err == nil {
+									c.rewriter.AddMapping(absFontURL, localPath)
+									c.metrics.IncAssetsCaptured()
+									c.metrics.AddBytes(int64(len(fontBody)))
 								}
 							}
+						} else {
+							io.Copy(io.Discard, fontResp.Body)
+							fontResp.Body.Close()
 						}
 					}
+				}
 				}
 			}
 
@@ -1960,24 +1995,32 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			for _, cssURL := range cssURLs {
 				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
 				if absCSSURL != "" && isValidURL(absCSSURL) {
-					if !c.bloomFilter.HasSeen(absCSSURL) {
-						cssReq, _ := http.NewRequestWithContext(c.ctx, "GET", absCSSURL, nil)
-						if cssReq != nil {
-							cssResp, err := c.httpClient.Do(cssReq)
-							if err == nil && cssResp.StatusCode == 200 {
-								cssBody, _ := io.ReadAll(cssResp.Body)
+				if !c.bloomFilter.HasSeen(absCSSURL) {
+					cssReq, _ := http.NewRequestWithContext(c.ctx, "GET", absCSSURL, nil)
+					if cssReq != nil {
+						cssResp, err := c.httpClient.Do(cssReq)
+						if err != nil {
+							if cssResp != nil {
+								io.Copy(io.Discard, cssResp.Body)
 								cssResp.Body.Close()
-								if len(cssBody) > 0 {
-									localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
-									if err == nil {
-										c.rewriter.AddMapping(absCSSURL, localPath)
-										c.metrics.IncAssetsCaptured()
-										c.metrics.AddBytes(int64(len(cssBody)))
-									}
+							}
+						} else if cssResp.StatusCode == 200 {
+							cssBody, _ := io.ReadAll(cssResp.Body)
+							cssResp.Body.Close()
+							if len(cssBody) > 0 {
+								localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
+								if err == nil {
+									c.rewriter.AddMapping(absCSSURL, localPath)
+									c.metrics.IncAssetsCaptured()
+									c.metrics.AddBytes(int64(len(cssBody)))
 								}
 							}
+						} else {
+							io.Copy(io.Discard, cssResp.Body)
+							cssResp.Body.Close()
 						}
 					}
+				}
 				}
 			}
 		}
@@ -2833,7 +2876,12 @@ func (c *Crawler) persistCookies(ctx context.Context, urlStr string) {
 		if ck.Domain != "" {
 			ckDomain = strings.TrimPrefix(ck.Domain, ".")
 		}
-		c.cookieJar[ckDomain] = append(c.cookieJar[ckDomain], ck)
+		jar := c.cookieJar[ckDomain]
+		jar = append(jar, ck)
+		if len(jar) > maxCookiesPerDomain {
+			jar = jar[len(jar)-maxCookiesPerDomain:]
+		}
+		c.cookieJar[ckDomain] = jar
 	}
 	c.cookieMu.Unlock()
 
@@ -3037,8 +3085,13 @@ func (c *Crawler) fetchPageMetadata(ctx context.Context, urlStr string) {
 
 			headResp, err := c.httpClient.Do(headReq)
 			if err != nil {
+				if headResp != nil {
+					io.Copy(io.Discard, headResp.Body)
+					headResp.Body.Close()
+				}
 				return
 			}
+			io.Copy(io.Discard, headResp.Body)
 			headResp.Body.Close()
 
 			if headResp.StatusCode == 304 {
@@ -3130,12 +3183,7 @@ func (c *Crawler) isAllowedDomain(rawURL string) bool {
 }
 
 func (c *Crawler) isExcluded(rawURL string) bool {
-	for _, pattern := range c.cfg.ExcludePatterns {
-		if strings.Contains(rawURL, pattern) {
-			return true
-		}
-	}
-	return false
+	return c.excludeFn(rawURL)
 }
 
 func (c *Crawler) isSameDomain(original, target string) bool {
@@ -3182,7 +3230,9 @@ func (c *Crawler) applyWaitStrategy(ctx context.Context) {
 		select {
 		case <-waitTimer.C:
 		case <-ctx.Done():
-			waitTimer.Stop()
+			if !waitTimer.Stop() {
+				<-waitTimer.C
+			}
 		}
 	}
 }
@@ -3253,7 +3303,9 @@ func (c *Crawler) solveCaptcha(tabCtx context.Context, urlStr string, html strin
 			select {
 			case <-captchaTimer.C:
 			case <-c.ctx.Done():
-				captchaTimer.Stop()
+				if !captchaTimer.Stop() {
+					<-captchaTimer.C
+				}
 				return
 			}
 		}
@@ -3285,7 +3337,9 @@ func (c *Crawler) solveCaptcha(tabCtx context.Context, urlStr string, html strin
 			select {
 			case <-postSolveTimer.C:
 			case <-c.ctx.Done():
-				postSolveTimer.Stop()
+				if !postSolveTimer.Stop() {
+					<-postSolveTimer.C
+				}
 				return
 			}
 			break

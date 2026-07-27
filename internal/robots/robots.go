@@ -34,15 +34,21 @@ type RobotsParser struct {
 	ruleCache    map[string]*regexp.Regexp
 	ruleCacheMu  sync.RWMutex
 	fetchGroup   singleflight.Group
+	parentCtx    context.Context
 }
 
 func NewRobotsParser() *RobotsParser {
 	return &RobotsParser{
-		cache:     make(map[string]*RobotsEntry),
-		cacheTTL:  24 * time.Hour,
-		userAgent: "*",
-		ruleCache: make(map[string]*regexp.Regexp),
+		cache:      make(map[string]*RobotsEntry),
+		cacheTTL:   24 * time.Hour,
+		userAgent:  "*",
+		ruleCache:  make(map[string]*regexp.Regexp),
+		parentCtx:  context.Background(),
 	}
+}
+
+func (rp *RobotsParser) SetContext(ctx context.Context) {
+	rp.parentCtx = ctx
 }
 
 func (rp *RobotsParser) SetUserAgent(ua string) {
@@ -179,7 +185,7 @@ func (rp *RobotsParser) fetchRobots(robotsURL string) *RobotsEntry {
 		fetchedAt: time.Now(),
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(rp.parentCtx, 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", robotsURL, nil)
 	if err != nil {
@@ -315,7 +321,7 @@ func (rp *RobotsParser) ClearExpired() {
 func (rp *RobotsParser) FetchSitemapURLs(sitemapURL string) []string {
 	var urls []string
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(rp.parentCtx, 30*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, "GET", sitemapURL, nil)
 	if err != nil {

@@ -2,6 +2,7 @@ package queue
 
 import (
 	"container/heap"
+	"context"
 	"sync"
 )
 
@@ -168,16 +169,16 @@ func (q *PriorityQueue) Close() error {
 	return nil
 }
 
-func NewQueue(backend, redisURL, pgDSN, kafkaURL string, maxSize int) (Queue, error) {
+func NewQueue(ctx context.Context, backend, redisURL, pgDSN, kafkaURL string, maxSize int) (Queue, error) {
 	switch backend {
 	case "local":
 		return NewPriorityQueueWithMaxSize(maxSize), nil
 	case "redis":
-		return NewRedisQueueWithSize(redisURL, maxSize)
+		return NewRedisQueueWithSize(ctx, redisURL, maxSize)
 	case "postgres":
-		return NewPostgresQueueWithSize(pgDSN, maxSize)
+		return NewPostgresQueueWithSize(ctx, pgDSN, maxSize)
 	case "kafka":
-		return NewKafkaQueueWithSize(kafkaURL, maxSize)
+		return NewKafkaQueueWithSize(ctx, kafkaURL, maxSize)
 	default:
 		return NewPriorityQueueWithMaxSize(maxSize), nil
 	}

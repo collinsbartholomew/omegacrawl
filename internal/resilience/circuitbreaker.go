@@ -146,21 +146,20 @@ func (cb *CircuitBreaker) Allow() bool {
 }
 
 func (cb *CircuitBreaker) Success() {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
 	state := State(atomic.LoadInt32((*int32)(&cb.state)))
 	switch state {
 	case StateHalfOpen:
-		cb.mu.Lock()
 		cb.successCount++
 		if cb.successCount >= cb.successThreshold {
 			atomic.StoreInt32((*int32)(&cb.state), int32(StateClosed))
 			cb.failureCount = 0
 			cb.successCount = 0
 		}
-		cb.mu.Unlock()
 	case StateClosed:
-		cb.mu.Lock()
 		cb.failureCount = 0
-		cb.mu.Unlock()
 	}
 }
 

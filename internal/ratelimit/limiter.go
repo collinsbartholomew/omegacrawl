@@ -18,6 +18,7 @@ type RateLimiter struct {
 	burstSize   int
 	cleanupAt   time.Time
 	cleanupDone chan struct{}
+	stopOnce    sync.Once
 }
 
 type hostLimiter struct {
@@ -155,7 +156,9 @@ func (rl *RateLimiter) periodicCleanup() {
 }
 
 func (rl *RateLimiter) Stop() {
-	close(rl.cleanupDone)
+	rl.stopOnce.Do(func() {
+		close(rl.cleanupDone)
+	})
 }
 
 func (rl *RateLimiter) Len() int {

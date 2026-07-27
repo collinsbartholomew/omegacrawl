@@ -1,13 +1,14 @@
 package queue
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
 	"github.com/user/clone/internal/config"
 )
 
-func NewQueueFromConfig(cfg *config.QueueConfig) (Queue, error) {
+func NewQueueFromConfig(ctx context.Context, cfg *config.QueueConfig) (Queue, error) {
 	if cfg == nil {
 		return NewPriorityQueue(), nil
 	}
@@ -19,17 +20,17 @@ func NewQueueFromConfig(cfg *config.QueueConfig) (Queue, error) {
 		if cfg.RedisURL == "" {
 			return nil, fmt.Errorf("redis backend requires redis_url")
 		}
-		return NewRedisQueue(cfg.RedisURL)
+		return NewRedisQueue(ctx, cfg.RedisURL)
 	case "postgres":
 		if cfg.PgDSN == "" {
 			return nil, fmt.Errorf("postgres backend requires pg_dsn")
 		}
-		return NewPostgresQueue(cfg.PgDSN)
+		return NewPostgresQueue(ctx, cfg.PgDSN)
 	case "kafka":
 		if cfg.KafkaURL == "" {
 			return nil, fmt.Errorf("kafka backend requires kafka_url")
 		}
-		return NewKafkaQueue(cfg.KafkaURL)
+		return NewKafkaQueue(ctx, cfg.KafkaURL)
 	default:
 		return nil, fmt.Errorf("unknown queue backend: %s", cfg.Backend)
 	}

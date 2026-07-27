@@ -103,15 +103,16 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 				})(%s)
 			`, string(selJSON)), &clicked))
 			if err == nil && clicked {
-				timer := time.NewTimer(cfg.ScrollDelay)
-				select {
-				case <-timer.C:
-				case <-ctx.Done():
-					timer.Stop()
-					result.Reason = "ctx_cancelled"
+			timer := time.NewTimer(cfg.ScrollDelay)
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
 				}
-				timer.Stop()
-				continue
+				result.Reason = "ctx_cancelled"
+			}
+			continue
 			}
 		}
 
@@ -142,10 +143,11 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
-			timer.Stop()
+			if !timer.Stop() {
+				<-timer.C
+			}
 			result.Reason = "ctx_cancelled"
 		}
-		timer.Stop()
 		if ctx.Err() != nil {
 			break
 		}

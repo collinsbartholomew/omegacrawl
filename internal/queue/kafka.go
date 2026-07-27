@@ -22,13 +22,14 @@ type KafkaQueue struct {
 	closeCh   chan struct{}
 	wg        sync.WaitGroup
 	pending   atomic.Int64
+	parentCtx context.Context
 }
 
-func NewKafkaQueue(kafkaURL string) (*KafkaQueue, error) {
-	return NewKafkaQueueWithSize(kafkaURL, DefaultMaxQueueSize)
+func NewKafkaQueue(ctx context.Context, kafkaURL string) (*KafkaQueue, error) {
+	return NewKafkaQueueWithSize(ctx, kafkaURL, DefaultMaxQueueSize)
 }
 
-func NewKafkaQueueWithSize(kafkaURL string, maxSize int) (*KafkaQueue, error) {
+func NewKafkaQueueWithSize(ctx context.Context, kafkaURL string, maxSize int) (*KafkaQueue, error) {
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(kafkaURL),
 		Topic:    "crawl_queue",
@@ -52,6 +53,7 @@ func NewKafkaQueueWithSize(kafkaURL string, maxSize int) (*KafkaQueue, error) {
 		seenTopic: "crawl_seen",
 		brokers:   []string{kafkaURL},
 		closeCh:   make(chan struct{}),
+		parentCtx: ctx,
 	}
 
 	q.wg.Add(1)
@@ -80,7 +82,7 @@ func (q *KafkaQueue) consumeSeenTopic() {
 		default:
 		}
 
-		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		fetchCtx, fetchCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 		msg, err := seenReader.FetchMessage(fetchCtx)
 		fetchCancel()
 		if err != nil {
@@ -99,7 +101,7 @@ func (q *KafkaQueue) consumeSeenTopic() {
 				q.seenMu.Unlock()
 			}
 		}
-		commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		commitCtx, commitCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 		_ = seenReader.CommitMessages(commitCtx, msg)
 		commitCancel()
 	}
@@ -125,9 +127,9 @@ func (q *KafkaQueue) PushURL(url string, depth int) bool {
 	if err != nil {
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	err = q.writer.WriteMessages(ctx, kafka.Message{
+	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
+	defer opCancel()
+	err = q.writer.WriteMessages(opCtx, kafka.Message{
 		Key:   []byte(url),
 		Value: data,
 	})
@@ -150,9 +152,9 @@ func (q *KafkaQueue) markSeen(url string) {
 
 	item := URLItem{URL: url, Depth: 0}
 	data, _ := json.Marshal(item)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	q.writer.WriteMessages(ctx, kafka.Message{
+	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
+	defer opCancel()
+	q.writer.WriteMessages(opCtx, kafka.Message{
 		Topic: q.seenTopic,
 		Key:   []byte(url),
 		Value: data,
@@ -160,14 +162,19 @@ func (q *KafkaQueue) markSeen(url string) {
 }
 
 func (q *KafkaQueue) PopURL() (URLItem, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	msg, err := q.reader.FetchMessage(ctx)
+	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
+	defer opCancel()
+	msg, err := q.reader.FetchMessage(opCtx)
 	if err != nil {
 		return URLItem{}, false
 	}
 	var item URLItem
 	if err := json.Unmarshal(msg.Value, &item); err != nil {
+		return URLItem{}, false
+	}
+	commitCtx, commitCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
+	defer commitCancel()
+	if err := q.reader.CommitMessages(commitCtx, msg); err != nil {
 		return URLItem{}, false
 	}
 	q.pending.Add(-1)
@@ -213,12 +220,12 @@ func (q *KafkaQueue) AllVisited() map[string]bool {
 }
 
 func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	opCtx, opCancel := context.WithTimeout(q.parentCtx, 30*time.Second)
+	defer opCancel()
 
 	for _, item := range items {
 		data, _ := json.Marshal(item)
-		q.writer.WriteMessages(ctx, kafka.Message{
+		q.writer.WriteMessages(opCtx, kafka.Message{
 			Key:   []byte(item.URL),
 			Value: data,
 		})

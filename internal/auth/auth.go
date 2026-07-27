@@ -103,9 +103,13 @@ func (am *AuthManager) formLogin(ctx context.Context, targetURL string) error {
 	}
 
 	if am.cfg.WaitAfterLogin > 0 {
+		waitTimer := time.NewTimer(am.cfg.WaitAfterLogin)
 		select {
-		case <-time.After(am.cfg.WaitAfterLogin):
+		case <-waitTimer.C:
 		case <-waitCtx.Done():
+			if !waitTimer.Stop() {
+				<-waitTimer.C
+			}
 		}
 	}
 
@@ -205,7 +209,7 @@ func (am *AuthManager) exchangeOAuthToken(ctx context.Context) (*OAuthToken, err
 		data.Set("scope", strings.Join(oc.Scopes, " "))
 	}
 
-	req, err := http.NewRequestWithContext(context.Background(), "POST", oc.TokenURL, strings.NewReader(data.Encode()))
+	req, err := http.NewRequestWithContext(ctx, "POST", oc.TokenURL, strings.NewReader(data.Encode()))
 	if err != nil {
 		return nil, err
 	}

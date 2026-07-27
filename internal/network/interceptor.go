@@ -212,14 +212,14 @@ func (i *Interceptor) onLoadingFinished(ctx context.Context, ev *network.EventLo
 	delete(i.pending, ev.RequestID)
 	i.mu.Unlock()
 
-	select {
-	case i.workerSem <- struct{}{}:
-	case <-ctx.Done():
-		return
-	}
 	i.fetchWg.Add(1)
 	go func() {
 		defer i.fetchWg.Done()
+		select {
+		case i.workerSem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		defer func() { <-i.workerSem }()
 		i.fetchAndProcess(ctx, p)
 	}()
@@ -281,7 +281,9 @@ func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestI
 			select {
 			case <-retryTimer.C:
 			case <-ctx.Done():
-				retryTimer.Stop()
+				if !retryTimer.Stop() {
+					<-retryTimer.C
+				}
 				return nil
 			}
 		}

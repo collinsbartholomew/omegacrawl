@@ -286,7 +286,7 @@ func rewriteHTMLTokens(
 			name, hasAttr := z.TagName()
 			nameStr := strings.ToLower(string(name))
 			tagAtom := atom.Lookup(name)
-			if tagAtom == atom.Script || tagAtom == atom.Style {
+			if (tagAtom == atom.Script || tagAtom == atom.Style) && tt == html.StartTagToken {
 				inScriptOrStyle = true
 			}
 
