@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"bufio"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -455,6 +456,15 @@ func (c *Crawler) Start(seeds []string) error {
 		fmt.Println("========================")
 	}
 
+	if c.cfg.ManualCapture {
+		fmt.Println("\n=== Manual Capture Mode ===")
+		fmt.Println("Navigate freely in the browser window.")
+		fmt.Println("Each page you visit will be captured automatically.")
+		fmt.Println("Press Ctrl+C or type 'q' + Enter to stop.")
+		c.manualCapture(browserCtx, seeds)
+		goto cleanup
+	}
+
 Loop:
 	for c.urlQueue.Size() > 0 {
 		select {
@@ -550,6 +560,7 @@ Loop:
 		}(item.URL, item.Depth, host, hostSemCh, startTime)
 	}
 
+cleanup:
 	drainTimer := time.NewTimer(drainTimeout)
 	drainDone := make(chan struct{})
 	go func() {
@@ -1470,10 +1481,6 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	tabCtx, tabCancel2 := context.WithTimeout(rawTabCtx, c.cfg.PageTimeout)
 	defer tabCancel2()
 
-	// Context for asset downloads (fonts, CSS images) - derived from page context
-	assetCtx, assetCancel := context.WithTimeout(tabCtx, 30*time.Second)
-	defer assetCancel()
-
 	if c.cfg.EnableStealth {
 		if err := chromedp.Run(tabCtx, chromedp.ActionFunc(func(ctx context.Context) error {
 			_, err := page.AddScriptToEvaluateOnNewDocument(jsengine.StealthScript).Do(ctx)
@@ -1793,306 +1800,10 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		}
 	}
 
-	var html string
-	if err := chromedp.Run(tabCtx, chromedp.Evaluate(`
-		(function() {
-			function serializeShadowDOM(root) {
-				var elements = root.querySelectorAll('*');
-				elements.forEach(function(el) {
-					if (el.shadowRoot) {
-						var template = document.createElement('template');
-						template.innerHTML = '<!---- shadowrootmode=open ---->' + el.shadowRoot.innerHTML + '<!---- /shadowrootmode ---->';
-						el.appendChild(template.content);
-					}
-				});
-			}
-			serializeShadowDOM(document);
-			var doc = document.documentElement;
-			if (!doc) return document.body ? document.body.outerHTML : '';
-			return '<!DOCTYPE html>' + doc.outerHTML;
-		})()
-	`, &html)); err != nil || html == "" {
-		chromedp.Run(tabCtx, chromedp.Evaluate(`
-			(function() {
-				function serializeShadowDOM(root) {
-					root.querySelectorAll('*').forEach(function(el) {
-						if (el.shadowRoot) {
-							var t = document.createElement('template');
-							t.innerHTML = el.shadowRoot.innerHTML;
-							el.appendChild(t.content);
-						}
-					});
-				}
-				serializeShadowDOM(document);
-				return document.documentElement ? '<!DOCTYPE html>' + document.documentElement.outerHTML : '';
-			})()
-		`, &html))
-		if html == "" {
-			chromedp.Run(tabCtx, chromedp.OuterHTML("html", &html))
-			if html != "" {
-				html = "<!DOCTYPE html>\n" + html
-			}
-		}
-	}
-	if html == "" {
-		chromedp.Run(tabCtx, chromedp.Evaluate(`document.body ? document.body.innerHTML : ''`, &html))
-	}
-
-	if c.changeDetector != nil {
-		var title string
-		chromedp.Run(tabCtx, chromedp.Title(&title))
-		newSnap, err := c.changeDetector.SaveSnapshot(urlStr, title, []byte(html))
-		if err != nil {
-			util.LogDebug("failed to save snapshot", zap.Error(err))
-		} else {
-			oldSnap, _ := c.changeDetector.LoadSnapshot(urlStr)
-			if oldSnap != nil && oldSnap.Hash != newSnap.Hash {
-				report := c.changeDetector.DetectChanges(urlStr, oldSnap, newSnap)
-				util.LogInfo("page changed",
-					zap.String("url", urlStr),
-					zap.Int("changes", len(report.Changes)),
-					zap.String("old_hash", report.OldHash),
-					zap.String("new_hash", report.NewHash),
-				)
-			}
-		}
-	}
-
-	if c.captchaSolver != nil {
-		c.solveCaptcha(tabCtx, urlStr, html)
-	}
-
-	c.metrics.IncPagesFetched()
-
-	framework, _ := jsengine.DetectFramework(tabCtx)
-	if framework != nil {
-		util.LogDebug("framework",
-			zap.String("url", urlStr),
-			zap.String("name", framework.Framework),
-		)
-	}
-
-	var screenshot []byte
-	if c.cfg.EnableScreenshot {
-		if err := chromedp.Run(tabCtx, chromedp.FullScreenshot(&screenshot, 80)); err != nil {
-			util.LogDebug("screenshot failed", zap.Error(err))
-		}
-	}
-
-	var pdfData []byte
-	if c.cfg.EnablePDF {
-		if err := chromedp.Run(tabCtx,
-			chromedp.ActionFunc(func(ctx context.Context) error {
-				pdfParams := page.PrintToPDF()
-				pdfParams.PrintBackground = true
-				var err error
-				pdfData, _, err = pdfParams.Do(ctx)
-				return err
-			}),
-		); err != nil {
-			util.LogDebug("pdf failed", zap.Error(err))
-		}
-	}
-
-	htmlLocalPath, err := c.storage.SaveHTML(urlStr, []byte(html))
+	html, err := c.captureCurrentPage(tabCtx, rawTabCtx, urlStr, netIntercept)
 	if err != nil {
 		return err
 	}
-
-	c.rewriter.SetBaseURL(urlStr)
-
-	if c.cfg.EnableWARC && c.warc != nil {
-		c.warc.WriteRecord(&storage.WARCRecord{
-			URL:        urlStr,
-			Body:       []byte(html),
-			MimeType:   "text/html",
-			Date:       time.Now(),
-			StatusCode: 200,
-			RecordType: "response",
-			ContentLen: int64(len(html)),
-		})
-	}
-
-	if screenshot != nil {
-		c.storage.SaveScreenshot(urlStr, screenshot)
-	}
-	if pdfData != nil {
-		c.storage.SavePDF(urlStr, pdfData)
-	}
-
-	netIntercept.FetchBodies(rawTabCtx)
-
-	// First pass: save all CDP-captured resources
-	cdpSaved := make(map[string]bool)
-	for origURL, resource := range netIntercept.GetResources() {
-		if c.cfg.Incremental && resource.StatusCode == 304 {
-			continue
-		}
-
-		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
-
-		added := c.contentHashes.AddIfAbsent(hashStr)
-
-		if !added {
-			if c.cfg.Incremental && c.incCache != nil {
-				c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
-			}
-			continue
-		}
-
-		localPath, err := c.storage.SaveFile(origURL, resource.Body, resource.MimeType)
-		if err != nil {
-			continue
-		}
-		c.rewriter.AddMapping(origURL, localPath)
-
-		relPath, err := filepath.Rel(filepath.Dir(htmlLocalPath), localPath)
-		if err != nil {
-			relPath = localPath
-		}
-		relPath = filepath.ToSlash(relPath)
-		c.rewriter.AddAbsoluteToRelMapping(origURL, relPath)
-
-		c.metrics.IncAssetsCaptured()
-		c.metrics.AddBytes(int64(len(resource.Body)))
-
-		if c.cfg.EnableWARC && c.warc != nil {
-			c.warc.WriteRecord(&storage.WARCRecord{
-				URL:        origURL,
-				Body:       resource.Body,
-				MimeType:   resource.MimeType,
-				Date:       time.Now(),
-				StatusCode: 200,
-				RecordType: "response",
-				ContentLen: int64(len(resource.Body)),
-			})
-		}
-
-		if c.cfg.Incremental && c.incCache != nil {
-			c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
-		}
-		cdpSaved[origURL] = true
-	}
-
-	// HTTP fallback: download CDP-seen resources where body fetch failed
-	for _, missingURL := range netIntercept.GetMissingResources() {
-		if !isValidURL(missingURL) || !c.isAllowedDomain(missingURL) || c.isExcluded(missingURL) {
-			continue
-		}
-		if cdpSaved[missingURL] {
-			continue
-		}
-		resource, err := netIntercept.DownloadResourceViaHTTP(missingURL)
-		if err != nil || resource == nil || len(resource.Body) == 0 {
-			continue
-		}
-		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
-		if !c.contentHashes.AddIfAbsent(hashStr) {
-			continue
-		}
-		localPath, err := c.storage.SaveFile(missingURL, resource.Body, resource.MimeType)
-		if err != nil {
-			continue
-		}
-		c.rewriter.AddMapping(missingURL, localPath)
-		relPath, _ := filepath.Rel(filepath.Dir(htmlLocalPath), localPath)
-		c.rewriter.AddAbsoluteToRelMapping(missingURL, filepath.ToSlash(relPath))
-		c.metrics.IncAssetsCaptured()
-		c.metrics.AddBytes(int64(len(resource.Body)))
-}
-
-// Download assets from HTML not seen by CDP at all
-	if html != "" {
-		c.downloadHTMLAssets(urlStr, html, htmlLocalPath, netIntercept, cdpSaved)
-	}
-
-	// First: Extract and download fonts and CSS url() references
-	for cssPath := range c.rewriter.GetCSSFiles() {
-		cssData, err := os.ReadFile(cssPath)
-		if err == nil {
-			// Extract and download fonts referenced in CSS
-			fontURLs := c.rewriter.ExtractFontURLs(cssData)
-			for _, fontURL := range fontURLs {
-				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
-				if absFontURL != "" && isValidURL(absFontURL) {
-				if !c.bloomFilter.HasSeen(absFontURL) {
-					fontReq, _ := http.NewRequestWithContext(assetCtx, "GET", absFontURL, nil)
-					if fontReq != nil {
-						fontResp, err := c.httpClient.Do(fontReq)
-						if err != nil {
-							if fontResp != nil {
-								io.Copy(io.Discard, fontResp.Body)
-								fontResp.Body.Close()
-							}
-						} else if fontResp.StatusCode == 200 {
-							fontBody, _ := io.ReadAll(fontResp.Body)
-							fontResp.Body.Close()
-							if len(fontBody) > 0 {
-								localPath, err := c.storage.SaveFile(absFontURL, fontBody, fontResp.Header.Get("Content-Type"))
-								if err == nil {
-									c.rewriter.AddMapping(absFontURL, localPath)
-									c.metrics.IncAssetsCaptured()
-									c.metrics.AddBytes(int64(len(fontBody)))
-								}
-							}
-						} else {
-							io.Copy(io.Discard, fontResp.Body)
-							fontResp.Body.Close()
-						}
-					}
-				}
-				}
-			}
-
-			// Extract and download ALL CSS url() references (background images, etc.)
-			cssURLs := c.rewriter.ExtractAllCSSURLs(cssData)
-			for _, cssURL := range cssURLs {
-				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
-				if absCSSURL != "" && isValidURL(absCSSURL) {
-				if !c.bloomFilter.HasSeen(absCSSURL) {
-					cssReq, _ := http.NewRequestWithContext(assetCtx, "GET", absCSSURL, nil)
-					if cssReq != nil {
-						cssResp, err := c.httpClient.Do(cssReq)
-						if err != nil {
-							if cssResp != nil {
-								io.Copy(io.Discard, cssResp.Body)
-								cssResp.Body.Close()
-							}
-						} else if cssResp.StatusCode == 200 {
-							cssBody, _ := io.ReadAll(cssResp.Body)
-							cssResp.Body.Close()
-							if len(cssBody) > 0 {
-								localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
-								if err == nil {
-									c.rewriter.AddMapping(absCSSURL, localPath)
-									c.metrics.IncAssetsCaptured()
-									c.metrics.AddBytes(int64(len(cssBody)))
-								}
-							}
-						} else {
-							io.Copy(io.Discard, cssResp.Body)
-							cssResp.Body.Close()
-						}
-					}
-				}
-				}
-			}
-		}
-	}
-
-	// Second: Now process CSS files with all mappings in place
-	fmt.Println("=== DEBUG: Processing CSS files ===")
-	util.LogDebug("Processing CSS files", zap.Int("count", len(c.rewriter.GetCSSFiles())))
-	for cssPath := range c.rewriter.GetCSSFiles() {
-		fmt.Printf("=== DEBUG: Processing CSS file: %s\n", cssPath)
-		util.LogDebug("Processing CSS file", zap.String("path", cssPath))
-		c.rewriter.ProcessFiles(map[string]string{cssPath: "css"})
-	}
-
-	c.resolveJSDependencies(htmlLocalPath, urlStr)
-	fmt.Println("=== DEBUG: About to call ProcessFiles for HTML ===")
-	util.LogDebug("About to call ProcessFiles for HTML", zap.String("htmlLocalPath", htmlLocalPath))
-	c.rewriter.ProcessFiles(map[string]string{htmlLocalPath: "html"})
 
 	links := c.rewriter.ExtractLinks(urlStr, []byte(html))
 	c.routeMu.RLock()
@@ -2235,6 +1946,400 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	netIntercept.Close()
 
 	return nil
+}
+
+func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, urlStr string, netIntercept *netintercept.Interceptor) (string, error) {
+	var html string
+	if err := chromedp.Run(tabCtx, chromedp.Evaluate(`
+		(function() {
+			function serializeShadowDOM(root) {
+				var elements = root.querySelectorAll('*');
+				elements.forEach(function(el) {
+					if (el.shadowRoot) {
+						var template = document.createElement('template');
+						template.innerHTML = '<!---- shadowrootmode=open ---->' + el.shadowRoot.innerHTML + '<!---- /shadowrootmode ---->';
+						el.appendChild(template.content);
+					}
+				});
+			}
+			serializeShadowDOM(document);
+			var doc = document.documentElement;
+			if (!doc) return document.body ? document.body.outerHTML : '';
+			return '<!DOCTYPE html>' + doc.outerHTML;
+		})()
+	`, &html)); err != nil || html == "" {
+		chromedp.Run(tabCtx, chromedp.Evaluate(`
+			(function() {
+				function serializeShadowDOM(root) {
+					root.querySelectorAll('*').forEach(function(el) {
+						if (el.shadowRoot) {
+							var t = document.createElement('template');
+							t.innerHTML = el.shadowRoot.innerHTML;
+							el.appendChild(t.content);
+						}
+					});
+				}
+				serializeShadowDOM(document);
+				return document.documentElement ? '<!DOCTYPE html>' + document.documentElement.outerHTML : '';
+			})()
+		`, &html))
+		if html == "" {
+			chromedp.Run(tabCtx, chromedp.OuterHTML("html", &html))
+			if html != "" {
+				html = "<!DOCTYPE html>\n" + html
+			}
+		}
+	}
+	if html == "" {
+		chromedp.Run(tabCtx, chromedp.Evaluate(`document.body ? document.body.innerHTML : ''`, &html))
+	}
+
+	if c.changeDetector != nil {
+		var title string
+		chromedp.Run(tabCtx, chromedp.Title(&title))
+		newSnap, err := c.changeDetector.SaveSnapshot(urlStr, title, []byte(html))
+		if err != nil {
+			util.LogDebug("failed to save snapshot", zap.Error(err))
+		} else {
+			oldSnap, _ := c.changeDetector.LoadSnapshot(urlStr)
+			if oldSnap != nil && oldSnap.Hash != newSnap.Hash {
+				report := c.changeDetector.DetectChanges(urlStr, oldSnap, newSnap)
+				util.LogInfo("page changed",
+					zap.String("url", urlStr),
+					zap.Int("changes", len(report.Changes)),
+					zap.String("old_hash", report.OldHash),
+					zap.String("new_hash", report.NewHash),
+				)
+			}
+		}
+	}
+
+	if c.captchaSolver != nil {
+		c.solveCaptcha(tabCtx, urlStr, html)
+	}
+
+	c.metrics.IncPagesFetched()
+
+	framework, _ := jsengine.DetectFramework(tabCtx)
+	if framework != nil {
+		util.LogDebug("framework",
+			zap.String("url", urlStr),
+			zap.String("name", framework.Framework),
+		)
+	}
+
+	var screenshot []byte
+	if c.cfg.EnableScreenshot {
+		if err := chromedp.Run(tabCtx, chromedp.FullScreenshot(&screenshot, 80)); err != nil {
+			util.LogDebug("screenshot failed", zap.Error(err))
+		}
+	}
+
+	var pdfData []byte
+	if c.cfg.EnablePDF {
+		if err := chromedp.Run(tabCtx,
+			chromedp.ActionFunc(func(ctx context.Context) error {
+				pdfParams := page.PrintToPDF()
+				pdfParams.PrintBackground = true
+				var err error
+				pdfData, _, err = pdfParams.Do(ctx)
+				return err
+			}),
+		); err != nil {
+			util.LogDebug("pdf failed", zap.Error(err))
+		}
+	}
+
+	htmlLocalPath, err := c.storage.SaveHTML(urlStr, []byte(html))
+	if err != nil {
+		return html, err
+	}
+
+	c.rewriter.SetBaseURL(urlStr)
+
+	if c.cfg.EnableWARC && c.warc != nil {
+		c.warc.WriteRecord(&storage.WARCRecord{
+			URL:        urlStr,
+			Body:       []byte(html),
+			MimeType:   "text/html",
+			Date:       time.Now(),
+			StatusCode: 200,
+			RecordType: "response",
+			ContentLen: int64(len(html)),
+		})
+	}
+
+	if screenshot != nil {
+		c.storage.SaveScreenshot(urlStr, screenshot)
+	}
+	if pdfData != nil {
+		c.storage.SavePDF(urlStr, pdfData)
+	}
+
+	netIntercept.FetchBodies(rawTabCtx)
+
+	cdpSaved := make(map[string]bool)
+	for origURL, resource := range netIntercept.GetResources() {
+		if c.cfg.Incremental && resource.StatusCode == 304 {
+			continue
+		}
+
+		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
+
+		added := c.contentHashes.AddIfAbsent(hashStr)
+
+		if !added {
+			if c.cfg.Incremental && c.incCache != nil {
+				c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
+			}
+			continue
+		}
+
+		localPath, err := c.storage.SaveFile(origURL, resource.Body, resource.MimeType)
+		if err != nil {
+			continue
+		}
+		c.rewriter.AddMapping(origURL, localPath)
+
+		relPath, err := filepath.Rel(filepath.Dir(htmlLocalPath), localPath)
+		if err != nil {
+			relPath = localPath
+		}
+		relPath = filepath.ToSlash(relPath)
+		c.rewriter.AddAbsoluteToRelMapping(origURL, relPath)
+
+		c.metrics.IncAssetsCaptured()
+		c.metrics.AddBytes(int64(len(resource.Body)))
+
+		if c.cfg.EnableWARC && c.warc != nil {
+			c.warc.WriteRecord(&storage.WARCRecord{
+				URL:        origURL,
+				Body:       resource.Body,
+				MimeType:   resource.MimeType,
+				Date:       time.Now(),
+				StatusCode: 200,
+				RecordType: "response",
+				ContentLen: int64(len(resource.Body)),
+			})
+		}
+
+		if c.cfg.Incremental && c.incCache != nil {
+			c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
+		}
+		cdpSaved[origURL] = true
+	}
+
+	for _, missingURL := range netIntercept.GetMissingResources() {
+		if !isValidURL(missingURL) || !c.isAllowedDomain(missingURL) || c.isExcluded(missingURL) {
+			continue
+		}
+		if cdpSaved[missingURL] {
+			continue
+		}
+		resource, err := netIntercept.DownloadResourceViaHTTP(missingURL)
+		if err != nil || resource == nil || len(resource.Body) == 0 {
+			continue
+		}
+		hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
+		if !c.contentHashes.AddIfAbsent(hashStr) {
+			continue
+		}
+		localPath, err := c.storage.SaveFile(missingURL, resource.Body, resource.MimeType)
+		if err != nil {
+			continue
+		}
+		c.rewriter.AddMapping(missingURL, localPath)
+		relPath, _ := filepath.Rel(filepath.Dir(htmlLocalPath), localPath)
+		c.rewriter.AddAbsoluteToRelMapping(missingURL, filepath.ToSlash(relPath))
+		c.metrics.IncAssetsCaptured()
+		c.metrics.AddBytes(int64(len(resource.Body)))
+	}
+
+	if html != "" {
+		c.downloadHTMLAssets(urlStr, html, htmlLocalPath, netIntercept, cdpSaved)
+	}
+
+	assetCtx, assetCancel := context.WithTimeout(c.ctx, 30*time.Second)
+	defer assetCancel()
+
+	for cssPath := range c.rewriter.GetCSSFiles() {
+		cssData, err := os.ReadFile(cssPath)
+		if err == nil {
+			fontURLs := c.rewriter.ExtractFontURLs(cssData)
+			for _, fontURL := range fontURLs {
+				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
+				if absFontURL != "" && isValidURL(absFontURL) {
+				if !c.bloomFilter.HasSeen(absFontURL) {
+					fontReq, _ := http.NewRequestWithContext(assetCtx, "GET", absFontURL, nil)
+					if fontReq != nil {
+						fontResp, err := c.httpClient.Do(fontReq)
+						if err != nil {
+							if fontResp != nil {
+								io.Copy(io.Discard, fontResp.Body)
+								fontResp.Body.Close()
+							}
+						} else if fontResp.StatusCode == 200 {
+							fontBody, _ := io.ReadAll(fontResp.Body)
+							fontResp.Body.Close()
+							if len(fontBody) > 0 {
+								localPath, err := c.storage.SaveFile(absFontURL, fontBody, fontResp.Header.Get("Content-Type"))
+								if err == nil {
+									c.rewriter.AddMapping(absFontURL, localPath)
+									c.metrics.IncAssetsCaptured()
+									c.metrics.AddBytes(int64(len(fontBody)))
+								}
+							}
+						} else {
+							io.Copy(io.Discard, fontResp.Body)
+							fontResp.Body.Close()
+						}
+					}
+				}
+				}
+			}
+
+			cssURLs := c.rewriter.ExtractAllCSSURLs(cssData)
+			for _, cssURL := range cssURLs {
+				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
+				if absCSSURL != "" && isValidURL(absCSSURL) {
+				if !c.bloomFilter.HasSeen(absCSSURL) {
+					cssReq, _ := http.NewRequestWithContext(assetCtx, "GET", absCSSURL, nil)
+					if cssReq != nil {
+						cssResp, err := c.httpClient.Do(cssReq)
+						if err != nil {
+							if cssResp != nil {
+								io.Copy(io.Discard, cssResp.Body)
+								cssResp.Body.Close()
+							}
+						} else if cssResp.StatusCode == 200 {
+							cssBody, _ := io.ReadAll(cssResp.Body)
+							cssResp.Body.Close()
+							if len(cssBody) > 0 {
+								localPath, err := c.storage.SaveFile(absCSSURL, cssBody, cssResp.Header.Get("Content-Type"))
+								if err == nil {
+									c.rewriter.AddMapping(absCSSURL, localPath)
+									c.metrics.IncAssetsCaptured()
+									c.metrics.AddBytes(int64(len(cssBody)))
+								}
+							}
+						} else {
+							io.Copy(io.Discard, cssResp.Body)
+							cssResp.Body.Close()
+						}
+					}
+				}
+				}
+			}
+		}
+	}
+
+	for cssPath := range c.rewriter.GetCSSFiles() {
+		c.rewriter.ProcessFiles(map[string]string{cssPath: "css"})
+	}
+
+	c.resolveJSDependencies(htmlLocalPath, urlStr)
+	c.rewriter.ProcessFiles(map[string]string{htmlLocalPath: "html"})
+
+	return html, nil
+}
+
+func (c *Crawler) manualCapture(browserCtx context.Context, seedURLs []string) {
+	rawTabCtx, tabCancel := chromedp.NewContext(browserCtx)
+	defer tabCancel()
+
+	tabCtx, tabCancel2 := context.WithTimeout(rawTabCtx, 24*time.Hour)
+	defer tabCancel2()
+
+	netIntercept := netintercept.NewInterceptorWithWorkers(5)
+	defer netIntercept.Close()
+	netIntercept.SetAPICallback(func(ar netintercept.APIResponse) {
+		var reqBody []byte
+		if ar.Request != nil && len(ar.Request.Body) > 0 {
+			reqBody = ar.Request.Body
+		}
+
+		gqlOp := extractGraphQLOp(reqBody)
+
+		c.apiResponses.Push(CapturedAPIResponse{
+			URL:         ar.URL,
+			Method:      ar.Method,
+			StatusCode:  ar.StatusCode,
+			Body:        ar.Body,
+			Headers:     ar.Headers,
+			RequestBody: reqBody,
+			Timestamp:   time.Now(),
+			Size:        len(ar.Body),
+			GraphQLOp:   gqlOp,
+		})
+		if c.cfg.EnableWARC && c.warc != nil {
+			c.warc.WriteRecord(&storage.WARCRecord{
+				URL:        ar.URL,
+				Body:       ar.Body,
+				MimeType:   "application/json",
+				Date:       time.Now(),
+				StatusCode: ar.StatusCode,
+				RecordType: "response",
+				ContentLen: int64(len(ar.Body)),
+			})
+		}
+		savePath := c.storage.PathForAPI(ar.URL)
+		if savePath != "" {
+			os.MkdirAll(filepath.Dir(savePath), 0755)
+			os.WriteFile(savePath, ar.Body, 0644)
+		}
+	})
+
+	startURL := ""
+	if len(seedURLs) > 0 {
+		startURL = seedURLs[0]
+		chromedp.Run(tabCtx, chromedp.Navigate(startURL))
+	}
+
+	netIntercept.Start(tabCtx, startURL)
+
+	go func() {
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "q" || line == "Q" {
+				c.Stop()
+				return
+			}
+		}
+	}()
+
+	var lastURL string
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+			var currentURL string
+			err := chromedp.Run(tabCtx, chromedp.Evaluate("window.location.href", &currentURL))
+			if err != nil || currentURL == "" || currentURL == "about:blank" {
+				continue
+			}
+			if currentURL == lastURL {
+				continue
+			}
+			lastURL = currentURL
+
+			waitCtx, waitCancel := context.WithTimeout(tabCtx, c.cfg.PageTimeout)
+			chromedp.Run(waitCtx, chromedp.WaitReady("body", chromedp.ByQuery))
+			jsengine.WaitForNetworkIdle(waitCtx, 1*time.Second)
+			chromedp.Sleep(500 * time.Millisecond).Do(waitCtx)
+			waitCancel()
+
+			if _, err := c.captureCurrentPage(tabCtx, rawTabCtx, currentURL, netIntercept); err != nil {
+				util.LogError("failed to capture page", err, zap.String("url", currentURL))
+			} else {
+				fmt.Printf("  Captured: %s\n", currentURL)
+			}
+		}
+	}
 }
 
 func (c *Crawler) downloadHTMLAssets(baseURL, pageHTML, htmlLocalPath string, netIntercept *netintercept.Interceptor, cdpSaved map[string]bool) {

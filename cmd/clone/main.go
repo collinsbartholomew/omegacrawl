@@ -35,7 +35,8 @@ Examples:
   clone https://example.com
   clone -o mysite https://example.com
   clone -d 3 -n 10 https://example.com
-  clone -c clone.json`,
+  clone -c clone.json
+  clone --manual-capture https://example.com (navigate freely, each page is captured)`,
 		Version: version,
 		Args:    cobra.ArbitraryArgs,
 		RunE:    runClone,
@@ -57,6 +58,7 @@ Examples:
 	rootCmd.Flags().Bool("scroll", true, "infinite scroll detection")
 	rootCmd.Flags().Bool("interact", false, "enable systematic interaction engine (click links, fill forms)")
 	rootCmd.Flags().Bool("interactive", false, "interactive mode (visible browser, user handles CAPTCHAs and forms manually)")
+	rootCmd.Flags().Bool("manual-capture", false, "manual capture mode (user navigates freely, each page visited is captured)")
 
 	serveCmd := &cobra.Command{
 		Use:   "serve [directory]",
@@ -184,6 +186,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 	scroll, _ := cmd.Flags().GetBool("scroll")
 	interact, _ := cmd.Flags().GetBool("interact")
 	interactive, _ := cmd.Flags().GetBool("interactive")
+	manualCapture, _ := cmd.Flags().GetBool("manual-capture")
 
 	cfg.MaxDepth = maxDepth
 	cfg.MaxConcurrentPages = concurrency
@@ -197,7 +200,8 @@ func runClone(cmd *cobra.Command, args []string) error {
 	cfg.CrawlDelay = delay
 	cfg.MaxURLsPerHost = maxURLs
 	cfg.EnableInteractionEngine = interact
-	cfg.Interactive = interactive
+	cfg.Interactive = interactive || manualCapture
+	cfg.ManualCapture = manualCapture
 
 	if cfg.InfiniteScroll == nil {
 		cfg.InfiniteScroll = &config.InfiniteScrollConfig{}

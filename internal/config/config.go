@@ -79,6 +79,7 @@ type Config struct {
 	Incremental      bool   `json:"incremental"`
 	IncCacheFile     string `json:"inc_cache_file"`
 	Interactive      bool   `json:"interactive"` // show browser window, user handles CAPTCHAs and forms manually
+	ManualCapture    bool   `json:"manual_capture"` // user navigates freely in browser, each page is captured
 
 	AuthConfig           *AuthConfig           `json:"auth"`
 	CAPTCHAConfig        *CAPTCHAConfig        `json:"captcha"`
@@ -256,10 +257,10 @@ func (c *Config) TLSConfig() *tls.Config {
 }
 
 func (c *Config) Validate() error {
-	if len(c.Seeds) == 0 {
+	if !c.ManualCapture && len(c.Seeds) == 0 {
 		return fmt.Errorf("at least one seed URL is required")
 	}
-	if c.MaxDepth <= 0 {
+	if !c.ManualCapture && c.MaxDepth <= 0 {
 		return fmt.Errorf("max_depth must be > 0")
 	}
 	if c.MaxConcurrentPages <= 0 {
@@ -271,10 +272,10 @@ func (c *Config) Validate() error {
 	if c.CrawlDelay < 0 {
 		return fmt.Errorf("crawl_delay must be >= 0")
 	}
-	if c.MaxURLsPerHost <= 0 {
+	if !c.ManualCapture && c.MaxURLsPerHost <= 0 {
 		return fmt.Errorf("max_urls_per_host must be > 0")
 	}
-	if c.MaxTotalURLs <= 0 {
+	if !c.ManualCapture && c.MaxTotalURLs <= 0 {
 		return fmt.Errorf("max_total_urls must be > 0")
 	}
 	if c.CheckpointInterval < 0 {
