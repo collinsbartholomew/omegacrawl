@@ -145,6 +145,8 @@ func (r *Rewriter) RewriteHTML(htmlContent []byte, htmlLocalPath string) []byte 
 	baseURL := r.baseURL
 	r.mu.RUnlock()
 
+	util.LogDebug("RewriteHTML called", zap.String("htmlLocalPath", htmlLocalPath), zap.Int("mappings", len(mappings)), zap.Int("absToRel", len(absToRel)), zap.String("baseURL", baseURL))
+
 	if len(mappings) == 0 && len(absToRel) == 0 {
 		util.LogDebug("rewrite: no mappings, skipping rewrite", zap.String("html", htmlLocalPath))
 		result := rewriteBaseTag(htmlContent)
@@ -825,6 +827,7 @@ func (r *Rewriter) processCSSImportsForURL(cssLocalPath string) {
 }
 
 func (r *Rewriter) ProcessFiles(files map[string]string) error {
+	util.LogDebug("=== DEBUG: ProcessFiles called ===")
 	for filePath, fileType := range files {
 		data, err := os.ReadFile(filePath)
 		if err != nil {
@@ -835,8 +838,12 @@ func (r *Rewriter) ProcessFiles(files map[string]string) error {
 		var rewritten []byte
 		switch fileType {
 		case "html":
+			util.LogDebug("=== DEBUG: ProcessFiles rewriting HTML ===")
+			util.LogDebug("ProcessFiles: rewriting HTML", zap.String("path", filePath))
 			rewritten = r.RewriteHTML(data, filePath)
 		case "css":
+			util.LogDebug("=== DEBUG: ProcessFiles rewriting CSS ===")
+			util.LogDebug("ProcessFiles: rewriting CSS", zap.String("path", filePath))
 			rewritten = r.RewriteCSS(data, filePath)
 			r.processCSSImportsForURL(filePath)
 		default:

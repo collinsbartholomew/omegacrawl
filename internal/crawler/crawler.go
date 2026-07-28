@@ -1999,19 +1999,18 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		c.rewriter.AddAbsoluteToRelMapping(missingURL, filepath.ToSlash(relPath))
 		c.metrics.IncAssetsCaptured()
 		c.metrics.AddBytes(int64(len(resource.Body)))
-	}
+}
 
-	// Download assets from HTML not seen by CDP at all
+// Download assets from HTML not seen by CDP at all
 	if html != "" {
 		c.downloadHTMLAssets(urlStr, html, htmlLocalPath, netIntercept, cdpSaved)
 	}
 
+	// First: Extract and download fonts and CSS url() references
 	for cssPath := range c.rewriter.GetCSSFiles() {
-		c.rewriter.ProcessFiles(map[string]string{cssPath: "css"})
-
-		// Extract and download fonts referenced in CSS
 		cssData, err := os.ReadFile(cssPath)
 		if err == nil {
+			// Extract and download fonts referenced in CSS
 			fontURLs := c.rewriter.ExtractFontURLs(cssData)
 			for _, fontURL := range fontURLs {
 				absFontURL := rewrite.ResolveURL(urlStr, fontURL)
@@ -2080,7 +2079,19 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			}
 		}
 	}
+
+	// Second: Now process CSS files with all mappings in place
+	fmt.Println("=== DEBUG: Processing CSS files ===")
+	util.LogDebug("Processing CSS files", zap.Int("count", len(c.rewriter.GetCSSFiles())))
+	for cssPath := range c.rewriter.GetCSSFiles() {
+		fmt.Printf("=== DEBUG: Processing CSS file: %s\n", cssPath)
+		util.LogDebug("Processing CSS file", zap.String("path", cssPath))
+		c.rewriter.ProcessFiles(map[string]string{cssPath: "css"})
+	}
+
 	c.resolveJSDependencies(htmlLocalPath, urlStr)
+	fmt.Println("=== DEBUG: About to call ProcessFiles for HTML ===")
+	util.LogDebug("About to call ProcessFiles for HTML", zap.String("htmlLocalPath", htmlLocalPath))
 	c.rewriter.ProcessFiles(map[string]string{htmlLocalPath: "html"})
 
 	links := c.rewriter.ExtractLinks(urlStr, []byte(html))
