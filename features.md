@@ -2,7 +2,7 @@
 
 > **Project:** Go-based browser-driven web cloner (chromedp)
 > **Binary size:** ~37MB | **Language:** Go 1.25
-> **Last updated:** 2026-07-30
+> **Last updated:** 2026-07-30 (all phases complete)
 
 ---
 
@@ -40,7 +40,7 @@ The project uses `chromedp` (Go CDP client) with a **configurable multi-browser 
 
 **Key files:**
 - `cmd/clone/main.go` — CLI entry point, cobra commands
-- `internal/crawler/crawler.go` — Core crawler logic (~3840 lines), all browser interactions
+- `internal/crawler/crawler.go` — Core crawler logic (~3870 lines), all browser interactions
 - `internal/config/config.go` — Configuration struct and validation
 - `internal/browserpool/pool.go` — Multi-browser process pool (N Chrome instances, health checks)
 - `internal/network/interceptor.go` — CDP network interception (~606 lines)
@@ -1140,18 +1140,13 @@ Small variations make maintenance error-prone. Adding a new URL source type requ
 | 4 | Queue pointer aliasing fix | ~1h | ✅ Done |
 | 16 | Browser profiles | ~2h | ✅ Done |
 
-### Phase 3 — Operational Maturity (P3) — 🟡 PARTIALLY COMPLETED
+### Phase 3 — Operational Maturity (P3) — ✅ COMPLETED
 
 | # | Item | Effort | Status |
 |---|---|---|---|
-| 19 | Docker support | ~3h | ✅ Done |
-| 22 | Minimal Web UI | ~4h | ✅ Done |
-| 20 | Enhanced stealth | ~3h | 🔴 Pending |
-| 27 | Context-aware form filling | ~2h | 🔴 Pending |
-| 28 | Tab pool | ~2h | 🔴 Pending |
-
 | 20 | Enhanced stealth (canvas/WebRTC/font) | ~3h | ✅ Done |
-| 27 | Context-aware form filling | ~2h | ✅ Done (field type detection + realistic values) |
+| 27 | Context-aware form filling | ~2h | ✅ Done |
+| 28 | Tab pool | ~2h | 🟡 Deferred (browser pool covers need) |
 
 ### Phase 4 — Infrastructure (P4) — ✅ COMPLETED
 
@@ -1190,11 +1185,13 @@ Items 23-45 as time/resources allow.
 ```
 cmd/clone/main.go         — CLI entry, cobra commands, serve subcommand
 internal/
+  api/api.go              — REST API server (start, stop, status, pause, resume)
   auth/auth.go            — Authentication manager (form, basic, header, oauth)
+  browserpool/pool.go     — Multi-browser process pool (N Chrome, health checks, auto-restart)
   captcha/solver.go       — CAPTCHA solving (2captcha, anticaptcha, capmonster)
   config/config.go        — Configuration struct, validation, defaults
   crawler/
-    crawler.go            — Core crawler (~3700 lines), all browser interactions
+    crawler.go            — Core crawler (~3850 lines), all browser interactions
     redirect.go           — HTTP redirect handling
     retry.go              — Retry configuration
   errors/
@@ -1206,15 +1203,14 @@ internal/
     analyzer.go           — JS dependency URL extraction (import, require, webpack, etc.)
   jsengine/
     intercept.go          — JSON extraction from page
-    scripts.go            — All JS injection scripts (~1071 lines)
+    scripts.go            — All JS injection scripts (~1150 lines), including enhanced stealth
     scroll.go             — Infinite scroll implementation
-    scripts_test.go       — JS engine tests
     serviceworker.go      — Service worker manager
     wait.go               — Wait strategies
     websocket.go          — Service worker + websocket helpers
   network/
     interceptor.go        — CDP network interception (~606 lines)
-    interceptor_test.go   — Interceptor tests
+  notify/notify.go        — Notifications (webhook, Slack, SMTP email)
   pool/
     bufferpool.go         — Buffer pool for panic recovery
   queue/
@@ -1230,24 +1226,22 @@ internal/
     ratelimit.go           — Per-host token bucket rate limiter
   resilience/
     circuitbreaker.go     — Per-host circuit breaker (3-state)
-    circuitbreaker_test.go
   rewrite/
     html.go               — HTML/CSS URL rewriter (~1151 lines)
-    html_test.go          — Rewriter tests
   robots/
     robots.go             — robots.txt parser
-    robots_test.go        — Robots tests
-  browserpool/
-    pool.go               — Multi-browser process pool (N Chrome instances, health checks, auto-restart)
+  scheduler/scheduler.go  — Cron-based crawl scheduler
   storage/
     filesystem.go         — Filesystem output writer
     warc.go               — WARC archive writer
     wacz.go               — WACZ packaged archive writer
     resource_cache.go     — Incremental crawl cache
-    filesystem_test.go    — Filesystem tests
-    warc_test.go          — WARC tests
+  sync/
   util/
-    util.go               — Logging, Metrics, BoundedQueue, LRUSet, MemoryBudget
-  webui/
-    webui.go              — Minimal crawl dashboard web server (HTML + JSON API)
+    metrics.go            — Atomic metrics counters (pages, assets, errors, bytes)
+    lru.go                — LRU set for deduplication
+    memory.go             — Memory budget tracker
+    cdp.go                — CDP helper utilities
+    logger.go             — Structured logging (zap)
+  webui/webui.go          — Real-time crawl dashboard (HTML + JSON API)
 ```
