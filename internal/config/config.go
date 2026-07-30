@@ -20,6 +20,7 @@ type Config struct {
 	EnableScreenshot   bool          `json:"enable_screenshot"`
 	EnablePDF          bool          `json:"enable_pdf"`
 	EnableWARC         bool          `json:"enable_warc"`
+	EnableWACZ         bool          `json:"enable_wacz"`
 	EnableSingleFile   bool          `json:"enable_singlefile"`
 	EnableArticleExtract bool        `json:"enable_article_extract"`
 	Proxy              string        `json:"proxy"`
@@ -74,12 +75,18 @@ type Config struct {
 	MaxIframeDepth     int           `json:"max_iframe_depth"`
 	IframeSkipPatterns []string      `json:"iframe_skip_patterns"`
 
+	BlockedURLPatterns  []string              `json:"blocked_url_patterns"`  // URL patterns to block (e.g. *doubleclick*, *ads*)
 	EnableAPICapture bool `json:"enable_api_capture"`
 	DisableTLSVerify bool `json:"disable_tls_verify"`
 	Incremental      bool   `json:"incremental"`
 	IncCacheFile     string `json:"inc_cache_file"`
 	Interactive      bool   `json:"interactive"` // show browser window, user handles CAPTCHAs and forms manually
 	ManualCapture    bool   `json:"manual_capture"` // user navigates freely in browser, each page is captured
+
+	BrowserPoolSize      int                   `json:"browser_pool_size"`     // number of concurrent browser processes (default 1)
+	UserDataDir          string                `json:"user_data_dir"`         // Chrome user data directory (persistent profiles)
+	ChromeFlags          []string              `json:"chrome_flags"`          // additional Chrome CLI flags
+	RemoteChromeURL      string                `json:"remote_chrome_url"`     // ws://host:port/devtools/browser/... for remote Chrome
 
 	AuthConfig           *AuthConfig           `json:"auth"`
 	CAPTCHAConfig        *CAPTCHAConfig        `json:"captcha"`
@@ -177,6 +184,7 @@ func DefaultConfig() *Config {
 		EnableScreenshot:   true,
 		EnablePDF:          false,
 		EnableWARC:         false,
+		EnableWACZ:         false,
 		EnableSingleFile:   true,
 		EnableArticleExtract: true,
 		ScrollHeight:       5000,
@@ -239,6 +247,7 @@ func DefaultConfig() *Config {
 
 		EnableAPICapture: true,
 		DisableTLSVerify: false,
+		BrowserPoolSize:  1,
 		Incremental:      false,
 		IncCacheFile:     "",
 

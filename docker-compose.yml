@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  chrome:
+    image: chromedp/headless-shell:latest
+    ports:
+      - "9222:9222"
+    command: ["--remote-debugging-address=0.0.0.0", "--remote-debugging-port=9222", "--no-sandbox", "--disable-gpu"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9222/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  cloner:
+    build: .
+    depends_on:
+      chrome:
+        condition: service_healthy
+    volumes:
+      - ./output:/data/output
+    environment:
+      - CLONE_REMOTE_CHROME_URL=ws://chrome:9222/devtools/browser/0
+    command:
+      - clone
+      - --remote-chrome-url=ws://chrome:9222/devtools/browser/0
+      - --output-dir=/data/output
+      - --max-concurrent=10
+      - --browser-pool-size=3
+      - ${SEEDS:-https://example.com}

@@ -1,2 +1,2 @@
-./clone
-output/
+./output/*
+./test*

@@ -52,13 +52,12 @@ func (w *WARCWriter) WriteRecord(rec *WARCRecord) error {
 		}
 	}
 
-	record := formatWARCRecord(rec)
-	n, err := w.gzipW.Write(record)
-	if err != nil {
+	record, payloadLen := formatWARCRecord(rec)
+	if _, err := w.gzipW.Write(record); err != nil {
 		return err
 	}
 
-	w.curSize += int64(n)
+	w.curSize += int64(payloadLen)
 	if w.curSize >= w.maxSize {
 		w.gzipW.Close()
 		w.file.Close()
@@ -128,7 +127,7 @@ func (w *WARCWriter) openFile() error {
 	return nil
 }
 
-func formatWARCRecord(rec *WARCRecord) []byte {
+func formatWARCRecord(rec *WARCRecord) ([]byte, int) {
 	date := rec.Date.Format(time.RFC3339)
 	blockDigest := sha1.Sum(rec.Body)
 	digest := base32.StdEncoding.EncodeToString(blockDigest[:])
@@ -174,7 +173,8 @@ func formatWARCRecord(rec *WARCRecord) []byte {
 	b.WriteString(payload)
 	b.WriteString("\r\n\r\n")
 
-	return []byte(b.String())
+	s := b.String()
+	return []byte(s), len(s)
 }
 
 func httpStatusText(code int) string {

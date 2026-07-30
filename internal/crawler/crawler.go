@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/auth"
+	"github.com/user/clone/internal/browserpool"
 	"github.com/user/clone/internal/captcha"
 	"github.com/user/clone/internal/changedetection"
 	"github.com/user/clone/internal/config"
@@ -80,6 +81,7 @@ type CapturedAPIResponse struct {
 const maxContentHashes = 200000
 const maxJSErrors = 10000
 const maxWSMessages = 5000
+const maxWSFrameSize = 10 * 1024 * 1024 // 10MB max per WS frame
 const maxAPICaptures = 2000
 const maxQueueSize = 100000
 const drainTimeout = 30 * time.Second
@@ -115,10 +117,36 @@ func (c *Crawler) normalizeURL(rawURL string) string {
 	return rawURL
 }
 
+func (c *Crawler) writeRecord(rec *storage.WARCRecord) {
+	if rec == nil {
+		return
+	}
+	if c.cfg.EnableWARC && c.warc != nil {
+		if err := c.warc.WriteRecord(rec); err != nil {
+			util.LogError("warc write failed", err, zap.String("url", rec.URL))
+		}
+	}
+	if c.cfg.EnableWACZ && c.wacz != nil {
+		if err := c.wacz.WriteRecord(rec); err != nil {
+			util.LogError("wacz write failed", err, zap.String("url", rec.URL))
+		}
+	}
+}
+
+func (c *Crawler) closeWriters() {
+	if c.warc != nil {
+		c.warc.Close()
+	}
+	if c.wacz != nil {
+		c.wacz.Close()
+	}
+}
+
 type Crawler struct {
 	cfg                *config.Config
 	storage            *storage.Filesystem
 	warc               *storage.WARCWriter
+	wacz               *storage.WACZWriter
 
 	hostSemaphores     map[string]*hostSem
 	exactDedup         *util.LRUSet
@@ -130,6 +158,7 @@ type Crawler struct {
 
 	browserMu          sync.Mutex
 	browserCancel      context.CancelFunc
+	browserPool        *browserpool.Pool
 
 	robotsParser       *robots.RobotsParser
 	rewriter           *rewrite.Rewriter
@@ -168,6 +197,7 @@ type Crawler struct {
 	authManager        *auth.AuthManager
 	changeDetector     *changedetection.Detector
 	captchaSolver      *captcha.Solver
+	memoryBudget       *util.MemoryBudget
 	excludeFn          func(string) bool
 
 }
@@ -298,6 +328,9 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 	if cfg.EnableWARC {
 		c.warc = storage.NewWARCWriter(cfg.OutputDir)
 	}
+	if cfg.EnableWACZ {
+		c.wacz = storage.NewWACZWriter(cfg.OutputDir)
+	}
 
 	if cfg.ChangeDetectionConfig != nil && cfg.ChangeDetectionConfig.Enabled {
 		snapDir := cfg.ChangeDetectionConfig.SnapshotDir
@@ -311,6 +344,8 @@ func NewCrawler(cfg *config.Config) (*Crawler, error) {
 		c.captchaSolver = captcha.NewSolver(cfg.CAPTCHAConfig)
 	}
 
+	c.memoryBudget = util.NewMemoryBudget(0)
+
 	return c, nil
 }
 
@@ -318,6 +353,24 @@ func (c *Crawler) Stop() {
 	c.shutdown.Store(true)
 	c.cancel()
 	c.rateLimiter.Stop()
+	if c.browserPool != nil {
+		c.browserPool.Close()
+	}
+}
+
+func (c *Crawler) periodicBrowserHealthCheck() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			if c.browserPool != nil {
+				c.browserPool.HealthCheck()
+			}
+		case <-c.ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *Crawler) Start(seeds []string) error {
@@ -393,16 +446,37 @@ func (c *Crawler) Start(seeds []string) error {
 	if c.cfg.Interactive {
 		c.allocOpts = append(c.allocOpts, chromedp.Flag("start-maximized", true))
 	}
-
-	if err := c.launchBrowser(); err != nil {
-		return err
+	if c.cfg.UserDataDir != "" {
+		c.allocOpts = append(c.allocOpts, chromedp.Flag("user-data-dir", c.cfg.UserDataDir))
 	}
-	browserCtx := c.getBrowserCtx()
+	// Apply user-configured Chrome flags (override internal ones if conflicting)
+	for _, flag := range c.cfg.ChromeFlags {
+		flag = strings.TrimSpace(flag)
+		if flag == "" {
+			continue
+		}
+		if strings.HasPrefix(flag, "--") {
+			flag = strings.TrimPrefix(flag, "--")
+		}
+		parts := strings.SplitN(flag, "=", 2)
+		if len(parts) == 2 {
+			c.allocOpts = append(c.allocOpts, chromedp.Flag(parts[0], parts[1]))
+		} else {
+			c.allocOpts = append(c.allocOpts, chromedp.Flag(flag, true))
+		}
+	}
+
+	// Start browser pool
+	c.browserPool = browserpool.New(c.ctx, c.cfg.BrowserPoolSize, c.allocOpts, c.cfg.RemoteChromeURL)
+	if err := c.browserPool.Start(); err != nil {
+		return fmt.Errorf("browser pool start failed: %w", err)
+	}
 
 	go c.periodicCheckpoint()
 	go c.reportProgress()
 	go c.periodicCleanup()
 	go c.periodicCookieSave()
+	go c.periodicBrowserHealthCheck()
 
 	c.loadCookieJar()
 
@@ -412,29 +486,29 @@ func (c *Crawler) Start(seeds []string) error {
 		fmt.Println("Log in manually in the browser, then press Enter to begin crawling.")
 		fmt.Print("Press Enter when ready (or 'q' to quit): ")
 
-		loginCtx, loginCancel := chromedp.NewContext(browserCtx)
-		if err := chromedp.Run(loginCtx, chromedp.Navigate(c.cfg.AuthConfig.LoginURL)); err != nil {
-			loginCancel()
-			if c.warc != nil {
-				c.warc.Close()
-			}
+		loginTabCtx, loginTabRelease, err := c.browserPool.Acquire()
+		if err != nil {
+			c.closeWriters()
+			return fmt.Errorf("failed to acquire browser for login: %w", err)
+		}
+		if err := chromedp.Run(loginTabCtx, chromedp.Navigate(c.cfg.AuthConfig.LoginURL)); err != nil {
+			loginTabRelease()
+			c.closeWriters()
 			return fmt.Errorf("failed to navigate to login URL: %w", err)
 		}
-		c.waitForPage(loginCtx)
+		c.waitForPage(loginTabCtx)
 
 		var input string
 		if _, err := fmt.Scanln(&input); err == nil {
 			if input == "q" || input == "Q" || input == "quit" || input == "exit" {
-				loginCancel()
-				if c.warc != nil {
-					c.warc.Close()
-				}
+				loginTabRelease()
+				c.closeWriters()
 				util.LogInfo("user cancelled during pre-crawl login")
 				return nil
 			}
 		}
-		c.persistCookies(loginCtx, c.cfg.AuthConfig.LoginURL)
-		loginCancel()
+		c.persistCookies(loginTabCtx, c.cfg.AuthConfig.LoginURL)
+		loginTabRelease()
 		fmt.Println("Login captured. Starting crawl...")
 	}
 
@@ -461,7 +535,11 @@ func (c *Crawler) Start(seeds []string) error {
 		fmt.Println("Navigate freely in the browser window.")
 		fmt.Println("Each page you visit will be captured automatically.")
 		fmt.Println("Press Ctrl+C or type 'q' + Enter to stop.")
-		c.manualCapture(browserCtx, seeds)
+		capCtx, _, err := c.browserPool.Acquire()
+		if err != nil {
+			return fmt.Errorf("failed to acquire browser for manual capture: %w", err)
+		}
+		c.manualCapture(capCtx, seeds)
 		goto cleanup
 	}
 
@@ -485,6 +563,12 @@ Loop:
 
 		if item.Depth > c.cfg.MaxDepth {
 			continue
+		}
+
+		memUsed := c.memoryBudget.Used()
+		memMax := c.memoryBudget.Max()
+		if memUsed > memMax*8/10 {
+			runtime.GC()
 		}
 
 		host := getHost(item.URL)
@@ -556,7 +640,7 @@ Loop:
 				}
 			}()
 
-			c.crawlPage(browserCtx, url, depth)
+			c.crawlPage(c.ctx, url, depth)
 		}(item.URL, item.Depth, host, hostSemCh, startTime)
 	}
 
@@ -593,9 +677,7 @@ cleanup:
 	c.writeSW(apiResponses, wsRaw)
 	c.writeSitemap()
 	c.saveCookieJar()
-	if c.warc != nil {
-		c.warc.Close()
-	}
+	c.closeWriters()
 	if c.persistentQueue != nil {
 		c.persistentQueue.Save()
 	}
@@ -704,6 +786,26 @@ func (c *Crawler) writeWSMessages() {
 		return
 	}
 	util.LogInfo("wrote WS messages", zap.String("path", path), zap.Int("count", len(wsMessages)))
+}
+
+func apiURLMatches(rawURL string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return true
+	}
+	for _, p := range patterns {
+		if strings.HasPrefix(p, "/") {
+			if u, err := url.Parse(rawURL); err == nil {
+				if matched, _ := filepath.Match(p, u.Path); matched {
+					return true
+				}
+			}
+		}
+		matched, _ := filepath.Match(p, rawURL)
+		if matched {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Crawler) writeAPIResponses(responses []interface{}) {
@@ -1346,24 +1448,45 @@ func (c *Crawler) launchBrowser() error {
 		c.browserCancel()
 	}
 
-	allocCtx, allocCancel := chromedp.NewExecAllocator(c.ctx, c.allocOpts...)
-	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
+	var allocCtx context.Context
+	var allocCancel context.CancelFunc
+	var browserCtx context.Context
+	var browserCancel context.CancelFunc
 
-	if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
-		allocCancel()
-		browserCancel()
-		return fmt.Errorf("browser launch failed: %w", err)
+	if c.cfg.RemoteChromeURL != "" {
+		// Connect to an existing remote Chrome instance
+		allocCtx, allocCancel = chromedp.NewRemoteAllocator(c.ctx, c.cfg.RemoteChromeURL)
+		browserCtx, browserCancel = chromedp.NewContext(allocCtx)
+
+		if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
+			allocCancel()
+			browserCancel()
+			return fmt.Errorf("remote browser connection failed: %w", err)
+		}
+	} else {
+		allocCtx, allocCancel = chromedp.NewExecAllocator(c.ctx, c.allocOpts...)
+		browserCtx, browserCancel = chromedp.NewContext(allocCtx)
+
+		if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
+			allocCancel()
+			browserCancel()
+			return fmt.Errorf("browser launch failed: %w", err)
+		}
 	}
-
-	go func() {
-		<-allocCtx.Done()
-		browserCancel()
-	}()
 
 	c.browserCtx = browserCtx
 	c.browserCancel = func() {
 		allocCancel()
 		browserCancel()
+		if c.cfg.RemoteChromeURL == "" {
+			// Only wait for local Chrome to exit
+			waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer waitCancel()
+			select {
+			case <-allocCtx.Done():
+			case <-waitCtx.Done():
+			}
+		}
 	}
 	return nil
 }
@@ -1375,31 +1498,37 @@ func (c *Crawler) getBrowserCtx() context.Context {
 }
 
 func (c *Crawler) restartBrowser() context.Context {
+	// Create allocator with timeout to prevent indefinite blocking
+	restartCtx, restartCancel := context.WithTimeout(c.ctx, 30*time.Second)
+	defer restartCancel()
+
 	c.browserMu.Lock()
 	if c.browserCancel != nil {
 		c.browserCancel()
 	}
 
-	allocCtx, allocCancel := chromedp.NewExecAllocator(c.ctx, c.allocOpts...)
+	allocCtx, allocCancel := chromedp.NewExecAllocator(restartCtx, c.allocOpts...)
 	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
 
 	if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
+		c.browserMu.Unlock()
 		allocCancel()
 		browserCancel()
-		c.browserMu.Unlock()
 		util.LogError("browser restart failed", err)
 		return nil
 	}
-
-	go func() {
-		<-allocCtx.Done()
-		browserCancel()
-	}()
 
 	c.browserCtx = browserCtx
 	c.browserCancel = func() {
 		allocCancel()
 		browserCancel()
+		// Wait for Chrome to exit gracefully (up to 5 seconds)
+		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer waitCancel()
+		select {
+		case <-allocCtx.Done():
+		case <-waitCtx.Done():
+		}
 	}
 	c.browserMu.Unlock()
 	util.LogInfo("browser restarted successfully")
@@ -1437,25 +1566,14 @@ func (c *Crawler) crawlPage(ctx context.Context, urlStr string, depth int) {
 			}
 		}
 
-		browserCtx := c.getBrowserCtx()
-		if browserCtx == nil {
-			util.LogError("browser context is nil, skipping", nil, zap.String("url", urlStr))
+		tabCtx, tabRelease, err := c.browserPool.Acquire()
+		if err != nil {
+			util.LogError("failed to acquire browser from pool, skipping", err, zap.String("url", urlStr))
 			return
 		}
 
-		if browserCtx.Err() != nil {
-			util.LogInfo("browser appears to have crashed, restarting",
-				zap.String("url", urlStr),
-				zap.Error(browserCtx.Err()),
-			)
-			browserCtx = c.restartBrowser()
-			if browserCtx == nil {
-				util.LogError("browser restart failed, giving up", nil, zap.String("url", urlStr))
-				return
-			}
-		}
-
-		lastErr = c.doCrawl(browserCtx, urlStr, depth)
+		lastErr = c.doCrawl(tabCtx, urlStr, depth)
+		tabRelease()
 		if lastErr == nil {
 			c.circuitBreaker.Success(host)
 			return
@@ -1504,6 +1622,12 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	c.setCookies(tabCtx)
 	c.injectPersistedCookies(tabCtx, urlStr)
 
+	if len(c.cfg.BlockedURLPatterns) > 0 {
+		if err := chromedp.Run(tabCtx, network.SetBlockedURLS(c.cfg.BlockedURLPatterns)); err != nil {
+			util.LogDebug("failed to set blocked URL patterns", zap.Error(err))
+		}
+	}
+
 	if !c.cfg.Interactive && c.authManager != nil && c.cfg.AuthConfig != nil && c.cfg.AuthConfig.Enabled {
 		if err := c.authManager.Authenticate(tabCtx, urlStr); err != nil {
 			util.LogError("authentication failed", err, zap.String("url", urlStr))
@@ -1517,6 +1641,13 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	netIntercept := netintercept.NewInterceptorWithWorkers(workerCount)
 	defer netIntercept.Close()
 	netIntercept.SetAPICallback(func(ar netintercept.APIResponse) {
+		if !c.cfg.EnableAPICapture {
+			return
+		}
+		if !apiURLMatches(ar.URL, c.cfg.InterceptAPIs) {
+			return
+		}
+
 		var reqBody []byte
 		if ar.Request != nil && len(ar.Request.Body) > 0 {
 			reqBody = ar.Request.Body
@@ -1535,21 +1666,21 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			Size:        len(ar.Body),
 			GraphQLOp:   gqlOp,
 		})
-		if c.cfg.EnableWARC && c.warc != nil {
-			c.warc.WriteRecord(&storage.WARCRecord{
-				URL:        ar.URL,
-				Body:       ar.Body,
-				MimeType:   "application/json",
-				Date:       time.Now(),
-				StatusCode: ar.StatusCode,
-				RecordType: "response",
-				ContentLen: int64(len(ar.Body)),
-			})
-		}
+		c.writeRecord(&storage.WARCRecord{
+			URL:        ar.URL,
+			Body:       ar.Body,
+			MimeType:   "application/json",
+			Date:       time.Now(),
+			StatusCode: ar.StatusCode,
+			RecordType: "response",
+			ContentLen: int64(len(ar.Body)),
+		})
 		savePath := c.storage.PathForAPI(ar.URL)
 		if savePath != "" {
 			os.MkdirAll(filepath.Dir(savePath), 0755)
-			os.WriteFile(savePath, ar.Body, 0644)
+			if err := os.WriteFile(savePath, ar.Body, 0644); err != nil {
+				util.LogDebug("failed to save API response", zap.Error(err))
+			}
 		}
 	})
 	netIntercept.Start(tabCtx, urlStr)
@@ -1571,15 +1702,8 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		return nil
 	}))
 	if err != nil {
-		errStr := err.Error()
-		retryable := true
-		for _, code := range []string{"404", "410", "403", "401", "400"} {
-			if strings.Contains(errStr, code) {
-				retryable = false
-				break
-			}
-		}
-		return &RetryableError{Err: err, Retryable: retryable}
+		crawlErr := crawlerrors.Classify(err)
+		return &RetryableError{Err: err, Retryable: crawlErr.Retryable}
 	}
 
 	c.waitForPage(tabCtx)
@@ -1761,14 +1885,16 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 	}
 
 	var structuredData []byte
-	if c.cfg.EnableStructuredData {
+		if c.cfg.EnableStructuredData {
 		sd, err := jsengine.ExtractStructuredData(tabCtx)
 		if err == nil && sd != nil && (len(sd.JSONLD) > 0 || len(sd.OG) > 0 || len(sd.Twitter) > 0 || len(sd.Meta) > 0) {
 			structuredData, err = json.Marshal(sd)
 			if err == nil {
 				savePath := c.cfg.OutputDir + "/" + getHost(urlStr) + "/structured-data.json"
 				os.MkdirAll(filepath.Dir(savePath), 0755)
-				os.WriteFile(savePath, structuredData, 0644)
+				if err := os.WriteFile(savePath, structuredData, 0644); err != nil {
+					util.LogDebug("failed to save structured data", zap.Error(err))
+				}
 			}
 		}
 	}
@@ -1787,7 +1913,9 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			article.URL = urlStr
 			article.ExtractedAt = time.Now().Format(time.RFC3339)
 			articleData, _ := json.MarshalIndent(article, "", "  ")
-			os.WriteFile(articlePath, articleData, 0644)
+			if err := os.WriteFile(articlePath, articleData, 0644); err != nil {
+				util.LogDebug("failed to save article", zap.Error(err))
+			}
 		}
 	}
 
@@ -1816,31 +1944,9 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 
 	for _, link := range links {
 		normalized := c.normalizeURL(queue.NormalizeAndClean(link))
-		if !isValidURL(normalized) {
-			continue
+		if c.shouldQueue(normalized) {
+			c.urlQueue.PushURL(normalized, depth+1)
 		}
-		if c.bloomFilter.HasSeen(normalized) {
-			continue
-		}
-		if !c.isAllowedDomain(normalized) {
-			continue
-		}
-		if c.isExcluded(normalized) {
-			continue
-		}
-		if c.cfg.MaxTotalURLs > 0 && c.totalURLs.Load() >= int64(c.cfg.MaxTotalURLs) {
-			break
-		}
-		if c.urlQueue.Size() >= maxQueueSize {
-			util.LogDebug("queue full, skipping", zap.String("url", normalized))
-			continue
-		}
-		if c.exactDedup.Contains(normalized) {
-			continue
-		}
-		c.bloomFilter.Add(normalized)
-		c.exactDedup.Add(normalized)
-		c.urlQueue.PushURL(normalized, depth+1)
 	}
 
 	// Extract and queue iframe sources
@@ -1856,31 +1962,13 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 					continue
 				}
 				absURL := rewrite.ResolveURL(urlStr, iframe.Src)
-				if absURL == "" || !isValidURL(absURL) {
+				if absURL == "" {
 					continue
 				}
 				normalized := c.normalizeURL(queue.NormalizeAndClean(absURL))
-				if c.bloomFilter.HasSeen(normalized) {
-					continue
+				if c.shouldQueue(normalized) {
+					c.urlQueue.PushURL(normalized, depth+1)
 				}
-				if !c.isAllowedDomain(normalized) {
-					continue
-				}
-				if c.isExcluded(normalized) {
-					continue
-				}
-				if c.cfg.MaxTotalURLs > 0 && c.totalURLs.Load() >= int64(c.cfg.MaxTotalURLs) {
-					break
-				}
-				if c.urlQueue.Size() >= maxQueueSize {
-					continue
-				}
-				if c.exactDedup.Contains(normalized) {
-					continue
-				}
-				c.bloomFilter.Add(normalized)
-				c.exactDedup.Add(normalized)
-				c.urlQueue.PushURL(normalized, depth+1)
 			}
 		}
 	}
@@ -1898,39 +1986,19 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 					continue
 				}
 				absURL := rewrite.ResolveURL(urlStr, ms.Src)
-				if absURL == "" || !isValidURL(absURL) {
+				if absURL == "" {
 					continue
 				}
 				normalized := c.normalizeURL(queue.NormalizeAndClean(absURL))
-				if c.bloomFilter.HasSeen(normalized) {
-					continue
+				if c.shouldQueue(normalized) {
+					c.urlQueue.PushURL(normalized, depth+1)
 				}
-				if !c.isAllowedDomain(normalized) {
-					continue
-				}
-				if c.isExcluded(normalized) {
-					continue
-				}
-				if c.cfg.MaxTotalURLs > 0 && c.totalURLs.Load() >= int64(c.cfg.MaxTotalURLs) {
-					break
-				}
-				if c.urlQueue.Size() >= maxQueueSize {
-					continue
-				}
-				if c.exactDedup.Contains(normalized) {
-					continue
-				}
-				c.bloomFilter.Add(normalized)
-				c.exactDedup.Add(normalized)
-				c.urlQueue.PushURL(normalized, depth+1)
 
 				if ms.Poster != "" {
 					posterURL := rewrite.ResolveURL(urlStr, ms.Poster)
-					if posterURL != "" && isValidURL(posterURL) {
+					if posterURL != "" {
 						pNorm := c.normalizeURL(queue.NormalizeAndClean(posterURL))
-						if !c.bloomFilter.HasSeen(pNorm) && c.isAllowedDomain(pNorm) && !c.isExcluded(pNorm) && !c.exactDedup.Contains(pNorm) {
-							c.bloomFilter.Add(pNorm)
-							c.exactDedup.Add(pNorm)
+						if c.shouldQueue(pNorm) {
 							c.urlQueue.PushURL(pNorm, depth+1)
 						}
 					}
@@ -1957,7 +2025,7 @@ func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, urlStr s
 				elements.forEach(function(el) {
 					if (el.shadowRoot) {
 						var template = document.createElement('template');
-						template.innerHTML = '<!---- shadowrootmode=open ---->' + el.shadowRoot.innerHTML + '<!---- /shadowrootmode ---->';
+						template.innerHTML = '<template shadowrootmode="open">' + el.shadowRoot.innerHTML + '</template>';
 						el.appendChild(template.content);
 					}
 				});
@@ -1993,6 +2061,9 @@ func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, urlStr s
 	if html == "" {
 		chromedp.Run(tabCtx, chromedp.Evaluate(`document.body ? document.body.innerHTML : ''`, &html))
 	}
+
+	c.memoryBudget.ReserveBlocking(int64(len(html)))
+	defer c.memoryBudget.Release(int64(len(html)))
 
 	if c.changeDetector != nil {
 		var title string
@@ -2057,17 +2128,15 @@ func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, urlStr s
 
 	c.rewriter.SetBaseURL(urlStr)
 
-	if c.cfg.EnableWARC && c.warc != nil {
-		c.warc.WriteRecord(&storage.WARCRecord{
-			URL:        urlStr,
-			Body:       []byte(html),
-			MimeType:   "text/html",
-			Date:       time.Now(),
-			StatusCode: 200,
-			RecordType: "response",
-			ContentLen: int64(len(html)),
-		})
-	}
+	c.writeRecord(&storage.WARCRecord{
+		URL:        urlStr,
+		Body:       []byte(html),
+		MimeType:   "text/html",
+		Date:       time.Now(),
+		StatusCode: 200,
+		RecordType: "response",
+		ContentLen: int64(len(html)),
+	})
 
 	if screenshot != nil {
 		c.storage.SaveScreenshot(urlStr, screenshot)
@@ -2111,17 +2180,15 @@ func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, urlStr s
 		c.metrics.IncAssetsCaptured()
 		c.metrics.AddBytes(int64(len(resource.Body)))
 
-		if c.cfg.EnableWARC && c.warc != nil {
-			c.warc.WriteRecord(&storage.WARCRecord{
-				URL:        origURL,
-				Body:       resource.Body,
-				MimeType:   resource.MimeType,
-				Date:       time.Now(),
-				StatusCode: 200,
-				RecordType: "response",
-				ContentLen: int64(len(resource.Body)),
-			})
-		}
+		c.writeRecord(&storage.WARCRecord{
+			URL:        origURL,
+			Body:       resource.Body,
+			MimeType:   resource.MimeType,
+			Date:       time.Now(),
+			StatusCode: 200,
+			RecordType: "response",
+			ContentLen: int64(len(resource.Body)),
+		})
 
 		if c.cfg.Incremental && c.incCache != nil {
 			c.incCache.UpdateFromResponse(origURL, int(resource.StatusCode), resource.Headers)
@@ -2201,7 +2268,7 @@ func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, urlStr s
 			cssURLs := c.rewriter.ExtractAllCSSURLs(cssData)
 			for _, cssURL := range cssURLs {
 				absCSSURL := rewrite.ResolveURL(urlStr, cssURL)
-				if absCSSURL != "" && isValidURL(absCSSURL) {
+				if absCSSURL != "" && isValidURL(absCSSURL) && !c.bloomFilter.HasSeen(absCSSURL) {
 				if !c.bloomFilter.HasSeen(absCSSURL) {
 					cssReq, _ := http.NewRequestWithContext(assetCtx, "GET", absCSSURL, nil)
 					if cssReq != nil {
@@ -2253,6 +2320,13 @@ func (c *Crawler) manualCapture(browserCtx context.Context, seedURLs []string) {
 	netIntercept := netintercept.NewInterceptorWithWorkers(5)
 	defer netIntercept.Close()
 	netIntercept.SetAPICallback(func(ar netintercept.APIResponse) {
+		if !c.cfg.EnableAPICapture {
+			return
+		}
+		if !apiURLMatches(ar.URL, c.cfg.InterceptAPIs) {
+			return
+		}
+
 		var reqBody []byte
 		if ar.Request != nil && len(ar.Request.Body) > 0 {
 			reqBody = ar.Request.Body
@@ -2271,21 +2345,21 @@ func (c *Crawler) manualCapture(browserCtx context.Context, seedURLs []string) {
 			Size:        len(ar.Body),
 			GraphQLOp:   gqlOp,
 		})
-		if c.cfg.EnableWARC && c.warc != nil {
-			c.warc.WriteRecord(&storage.WARCRecord{
-				URL:        ar.URL,
-				Body:       ar.Body,
-				MimeType:   "application/json",
-				Date:       time.Now(),
-				StatusCode: ar.StatusCode,
-				RecordType: "response",
-				ContentLen: int64(len(ar.Body)),
-			})
-		}
+		c.writeRecord(&storage.WARCRecord{
+			URL:        ar.URL,
+			Body:       ar.Body,
+			MimeType:   "application/json",
+			Date:       time.Now(),
+			StatusCode: ar.StatusCode,
+			RecordType: "response",
+			ContentLen: int64(len(ar.Body)),
+		})
 		savePath := c.storage.PathForAPI(ar.URL)
 		if savePath != "" {
 			os.MkdirAll(filepath.Dir(savePath), 0755)
-			os.WriteFile(savePath, ar.Body, 0644)
+			if err := os.WriteFile(savePath, ar.Body, 0644); err != nil {
+				util.LogDebug("failed to save API response", zap.Error(err))
+			}
 		}
 	})
 
@@ -2928,7 +3002,96 @@ func (c *Crawler) interactWithForm(ctx context.Context, xpath string, item map[s
 		method = m
 	}
 
-	util.LogDebug("interaction: found form", zap.String("xpath", xpath), zap.String("action", action), zap.String("method", method))
+	if action == "" || strings.HasPrefix(action, "javascript:") {
+		return false
+	}
+
+	util.LogDebug("interaction: submitting form", zap.String("xpath", xpath), zap.String("action", action), zap.String("method", method))
+
+	// Fill all input/select/textarea elements inside the form
+	script := fmt.Sprintf(`
+		(function(xpath) {
+			var result = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null);
+			var form = result.singleNodeValue;
+			if (!form || !form.elements) return { success: false, reason: 'not found or not a form' };
+
+			// Fill inputs with sensible defaults
+			for (var i = 0; i < form.elements.length; i++) {
+				var el = form.elements[i];
+				if (el.disabled || el.readOnly) continue;
+				var type = (el.type || '').toLowerCase();
+
+				if (type === 'text' || type === 'search' || type === 'tel' || type === 'url') {
+					el.focus();
+					if (el.name && el.name.toLowerCase().indexOf('search') >= 0) {
+						el.value = 'test query';
+					} else if (el.name && (el.name.toLowerCase().indexOf('name') >= 0 || el.placeholder && el.placeholder.toLowerCase().indexOf('name') >= 0)) {
+						el.value = 'Test User';
+					} else if (el.name && el.name.toLowerCase().indexOf('email') >= 0) {
+						el.value = 'test@example.com';
+					} else if (el.name && (el.name.toLowerCase().indexOf('phone') >= 0 || el.name.toLowerCase().indexOf('tel') >= 0)) {
+						el.value = '+1-555-555-0100';
+					} else {
+						el.value = 'test';
+					}
+					el.dispatchEvent(new Event('input', { bubbles: true }));
+					el.dispatchEvent(new Event('change', { bubbles: true }));
+				} else if (type === 'email') {
+					el.focus();
+					el.value = 'test@example.com';
+					el.dispatchEvent(new Event('input', { bubbles: true }));
+					el.dispatchEvent(new Event('change', { bubbles: true }));
+				} else if (type === 'password') {
+					el.focus();
+					el.value = 'testpassword123';
+					el.dispatchEvent(new Event('input', { bubbles: true }));
+					el.dispatchEvent(new Event('change', { bubbles: true }));
+				} else if (type === 'checkbox' || type === 'radio') {
+					el.checked = true;
+					el.dispatchEvent(new Event('change', { bubbles: true }));
+				} else if (type === 'select-one' || type === 'select-multiple') {
+					if (el.options.length > 0) {
+						for (var j = 0; j < el.options.length; j++) {
+							if (!el.options[j].disabled) {
+								el.selectedIndex = j;
+								el.dispatchEvent(new Event('change', { bubbles: true }));
+								break;
+							}
+						}
+					}
+				} else if (type === 'textarea') {
+					el.focus();
+					el.value = 'test content for textarea';
+					el.dispatchEvent(new Event('input', { bubbles: true }));
+					el.dispatchEvent(new Event('change', { bubbles: true }));
+				}
+			}
+
+			// Submit the form
+			try {
+				var submitBtn = form.querySelector('input[type="submit"], button[type="submit"], button:not([type])');
+				if (submitBtn) {
+					submitBtn.click();
+				} else {
+					form.submit();
+				}
+				return { success: true };
+			} catch(e) {
+				return { success: false, reason: e.message };
+			}
+		})("%s")
+	`, xpath)
+
+	var result map[string]interface{}
+	err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+	if err != nil {
+		return false
+	}
+
+	if success, ok := result["success"].(bool); ok && success {
+		util.LogDebug("interaction: form submitted", zap.String("xpath", xpath))
+		return true
+	}
 	return false
 }
 
@@ -3087,16 +3250,15 @@ func (c *Crawler) injectPersistedCookies(ctx context.Context, urlStr string) {
 
 	c.cookieMu.RLock()
 	var allCookies []*http.Cookie
-	// Collect cookies from the exact domain and parent domains
-	parts := strings.Split(domain, ".")
 	seen := make(map[string]bool)
-	for i := 0; i < len(parts); i++ {
-		d := strings.Join(parts[i:], ".")
-		for _, ck := range c.cookieJar[d] {
-			key := ck.Name + "|" + ck.Domain + "|" + ck.Path
-			if !seen[key] {
-				seen[key] = true
-				allCookies = append(allCookies, ck)
+	for jarDomain, cookies := range c.cookieJar {
+		if domain == jarDomain || strings.HasSuffix(domain, "."+jarDomain) {
+			for _, ck := range cookies {
+				key := ck.Name + "|" + ck.Domain + "|" + ck.Path
+				if !seen[key] {
+					seen[key] = true
+					allCookies = append(allCookies, ck)
+				}
 			}
 		}
 	}
@@ -3176,6 +3338,9 @@ func (c *Crawler) setupWSCapture(ctx context.Context) {
 			}
 			isBinary := e.Response.Opcode == 2
 			data := e.Response.PayloadData
+			if len(data) > maxWSFrameSize {
+				data = data[:maxWSFrameSize]
+			}
 			if isBinary {
 				data = base64.StdEncoding.EncodeToString([]byte(data))
 			}
@@ -3196,6 +3361,9 @@ func (c *Crawler) setupWSCapture(ctx context.Context) {
 			}
 			isBinary := e.Response.Opcode == 2
 			data := e.Response.PayloadData
+			if len(data) > maxWSFrameSize {
+				data = data[:maxWSFrameSize]
+			}
 			if isBinary {
 				data = base64.StdEncoding.EncodeToString([]byte(data))
 			}
@@ -3422,6 +3590,35 @@ func (c *Crawler) applyWaitStrategy(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// shouldQueue checks if a URL should be added to the crawl queue.
+// If it passes all filters, it's marked as seen and true is returned.
+func (c *Crawler) shouldQueue(normalized string) bool {
+	if !isValidURL(normalized) {
+		return false
+	}
+	if c.bloomFilter.HasSeen(normalized) {
+		return false
+	}
+	if !c.isAllowedDomain(normalized) {
+		return false
+	}
+	if c.isExcluded(normalized) {
+		return false
+	}
+	if c.cfg.MaxTotalURLs > 0 && c.totalURLs.Load() >= int64(c.cfg.MaxTotalURLs) {
+		return false
+	}
+	if c.urlQueue.Size() >= maxQueueSize {
+		return false
+	}
+	if c.exactDedup.Contains(normalized) {
+		return false
+	}
+	c.bloomFilter.Add(normalized)
+	c.exactDedup.Add(normalized)
+	return true
 }
 
 func (c *Crawler) periodicCleanup() {

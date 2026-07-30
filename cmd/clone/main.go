@@ -59,6 +59,12 @@ Examples:
 	rootCmd.Flags().Bool("interact", false, "enable systematic interaction engine (click links, fill forms)")
 	rootCmd.Flags().Bool("interactive", false, "interactive mode (visible browser, user handles CAPTCHAs and forms manually)")
 	rootCmd.Flags().Bool("manual-capture", false, "manual capture mode (user navigates freely, each page visited is captured)")
+	rootCmd.Flags().StringSlice("chrome-flag", nil, "additional Chrome CLI flag (can be specified multiple times)")
+	rootCmd.Flags().String("remote-chrome-url", "", "websocket URL for remote Chrome (ws://host:port/...)")
+	rootCmd.Flags().Int("browser-pool-size", 1, "number of concurrent browser processes")
+	rootCmd.Flags().String("user-data-dir", "", "Chrome user data directory for persistent profiles")
+	rootCmd.Flags().Bool("wacz", false, "enable WACZ output (packaged web archive)")
+	rootCmd.Flags().StringSlice("blocked-urls", nil, "URL patterns to block (e.g. *doubleclick*)")
 
 	serveCmd := &cobra.Command{
 		Use:   "serve [directory]",
@@ -187,6 +193,12 @@ func runClone(cmd *cobra.Command, args []string) error {
 	interact, _ := cmd.Flags().GetBool("interact")
 	interactive, _ := cmd.Flags().GetBool("interactive")
 	manualCapture, _ := cmd.Flags().GetBool("manual-capture")
+	chromeFlags, _ := cmd.Flags().GetStringSlice("chrome-flag")
+	remoteChromeURL, _ := cmd.Flags().GetString("remote-chrome-url")
+	browserPoolSize, _ := cmd.Flags().GetInt("browser-pool-size")
+	userDataDir, _ := cmd.Flags().GetString("user-data-dir")
+	wacz, _ := cmd.Flags().GetBool("wacz")
+	blockedURLs, _ := cmd.Flags().GetStringSlice("blocked-urls")
 
 	cfg.MaxDepth = maxDepth
 	cfg.MaxConcurrentPages = concurrency
@@ -202,6 +214,12 @@ func runClone(cmd *cobra.Command, args []string) error {
 	cfg.EnableInteractionEngine = interact
 	cfg.Interactive = interactive || manualCapture
 	cfg.ManualCapture = manualCapture
+	cfg.ChromeFlags = chromeFlags
+	cfg.RemoteChromeURL = remoteChromeURL
+	cfg.BrowserPoolSize = browserPoolSize
+	cfg.UserDataDir = userDataDir
+	cfg.EnableWACZ = wacz
+	cfg.BlockedURLPatterns = blockedURLs
 
 	if cfg.InfiniteScroll == nil {
 		cfg.InfiniteScroll = &config.InfiniteScrollConfig{}

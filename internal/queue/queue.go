@@ -158,9 +158,13 @@ func (q *PriorityQueue) LoadFromCheckpoint(items []URLItem, visited map[string]b
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.items = make([]*URLItem, len(items))
-	q.seen = visited
+	q.seen = make(map[string]bool, len(visited))
+	for k, v := range visited {
+		q.seen[k] = v
+	}
 	for i := range items {
-		q.items[i] = &items[i]
+		item := items[i]
+		q.items[i] = &item
 	}
 	heap.Init(q)
 }

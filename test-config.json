@@ -1,0 +1,14 @@
+{
+  "checkpoint_file": "test.checkpoint",
+  "bloom_filter_path": "test.bloom",
+  "inc_cache_file": "test.inc.cache",
+  "incremental": true,
+  "enable_raw": true,
+  "raw_dir": "test-raw",
+  "output_dir": "test-localized",
+  "max_urls_per_host": 2000,
+  "max_concurrent_pages": 3,
+  "page_timeout": 60000000000,
+  "crawl_delay": 1000000000,
+  "max_depth": 3
+}

@@ -1,0 +1,125 @@
+version: "2"
+
+run:
+  timeout: 5m
+  issues-exit-code: 1
+  tests: true
+
+output:
+  format: colored-line-number
+  print-issued-lines: true
+  print-linter-name: true
+
+linters-settings:
+  govet:
+    check-shadowing: true
+  gocyclo:
+    min-complexity: 15
+  goconst:
+    min-len: 2
+    min-occurrences: 2
+  misspell:
+    locale: US
+  lll:
+    line-length: 120
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - experimental
+      - opinionated
+      - performance
+      - style
+    disabled-checks:
+      - wrapperFunc
+      - dupImport
+      - ifElseChain
+      - tooManyResultsChecker
+  revive:
+    rules:
+      - name: exported
+        severity: warning
+        disabled: false
+      - name: unexported-return
+        severity: warning
+        disabled: true
+      - name: var-naming
+        severity: warning
+        disabled: false
+      - name: package-comments
+        severity: warning
+        disabled: false
+      - name: blank-imports
+        severity: error
+        disabled: false
+  gosec:
+    excludes:
+      - G104 # Errors not checked
+      - G204 # Subprocess launch
+      - G304 # File path taint
+
+linters:
+  enable:
+    - bodyclose
+    - contextcheck
+    - errcheck
+    - exhaustive
+    - exportloopref
+    - goconst
+    - gocritic
+    - gocyclo
+    - goimports
+    - gomnd
+    - gosec
+    - gosimple
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - noctx
+    - nolintlint
+    - prealloc
+    - revive
+    - staticcheck
+    - stylecheck
+    - unconvert
+  disable:
+    - cyclop
+    - dupl
+    - funlen
+    - gocognit
+    - godox
+    - gochecknoglobals
+    - gochecknoinits
+    - llld
+    - mnd
+    - rowserrcheck
+    - testpackage
+    - wrapcheck
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gocyclo
+        - lll
+        - goconst
+    - path: internal/crawler/crawler\.go
+      linters:
+        - funlen
+        - gocyclo
+    - path: internal/crawler/capture\.go
+      linters:
+        - funlen
+        - gocyclo
+    - path: internal/rewrite/html\.go
+      linters:
+        - funlen
+        - gocyclo
+    - path: internal/jsengine/scripts\.go
+      linters:
+        - funlen
+        - gocyclo
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
