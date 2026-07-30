@@ -47,6 +47,87 @@ const (
 				configurable: true,
 			});
 
+			// Canvas fingerprint protection
+			try {
+				const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+				const origToBlob = HTMLCanvasElement.prototype.toBlob;
+				const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+
+				HTMLCanvasElement.prototype.toDataURL = function() {
+					const r = Math.random() * 0.01 - 0.005;
+					const g = Math.random() * 0.01 - 0.005;
+					const b = Math.random() * 0.01 - 0.005;
+					const ctx = this.getContext('2d');
+					if (ctx) {
+						const imageData = ctx.getImageData(0, 0, this.width, this.height);
+						for (let i = 0; i < imageData.data.length; i += 4) {
+							imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + r));
+							imageData.data[i+1] = Math.min(255, Math.max(0, imageData.data[i+1] + g));
+							imageData.data[i+2] = Math.min(255, Math.max(0, imageData.data[i+2] + b));
+						}
+						ctx.putImageData(imageData, 0, 0);
+					}
+					return origToDataURL.apply(this, arguments);
+				};
+				HTMLCanvasElement.prototype.toBlob = function() {
+					return origToBlob.apply(this, arguments);
+				};
+				CanvasRenderingContext2D.prototype.getImageData = function() {
+					const imageData = origGetImageData.apply(this, arguments);
+					for (let i = 0; i < imageData.data.length; i += 4) {
+						imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + (Math.random() * 0.5)));
+						imageData.data[i+1] = Math.min(255, Math.max(0, imageData.data[i+1] + (Math.random() * 0.5)));
+						imageData.data[i+2] = Math.min(255, Math.max(0, imageData.data[i+2] + (Math.random() * 0.5)));
+					}
+					return imageData;
+				};
+			} catch(e) {}
+
+			// WebRTC IP leak protection
+			try {
+				if (window.RTCPeerConnection) {
+					const origCreateOffer = RTCPeerConnection.prototype.createOffer;
+					RTCPeerConnection.prototype.createOffer = function() {
+						return origCreateOffer.apply(this, arguments).then(offer => {
+							offer.sdp = offer.sdp.replace(/c=IN IP4\d+\.\d+\.\d+\.\d+/g, 'c=IN IP4 0.0.0.0');
+							offer.sdp = offer.sdp.replace(/c=IN IP6[^\r\n]+/g, 'c=IN IP6 ::');
+							return offer;
+						});
+					};
+				}
+			} catch(e) {}
+
+			// Font fingerprint protection - disable non-standard font enumeration
+			try {
+				if (document.fonts) {
+					const origCheck = document.fonts.check;
+					document.fonts.check = function() { return true; };
+				}
+			} catch(e) {}
+
+			// Override AudioContext fingerprinting
+			try {
+				if (window.OfflineAudioContext || window.webkitOfflineAudioContext) {
+					const AudioContextClass = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+					const origStartRendering = AudioContextClass.prototype.startRendering;
+					AudioContextClass.prototype.startRendering = function() {
+						const result = origStartRendering.apply(this, arguments);
+						if (result && result.then) {
+							return result.then(buffer => {
+								if (buffer && buffer.getChannelData) {
+									const data = buffer.getChannelData(0);
+									for (let i = 0; i < data.length; i++) {
+										data[i] += (Math.random() - 0.5) * 0.0001;
+									}
+								}
+								return buffer;
+							});
+						}
+						return result;
+					};
+				}
+			} catch(e) {}
+
 			// Override languages
 			Object.defineProperty(navigator, 'languages', {
 				get: () => ['en-US', 'en'],

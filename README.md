@@ -1,111 +1,185 @@
 # Web Cloner
 
-Production-grade browser-based web archiver. Drives headless Chrome via chromedp to crawl, capture, and reconstruct JavaScript-heavy sites as static HTML/CSS/image assets with WARC output, change detection, and API capture.
+Production-grade browser-driven web archiver. Drives Chrome via [chromedp](https://github.com/chromedp/chromedp) to crawl, render, and reconstruct JavaScript-heavy sites as static offline archives with WARC/WACZ output, change detection, and API/WebSocket capture.
+
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8)](https://golang.org)
+[![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
 ---
 
 ## Features
 
-- **Real browser engine** — Chromedp-based, renders JS SPAs, handles redirects, scrolls infinite pages
-- **CAPTCHA handling** — Automated solving via 2Captcha/AntiCaptcha/CapMonster, or **interactive mode** with a visible browser for manual solving and form filling
-- **Authentication** — Form login, HTTP Basic, custom headers, OAuth 2.0 flows
-- **Network interception** — Captures XHR/fetch/WebSocket traffic, GraphQL operations, and API payloads
-- **Output formats** — Static HTML files, WARC archives, screenshots, PDFs, SingleFile snapshots
-- **Resilience** — Per-host rate limiting, circuit breakers, retry with backoff, checkpoint/resume
-- **robots.txt** — Respects crawl directives, caches sitemap-discovered URLs
-- **Change detection** — Compare snapshots across crawls, report structural differences
-- **Queue backends** — In-memory, Redis, PostgreSQL, Kafka
+### Browser Engine
+- **Headless Chrome** via chromedp — renders JS SPAs, handles redirects, scrolls infinite pages
+- **Multi-browser pool** — N concurrent Chrome processes with LRU page assignment, health checks, and auto-restart on crash
+- **Remote Chrome** — connect to existing Chrome instances via WebSocket (Docker, cloud, etc.)
+- **Configurable flags** — add arbitrary `--chrome-flag` values from CLI or config
+- **Persistent profiles** — `--user-data-dir` preserves sessions, cookies, localStorage between restarts
+
+### Page Capture
+- Full HTML with Shadow DOM serialization
+- CSS/JS/image/font asset capture with URL rewriting for offline replay
+- Screenshots (full-page) and PDF generation
+- [SingleFile](https://github.com/gildas-lormeau/SingleFile)-style self-contained snapshots
+- Article extraction (readability algorithm)
+- Structured data extraction (JSON-LD, microdata, RDFa)
+
+### Network Interception
+- XHR/fetch/WebSocket capture with full request/response bodies
+- GraphQL operation detection
+- API response capture (filterable by URL pattern)
+- Network request blocking (`--blocked-urls` filters ads, analytics, etc.)
+- Configurable resource fallback for CDP-captured content
+
+### Navigation & Waiting
+- Multiple wait strategies: `domcontentloaded`, `networkidle`, `selector`, `adaptive`
+- Configurable navigation timeout and quiet period
+- Overlay dismissal and section expansion
+- Custom JS injection before/after page load
+- Clickable element interaction (CSS selectors)
+
+### Interaction Engine
+- Systematic link clicking and form filling
+- Form field type detection (text, email, password, tel, URL, checkbox, radio, select, textarea)
+- Context-aware values (names, emails, phones, search queries)
+- Form submission detection (button click, JavaScript submit)
+
+### Authentication
+- Form-based login (configurable selectors)
+- HTTP Basic Authentication
+- Custom header injection
+- OAuth 2.0 flows with token refresh support
+- Pre-crawl interactive login (solve CAPTCHAs, 2FA, SSO manually)
+
+### CAPTCHA Handling
+- Automated solving: 2Captcha, AntiCaptcha, CapMonster
+- Interactive mode: visible browser window, you solve challenges manually
+
+### Output Formats
+| Format | Description | Flag |
+|---|---|---|
+| **HTML/CSS/JS/Assets** | Static site reconstruction (default) | enabled by default |
+| **WARC** | Standard web archive format | `--warc` |
+| **WACZ** | Packaged web archive (ZIP with CDX index + metadata) | `--wacz` |
+| **Screenshots** | Full-page PNG screenshots | `--screenshot` |
+| **PDF** | Page PDF exports | `--pdf` |
+| **API Responses** | JSON dumps of captured API traffic | `--intercept-apis` |
+
+### Resilience
+- **Multi-browser pool** — no single point of failure; crashed Chrome instances restart automatically
+- Per-host rate limiting (token bucket, respects robots.txt `Crawl-Delay`)
+- Per-host circuit breaker (3-state: closed/open/half-open)
+- Retry with exponential backoff (uses proper error classification)
+- Checkpoint/resume — saves queue state, survives process restarts
+- Bloom filter dedup (LRU + bloom for URL deduplication)
+- Graceful Chrome shutdown with timeout
+
+### Infrastructure
+- **Distributed queue backends:** in-memory, Redis, PostgreSQL, Kafka
+- **Docker:** multi-stage Dockerfile + docker-compose with remote Chrome
+- **REST API:** control crawls programmatically (start, stop, status)
+- **Dashboard:** real-time web UI at `--dashboard-port`
+- **Scheduling:** cron expression support for recurring crawls
+- **Notifications:** webhook, Slack, email (SMTP) on completion/errors
+- **Change detection:** snapshot-diff across crawls, HTML structural reports
 
 ---
 
 ## Quick Start
 
 ```bash
+# Build
 go build -o clone ./cmd/clone
+
+# Basic crawl
 ./clone -d 1 https://example.com
+
+# Interactive (visible browser, solve CAPTCHAs manually)
+./clone --interactive https://example.com
+
+# With screenshots and WACZ output
+./clone -s --wacz https://example.com
+
+# Multi-browser pool (3 Chrome processes)
+./clone --browser-pool-size 3 https://example.com
+
+# Remote Chrome (Docker)
+docker compose up -d chrome
+./clone --remote-chrome-url=ws://localhost:9222/devtools/browser/0 https://example.com
+
+# Dashboard
+./clone --dashboard-port 8080 https://example.com
+# Open http://localhost:8080 in your browser
 ```
 
-Default output goes to `./output/`. Use `--output` to set a custom directory.
+Default output goes to `./output/`. Use `-o` or `--output` to set a custom directory.
 
-### CLI
+### Docker
 
-```
-Usage: clone [options] <seed URLs...>
+```bash
+# Full stack with Chrome container
+docker compose up --build
 
-Options:
-  -c, --config string       config file path (JSON)
-  -d, --depth int           max crawl depth (default 2)
-  -o, --output string       output directory (default "./output")
-  -p, --pages int           max concurrent pages (default 3)
-  -t, --timeout duration    per-page timeout (default 30s)
-  -s, --stealth             enable stealth mode (hide automation)
-  -l, --log string          log level: debug, info, warn, error (default "info")
-  -u, --user-agent string   custom user agent
-  --proxy string            HTTP proxy for Chrome
-  --interactive             show browser, solve CAPTCHAs/challenges manually
+# Or build and run standalone
+docker build -t web-cloner .
+docker run --rm -v ./output:/data/output web-cloner -d 1 https://example.com
 ```
 
 ---
 
-## Usage
+## CLI Reference
 
-### Basic crawl
+```
+Usage: clone [flags] URL...
 
-```bash
-./clone https://example.com
+Flags:
+  -c, --config string           config file path (JSON)
+  -d, --depth int               max crawl depth (default 10)
+  -n, --concurrency int         max concurrent pages (default 5)
+  -o, --output string           output directory (default "output")
+  -s, --screenshot              take screenshots
+  -p, --pdf                     generate PDFs
+  -l, --log-level string        log level: debug, info, warn, error (default "info")
+      --timeout duration        per-page timeout (default 120s)
+      --delay duration          delay between requests to same host (default 1s)
+      --proxy string            HTTP proxy for Chrome
+      --stealth                 anti-bot stealth mode (default true)
+      --no-robots               ignore robots.txt
+      --max-urls int            max URLs per host (default 10000)
+      --scroll                  infinite scroll detection (default true)
+      --interact                enable interaction engine (click links, fill forms)
+      --interactive             visible browser for manual CAPTCHA/form solving
+      --manual-capture          user navigates freely, each page is captured
+      --warc                    write WARC archive
+      --wacz                    write WACZ packaged archive
+      --chrome-flag strings     additional Chrome CLI flags (repeatable)
+      --remote-chrome-url string  websocket URL for remote Chrome
+      --browser-pool-size int   concurrent browser processes (default 1)
+      --user-data-dir string    Chrome user data directory
+      --blocked-urls strings    URL patterns to block (e.g. *doubleclick*)
+      --dashboard-port int      web dashboard port (0 = disabled)
+      --api-port int            REST API port (0 = disabled)
+      --webhook-url string      notification webhook URL
+      --slack-url string        Slack webhook URL
+      --schedule string         cron expression (e.g. "0 6 * * *" or "@every 24h")
+
+Subcommands:
+  serve [directory]    Serve cloned output for local replay
 ```
 
-### Config file
+---
 
-```json
-{
-  "seeds": ["https://example.com"],
-  "max_depth": 3,
-  "max_concurrent_pages": 5,
-  "output_dir": "./archive",
-  "respect_robots": true,
-  "stealth": true,
-  "screenshot": true
-}
-```
+## Configuration
 
-```bash
-./clone -c config.json
-```
+All features can be configured via JSON config file (`-c config.json`). CLI flags override file values.
 
-### Interactive mode
+### Full Config Schema
 
-Launches a visible Chrome window and pauses on each page so you can solve CAPTCHAs, fill forms, or handle challenges manually. Prompts for Enter before capturing content.
+See [internal/config/config.go](internal/config/config.go) for the complete struct with all fields, defaults, and validation.
 
-```bash
-./clone --interactive https://example.com/login
-```
+### Examples
 
-Or via config:
-
-```json
-{
-  "interactive": true,
-  "seeds": ["https://example.com"]
-}
-```
-
-**Pre-crawl login** — When `auth.login_url` is set alongside `interactive: true`, the browser navigates to the login page before the crawl begins. Log in manually (handles CAPTCHAs, 2FA, SSO), press Enter, and the crawl continues authenticated via the captured cookies. Automated auth (form fill, OAuth) is skipped in interactive mode — you handle it directly.
-
-```json
-{
-  "interactive": true,
-  "auth": {
-    "enabled": true,
-    "type": "form",
-    "login_url": "https://example.com/login"
-  },
-  "seeds": ["https://example.com/dashboard"]
-}
-```
-
-### CAPTCHA automation (headless)
-
+**CAPTCHA automation (headless):**
 ```json
 {
   "captcha": {
@@ -118,12 +192,39 @@ Or via config:
 }
 ```
 
-Supported providers: `2captcha`, `anticaptcha`, `capmonster`.
-
-### Authentication
-
+**Multi-browser pool with remote Chrome:**
 ```json
 {
+  "seeds": ["https://example.com"],
+  "browser_pool_size": 4,
+  "remote_chrome_url": "ws://chrome:9222/devtools/browser/0",
+  "max_concurrent_pages": 20
+}
+```
+
+**Scheduled crawl with notifications:**
+```json
+{
+  "seeds": ["https://example.com"],
+  "schedule_cron": "0 6 * * *",
+  "slack_url": "https://hooks.slack.com/services/...",
+  "webhook_url": "https://myapp.com/webhook",
+  "smtp": {
+    "host": "smtp.gmail.com",
+    "port": 587,
+    "user": "you@gmail.com",
+    "pass": "app-password",
+    "from": "crawler@example.com",
+    "to": ["admin@example.com"]
+  }
+}
+```
+
+**Network blocking + authentication:**
+```json
+{
+  "seeds": ["https://example.com/dashboard"],
+  "blocked_url_patterns": ["*doubleclick*", "*facebook*", "*analytics*"],
   "auth": {
     "enabled": true,
     "type": "form",
@@ -140,85 +241,77 @@ Supported providers: `2captcha`, `anticaptcha`, `capmonster`.
 }
 ```
 
-Types: `form`, `basic`, `header`, `oauth`.
-
----
-
-## Configuration
-
-| Field | Default | Description |
-|---|---|---|
-| `max_depth` | `2` | Maximum crawl depth |
-| `max_concurrent_pages` | `3` | Parallel page limit |
-| `page_timeout` | `30s` | Per-page timeout |
-| `crawl_delay` | `1s` | Delay between requests to same host |
-| `respect_robots` | `true` | Obey robots.txt directives |
-| `interactive` | `false` | Visible browser, manual CAPTCHA/form solving |
-| `stealth` | `false` | Hide Chrome automation indicators |
-| `screenshot` | `false` | Capture page screenshots |
-| `pdf` | `false` | Capture page PDFs |
-| `warc` | `false` | Write WARC archive |
-| `singlefile` | `false` | Save SingleFile snapshots |
-| `article_extract` | `false` | Extract article content (readability) |
-| `infinite_scroll` | `null` | Scroll-to-load configuration |
-| `wait_strategy` | `"domcontentloaded"` | Page readiness: `domcontentloaded`, `networkidle`, `selector` |
-| `max_urls_per_host` | `1000` | Cap URLs per host |
-| `max_total_urls` | `100000` | Global URL cap |
-| `intercept_apis` | `[]` | URL patterns to capture as API responses |
-| `click_selectors` | `[]` | CSS selectors to click on each page |
-| `enable_interaction_engine` | `false` | Automated link clicking and form filling |
-
-Full schema in `internal/config/config.go`.
-
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                      Crawler                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐ │
-│  │  Chrome   │  │  Queue   │  │  Rate    │  │Circuit │ │
-│  │  Pool     │  │  (Redis/ │  │  Limiter │  │Breaker │ │
-│  │(1 alloc + │  │  PG/Kfk) │  │ per-host │  │per-host│ │
-│  │ per-page  │  │          │  │          │  │        │ │
-│  │  tabs)    │  └──────────┘  └──────────┘  └────────┘ │
-│  └──────────┘                                          │
-│           │                                            │
-│           ▼                                            │
-│  ┌──────────────────┐  ┌────────────┐  ┌────────────┐ │
-│  │  Network Intercpt │  │   Rewrite  │  │  Storage   │ │
-│  │  (XHR/fetch/WS)   │  │  (HTML/CSS │  │  (FS/WARC) │ │
-│  │                   │  │   /JS/Img) │  │            │ │
-│  └──────────────────┘  └────────────┘  └────────────┘ │
-└─────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                          Crawler                                │
+│  ┌──────────────────┐  ┌──────────┐  ┌──────────┐  ┌────────┐ │
+│  │   Browser Pool   │  │  Queue   │  │   Rate   │  │Circuit │ │
+│  │  ┌─Chrome 1───┐  │  │  (Redis/ │  │  Limiter │  │Breaker │ │
+│  │  │ Tabs ...   │  │  │   PG/K)  │  │ per-host │  │per-host│ │
+│  │  ├─Chrome 2───┤  │  │          │  │          │  │        │ │
+│  │  │ Tabs ...   │  │  └──────────┘  └──────────┘  └────────┘ │
+│  │  ├─Chrome N───┤  │                                          │
+│  │  │ Tabs ...   │  │  ┌──────────────────────────────────┐    │
+│  │  └────────────┘  │  │      Stealth / Interaction       │    │
+│  └──────────────────┘  │  Canvas/WebRTC/font protection   │    │
+│           │            │  Form filling + link clicking    │    │
+│           ▼            └──────────────────────────────────┘    │
+│  ┌──────────────────┐  ┌────────────┐  ┌──────────────────┐  │
+│  │  Network Intercpt│  │   Rewrite  │  │    Storage       │  │
+│  │  (XHR/fetch/WS)  │  │  (HTML/CSS │  │  FS / WARC/WACZ  │  │
+│  │  Blocked URLs    │  │   /JS/Img) │  │  Screenshots/PDF │  │
+│  └──────────────────┘  └────────────┘  └──────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+         ▲                    ▲                    ▲
+         │                    │                    │
+  ┌──────────────┐  ┌──────────────┐  ┌─────────────────────┐
+  │  Web UI      │  │  REST API    │  │  Notifications      │
+  │  Dashboard   │  │  Start/Stop  │  │  Webhook/Slack/SMTP │
+  └──────────────┘  └──────────────┘  └─────────────────────┘
 ```
 
-### Key design decisions
+### Key Design Decisions
 
-- **Single browser, per-page tabs** — One Chrome process with `NewExecAllocator`; each page gets its own chromedp tab context for isolation without the overhead of multiple browser processes.
-- **Depth-first with priorities** — BFS-style URL queue (FIFO) ensures shallow pages are crawled before deep ones; configurable `max_depth`.
-- **Token-bucket rate limiting** — Per-host token bucket with dynamic capacity derived from robots.txt crawl delay; circuit breaker opens on error rate spikes.
-- **Externalized queue** — Plugable backends (`local`, `redis`, `postgres`, `kafka`) for distributed crawling with checkpoint/resume.
-- **Interactive mode** — When enabled, Chrome runs headless=false (visible window), concurrency locks to 1, and `promptUser()` blocks on stdin — letting you solve CAPTCHAs, fill forms, or handle 2FA in the live browser before content is captured.
+- **Multi-browser pool** — N Chrome processes with LRU assignment. A crashed browser only loses its active pages; the pool auto-restarts it. Configure via `browser_pool_size`.
+- **Per-page CDP tabs** — Each page gets its own chromedp tab context for isolation. The browser pool distributes page tabs across available Chrome processes.
+- **Depth-first with priorities** — BFS-style URL queue (FIFO) ensures shallow pages are crawled before deep ones.
+- **Token-bucket rate limiting** — Per-host with dynamic capacity from robots.txt crawl delay.
+- **Externalized queue** — Pluggable backends (`local`, `redis`, `postgres`, `kafka`) for distributed crawling with checkpoint/resume.
+- **Interactive mode** — Chrome runs with a visible window, concurrency locks to 1, and prompts block on stdin — letting you solve CAPTCHAs, fill forms, or handle 2FA in the live browser.
 
----
-
-## Output structure
+### Project Layout
 
 ```
-output/
-├── html/           # Stored per-path: example.com/path/to/page.html
-├── css/            # Stylesheets (inlined + external)
-├── js/             # JavaScript files
-├── images/         # Images, favicons
-├── fonts/          # Web fonts
-├── api/            # Captured API responses (XHR/fetch/WS)
-├── screenshots/    # Full-page screenshots (if enabled)
-├── pdf/            # PDF exports (if enabled)
-├── singlefile/     # SingleFile snapshots (if enabled)
-├── warc/           # WARC archive (if enabled)
-└── snapshots/      # Change detection snapshots (if enabled)
+cmd/clone/           CLI entrypoint, cobra commands
+internal/
+  api/               REST API server (start, stop, status, pause, resume)
+  auth/              Form login, HTTP Basic, custom headers, OAuth 2.0
+  browserpool/       Multi-browser process pool with health checks
+  captcha/           2Captcha, AntiCaptcha, CapMonster integration
+  changedetection/   Snapshot diffing across crawls
+  config/            Configuration schema, defaults, validation
+  crawler/           Core crawl loop, browser management, page pipeline (~3850 lines)
+  errors/            Error classification (14 retryable/non-retryable types)
+  httpclient/        Shared HTTP client pool
+  jsanalyzer/        JavaScript dependency URL analysis
+  jsengine/          Stealth, scroll, wait strategies, framework detection, WebSocket capture
+  network/           CDP network interception (XHR/fetch/WebSocket)
+  notify/            Notifications (webhook, Slack, SMTP email)
+  pool/              Buffer pool for panic recovery
+  queue/             URL queue backends (local, Redis, PostgreSQL, Kafka)
+  ratelimit/         Token-bucket per-host rate limiter
+  resilience/        Per-host circuit breaker (3-state)
+  rewrite/           HTML/CSS/JS asset URL rewriting for offline replay
+  robots/            robots.txt parser and sitemap crawler
+  scheduler/         Cron-based crawl scheduler
+  storage/           Filesystem, WARC, and WACZ output writers
+  sync/              Synchronization primitives
+  util/              Logging, metrics, LRU set, bounded queue, memory budget
+  webui/             Real-time crawl dashboard (HTML + JSON API)
 ```
 
 ---
@@ -237,31 +330,81 @@ go test ./...
 - Chrome or Chromium (for chromedp)
 - Optional: Redis, PostgreSQL, or Kafka for distributed queue backends
 
-### Project layout
+### Testing
+
+```bash
+# Unit tests
+go test ./...
+
+# Run specific tests
+go test ./internal/queue/... -v -run TestPriorityQueue
+
+# With race detection
+go test -race ./...
+```
+
+---
+
+## Docker
+
+```bash
+# Build
+docker build -t web-cloner .
+
+# Run (output in ./output)
+docker run --rm -v ./output:/data/output web-cloner -d 1 https://example.com
+
+# Full stack with docker-compose (Chrome container + cloner)
+docker compose up --build
+```
+
+The `docker-compose.yml` pre-configures:
+- A `chrome` service with remote debugging on port 9222
+- A `cloner` service connected via `--remote-chrome-url`
+- Volume-mapped output directory
+- Configurable via `SEEDS` environment variable
+
+---
+
+## Output Structure
 
 ```
-cmd/clone/           # CLI entrypoint
-internal/
-  auth/              # Authentication (form, basic, header, OAuth)
-  captcha/           # CAPTCHA solver (2Captcha, AntiCaptcha, CapMonster)
-  changedetection/   # Snapshot diffing across crawls
-  config/            # Configuration schema and validation
-  crawler/           # Core crawl loop, browser management, page pipeline
-  errors/            # Retryable error types
-  httpclient/        # Shared HTTP client pool
-  jsanalyzer/        # JavaScript analysis
-  jsengine/          # Page interaction engine, scroll, stealth, framework detection
-  network/           # CDP network interception (XHR/fetch/WebSocket)
-  pool/              # Buffer pool
-  queue/             # URL queue (local, Redis, PostgreSQL, Kafka)
-  ratelimit/         # Token-bucket rate limiter
-  resilience/        # Circuit breaker
-  rewrite/           # HTML/CSS/JS rewriting for offline use
-  robots/            # robots.txt parser and sitemap crawler
-  storage/           # Filesystem and WARC output
-  sync/              # Synchronization primitives
-  util/              # Logging, metrics, LRU set
+output/
+├── html/             # Stored per-path: example.com/path/to/page.html
+├── css/              # Stylesheets (inlined + external)
+├── js/               # JavaScript files
+├── images/           # Images, favicons
+├── fonts/            # Web fonts
+├── api/              # Captured API responses (XHR/fetch/WS)
+├── screenshots/      # Full-page screenshots (if enabled)
+├── pdf/              # PDF exports (if enabled)
+├── singlefile/       # SingleFile snapshots (if enabled)
+├── warc/             # WARC archives (if enabled)
+├── *.wacz            # Packaged WACZ archives (if enabled)
+└── snapshots/        # Change detection snapshots (if enabled)
 ```
+
+To replay locally:
+```bash
+./clone serve ./output
+# Then open http://localhost:8080
+```
+
+---
+
+## API
+
+When `--api-port` is set, a REST API is available:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/status` | GET | Current crawl status (pages, errors, queue, elapsed) |
+| `/api/start` | POST | Start a new crawl (body: `{"seeds": ["..."]}`) |
+| `/api/stop` | POST | Stop the current crawl |
+| `/api/pause` | POST | Pause crawl (no new pages, finish active) |
+| `/api/resume` | POST | Resume paused crawl |
+
+All endpoints return JSON. CORS headers are set for cross-origin access.
 
 ---
 

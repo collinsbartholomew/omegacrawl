@@ -30,7 +30,9 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/auth"
+	"github.com/user/clone/internal/api"
 	"github.com/user/clone/internal/browserpool"
+	"github.com/user/clone/internal/webui"
 	"github.com/user/clone/internal/captcha"
 	"github.com/user/clone/internal/changedetection"
 	"github.com/user/clone/internal/config"
@@ -355,6 +357,39 @@ func (c *Crawler) Stop() {
 	c.rateLimiter.Stop()
 	if c.browserPool != nil {
 		c.browserPool.Close()
+	}
+}
+
+func (c *Crawler) Pause() {
+	c.shutdown.Store(true)
+}
+
+func (c *Crawler) Resume() {
+	c.shutdown.Store(false)
+}
+
+func (c *Crawler) Status() api.CrawlStatus {
+	pages, assets, errors, bytes := c.metrics.Snapshot()
+	return api.CrawlStatus{
+		PagesFetched: pages,
+		AssetsSaved:  assets,
+		Errors:       errors,
+		BytesTotal:   bytes,
+		QueueSize:    c.urlQueue.Size(),
+		Running:      !c.shutdown.Load(),
+		SeedURLs:     c.urlQueue.Size(),
+	}
+}
+
+func (c *Crawler) Stats() webui.CrawlStats {
+	pages, assets, errors, bytes := c.metrics.Snapshot()
+	return webui.CrawlStats{
+		PagesFetched: pages,
+		AssetsSaved:  assets,
+		Errors:       errors,
+		BytesTotal:   bytes,
+		QueueSize:    c.urlQueue.Size(),
+		Running:      !c.shutdown.Load(),
 	}
 }
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -13,9 +14,13 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 
+	"github.com/user/clone/internal/api"
 	"github.com/user/clone/internal/config"
 	"github.com/user/clone/internal/crawler"
+	"github.com/user/clone/internal/notify"
+	"github.com/user/clone/internal/scheduler"
 	"github.com/user/clone/internal/util"
+	"github.com/user/clone/internal/webui"
 )
 
 var (
@@ -65,6 +70,11 @@ Examples:
 	rootCmd.Flags().String("user-data-dir", "", "Chrome user data directory for persistent profiles")
 	rootCmd.Flags().Bool("wacz", false, "enable WACZ output (packaged web archive)")
 	rootCmd.Flags().StringSlice("blocked-urls", nil, "URL patterns to block (e.g. *doubleclick*)")
+	rootCmd.Flags().Int("dashboard-port", 0, "port for web dashboard (0 = disabled)")
+	rootCmd.Flags().Int("api-port", 0, "port for REST API (0 = disabled)")
+	rootCmd.Flags().String("webhook-url", "", "notification webhook URL")
+	rootCmd.Flags().String("slack-url", "", "Slack webhook URL for notifications")
+	rootCmd.Flags().String("schedule", "", "cron expression for scheduled crawl (e.g. '0 6 * * *' or '@every 24h')")
 
 	serveCmd := &cobra.Command{
 		Use:   "serve [directory]",
@@ -193,6 +203,11 @@ func runClone(cmd *cobra.Command, args []string) error {
 	interact, _ := cmd.Flags().GetBool("interact")
 	interactive, _ := cmd.Flags().GetBool("interactive")
 	manualCapture, _ := cmd.Flags().GetBool("manual-capture")
+	dashboardPort, _ := cmd.Flags().GetInt("dashboard-port")
+	apiPort, _ := cmd.Flags().GetInt("api-port")
+	webhookURL, _ := cmd.Flags().GetString("webhook-url")
+	slackURL, _ := cmd.Flags().GetString("slack-url")
+	scheduleCron, _ := cmd.Flags().GetString("schedule")
 	chromeFlags, _ := cmd.Flags().GetStringSlice("chrome-flag")
 	remoteChromeURL, _ := cmd.Flags().GetString("remote-chrome-url")
 	browserPoolSize, _ := cmd.Flags().GetInt("browser-pool-size")
@@ -220,6 +235,10 @@ func runClone(cmd *cobra.Command, args []string) error {
 	cfg.UserDataDir = userDataDir
 	cfg.EnableWACZ = wacz
 	cfg.BlockedURLPatterns = blockedURLs
+	cfg.APIPort = apiPort
+	cfg.WebhookURL = webhookURL
+	cfg.SlackURL = slackURL
+	cfg.ScheduleCron = scheduleCron
 
 	if cfg.InfiniteScroll == nil {
 		cfg.InfiniteScroll = &config.InfiniteScrollConfig{}
@@ -244,9 +263,81 @@ func runClone(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to create crawler: %w", err)
 	}
 
+	var dash *webui.Server
+	if dashboardPort > 0 {
+		dash = webui.New()
+		dash.SetProvider(c)
+		go func() {
+			util.LogInfo("dashboard", zap.Int("port", dashboardPort))
+			if err := dash.Start(dashboardPort); err != nil && err != http.ErrServerClosed {
+				util.LogError("dashboard error", err)
+			}
+		}()
+	}
+
+	var apiSrv *api.Server
+	if apiPort > 0 {
+		apiSrv = api.New(c)
+		go func() {
+			util.LogInfo("api server", zap.Int("port", apiPort))
+			if err := apiSrv.Start(apiPort); err != nil && err != http.ErrServerClosed {
+				util.LogError("api server error", err)
+			}
+		}()
+	}
+
+	n := &notify.Notifier{}
+	if cfg.WebhookURL != "" || cfg.SlackURL != "" || cfg.SMTPConfig != nil {
+		n = notify.New(&notify.Config{
+			WebhookURL: cfg.WebhookURL,
+			SlackURL:   cfg.SlackURL,
+			SMTP:       (*notify.SMTPConfig)(cfg.SMTPConfig),
+		})
+		n.Send(notify.Notification{Title: "Crawl Started", Message: "Crawl has been initialized.", Level: "info"})
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var sched *scheduler.Scheduler
+	if cfg.ScheduleCron != "" {
+		sched = scheduler.New()
+		sched.Add(&scheduler.Job{
+			ID:       "crawl",
+			Name:     "Scheduled Crawl",
+			CronExpr: cfg.ScheduleCron,
+			RunFunc: func(ctx context.Context) error {
+				util.LogInfo("scheduled crawl starting")
+				n.Send(notify.Notification{Title: "Scheduled Crawl", Message: "Starting scheduled crawl", Level: "info"})
+				cr, _ := crawler.NewCrawler(cfg)
+				err := cr.Start(cfg.Seeds)
+				if err != nil {
+					n.Send(notify.Notification{Title: "Crawl Failed", Message: err.Error(), Level: "error"})
+				} else {
+					n.Send(notify.Notification{Title: "Crawl Complete", Message: "Scheduled crawl finished successfully", Level: "info"})
+				}
+				return err
+			},
+		})
+		sched.Start(ctx)
+		util.LogInfo("scheduler", zap.String("cron", cfg.ScheduleCron))
+		// Wait indefinitely for scheduled runs
+		<-ctx.Done()
+		return nil
+	}
+
 	go func() {
 		<-sigChan
 		util.LogInfo("stopping...")
+		if dash != nil {
+			dash.Stop()
+		}
+		if apiSrv != nil {
+			apiSrv.Stop()
+		}
+		if sched != nil {
+			sched.Stop()
+		}
 		c.Stop()
 	}()
 

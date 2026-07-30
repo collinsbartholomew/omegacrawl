@@ -1,2 +1,54 @@
-./output/*
-./test*
+# Binaries
+clone
+clone.exe
+*.test
+*.out
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+vendor/
+go.work
+go.work.sum
+*.o
+*.a
+*.prof
+*.cov
+*.test
+*.test.exe
+
+# Output
+/output/
+/testout/
+/testdata/output/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+*.sublime-*
+*.orig
+*.bak
+
+# Build
+dist/
+build/
+release/
+
+# Environment
+.env
+.env.local
+*.key
+*.pem
+*.cert
+
+# Cache
+__pycache__/
+*.pyc

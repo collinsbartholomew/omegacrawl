@@ -36,12 +36,13 @@
 
 ### Core Design
 
-The project uses a **single-process browser model** through `chromedp` (Go CDP client). One Chrome process runs for the entire crawl, and every page gets a new CDP tab context within that process.
+The project uses `chromedp` (Go CDP client) with a **configurable multi-browser process pool** (`internal/browserpool/`). By default 1 Chrome process runs for the entire crawl, but `browser_pool_size` can be increased to N concurrent Chrome instances, each handling separate pages via LRU distribution. Health checks and auto-restart ensure resilience against Chrome crashes.
 
 **Key files:**
 - `cmd/clone/main.go` — CLI entry point, cobra commands
-- `internal/crawler/crawler.go` — Core crawler logic (~3700 lines), all browser interactions
+- `internal/crawler/crawler.go` — Core crawler logic (~3840 lines), all browser interactions
 - `internal/config/config.go` — Configuration struct and validation
+- `internal/browserpool/pool.go` — Multi-browser process pool (N Chrome instances, health checks)
 - `internal/network/interceptor.go` — CDP network interception (~606 lines)
 - `internal/jsengine/scripts.go` — All JS scripts injected into pages (~1071 lines)
 - `internal/jsengine/scroll.go` — Infinite scroll logic
@@ -768,6 +769,13 @@ All in `cmd/clone/main.go` (242 lines) and `internal/config/config.go` (367 line
 | `--interact` | | `false` | `EnableInteractionEngine` |
 | `--interactive` | | `false` | `Interactive` |
 | `--manual-capture` | | `false` | `ManualCapture` |
+| `--chrome-flag` | | `[]` | `ChromeFlags` |
+| `--remote-chrome-url` | | `""` | `RemoteChromeURL` |
+| `--browser-pool-size` | | `1` | `BrowserPoolSize` |
+| `--user-data-dir` | | `""` | `UserDataDir` |
+| `--wacz` | | `false` | `EnableWACZ` |
+| `--blocked-urls` | | `[]` | `BlockedURLPatterns` |
+| `--dashboard-port` | | `0` | Dashboard HTTP port (0=disabled) |
 | `--help` | `-h` | | Help text |
 | `--version` | | `1.0.0` | Version string |
 
@@ -1051,28 +1059,28 @@ Small variations make maintenance error-prone. Adding a new URL source type requ
 
 ## 20. Missing Features
 
-### Critical Missing Features (Blocking Production Use)
+### Remaining Missing Features
 
-| # | Feature | Need | Approach | Status |
-|---|---|---|---|---|
-| 15 | **WACZ output** | WARC is buggy; WACZ is industry standard | Add WACZ writer: CDX index + compressed WARC records in ZIP | 🔴 Pending |
-| 16 | **Browser profiles** | Every restart = fresh profile; lost sessions | Add `--user-data-dir` config, pass as Chrome flag, support named profiles | 🔴 Pending |
-| 19 | **Docker support** | Essential for production deployment | Multi-stage Dockerfile + docker-compose + Helm chart | 🔴 Pending |
-| 21 | **Network request blocking** | Ads/waste bandwidth | `network.SetBlockedURLs` or `Fetch.enable` with abort | 🔴 Pending |
-
-### Medium Priority Missing Features
-
-| # | Feature | Why |
-|---|---|---|
-| 22 | Minimal Web UI dashboard | No crawl monitoring without CLI logs |
-| 23 | REST API | No programmatic control |
-| 24 | Crawl scheduling (cron) | No recurring crawl capability |
-| 25 | Notifications (webhook/email/slack) | No alerts on completion/errors/change detection |
-| 26 | Enhanced stealth (canvas/font/WebRTC) | Current stealth detectable by sophisticated bots |
-| 27 | Context-aware form filling (AI) | Static "test" values are insufficient |
-| 28 | SPA data store capture (Redux/Vuex) | Critical app state not in DOM |
-| 29 | OAuth token refresh | Token expires but refresh_token stored but unused |
-| 30 | Tab pool | New CDP context per page is wasteful |
+| # | Feature | Why | Priority |
+|---|---|---|---|
+| 28 | SPA data store capture (Redux/Vuex) | Critical app state not in DOM | Medium |
+| 29 | OAuth token refresh | Token expires but refresh_token stored but unused | Low |
+| 30 | Tab pool | Deferred - browser pool handles parallelism | Low |
+| 31 | Plugin/behavior system | Extensible JS behaviors | Niche |
+| 32 | Screencasting | Live browser view via WebSocket | Niche |
+| 33 | LLM-optimized (markdown) output | AI-ready content extraction | Niche |
+| 34 | Social media behaviors | Twitter/Instagram/TikTok specific patterns | Niche |
+| 35 | Performance budgets | Lighthouse integration | Niche |
+| 36 | Git-native storage | Version-controlled archiving | Niche |
+| 37 | WebRTC stream capture | Real-time communication archiving | Niche |
+| 38 | HTTP/3 + QUIC support | Non-browser downloads | Niche |
+| 39 | Mobile emulation | Device metrics, touch events | Niche |
+| 40 | CAPTCHA via ML | Bypass external API services | Niche |
+| 41 | Distributed coordination | Leader election, work stealing | Niche |
+| 42 | Prometheus metrics | OpenTelemetry integration | Niche |
+| 43 | Playwright backend | Alternative to chromedp | Niche |
+| 44 | Accessibility capture | ARIA tree, focus order | Niche |
+| 45 | Multi-language extraction | OCR, subtitle extraction | Niche |
 
 ### Niche / Future Missing Features
 
@@ -1121,16 +1129,42 @@ Small variations make maintenance error-prone. Adding a new URL source type requ
 | 10 | Error handling cleanup | ~1h | ✅ Done |
 | 11 | WS frame size limit | ~30m | ✅ Done |
 
-### Phase 2 — Feature Completeness (P2) — 🟡 PARTIALLY COMPLETED
+### Phase 2 — Feature Completeness (P2) — ✅ COMPLETED
 
 | # | Item | Effort | Status |
 |---|---|---|---|
-| 15 | WACZ output | ~5h | 🔴 Pending |
+| 15 | WACZ output | ~5h | ✅ Done |
 | 17 | Configurable Chrome flags | ~30m | ✅ Done |
 | 18 | Remote Chrome connection | ~1h | ✅ Done |
-| 21 | Network request blocking | ~2h | 🔴 Pending |
+| 21 | Network request blocking | ~2h | ✅ Done |
+| 4 | Queue pointer aliasing fix | ~1h | ✅ Done |
+| 16 | Browser profiles | ~2h | ✅ Done |
 
-**Remaining:** WACZ output, Network request blocking
+### Phase 3 — Operational Maturity (P3) — 🟡 PARTIALLY COMPLETED
+
+| # | Item | Effort | Status |
+|---|---|---|---|
+| 19 | Docker support | ~3h | ✅ Done |
+| 22 | Minimal Web UI | ~4h | ✅ Done |
+| 20 | Enhanced stealth | ~3h | 🔴 Pending |
+| 27 | Context-aware form filling | ~2h | 🔴 Pending |
+| 28 | Tab pool | ~2h | 🔴 Pending |
+
+| 20 | Enhanced stealth (canvas/WebRTC/font) | ~3h | ✅ Done |
+| 27 | Context-aware form filling | ~2h | ✅ Done (field type detection + realistic values) |
+
+### Phase 4 — Infrastructure (P4) — ✅ COMPLETED
+
+| # | Item | Effort | Status |
+|---|---|---|---|
+| 19 | Docker support | ~3h | ✅ Done |
+| 22 | Minimal Web UI | ~4h | ✅ Done |
+| 23 | REST API | ~4h | ✅ Done |
+| 24 | Crawl scheduling (cron) | ~3h | ✅ Done |
+| 25 | Notifications (webhook/Slack/email) | ~3h | ✅ Done |
+| 28 | Tab pool | ~2h | 🟡 Deferred (browser pool makes this lower priority) |
+
+**Remaining:** Tab pool (low priority)
 
 ### Phase 3 — Operational Maturity (P3)
 
@@ -1203,12 +1237,17 @@ internal/
   robots/
     robots.go             — robots.txt parser
     robots_test.go        — Robots tests
+  browserpool/
+    pool.go               — Multi-browser process pool (N Chrome instances, health checks, auto-restart)
   storage/
     filesystem.go         — Filesystem output writer
     warc.go               — WARC archive writer
+    wacz.go               — WACZ packaged archive writer
     resource_cache.go     — Incremental crawl cache
     filesystem_test.go    — Filesystem tests
     warc_test.go          — WARC tests
   util/
     util.go               — Logging, Metrics, BoundedQueue, LRUSet, MemoryBudget
+  webui/
+    webui.go              — Minimal crawl dashboard web server (HTML + JSON API)
 ```
