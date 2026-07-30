@@ -2,6 +2,7 @@ package browserpool
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -9,6 +10,12 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/util"
+)
+
+var (
+	ErrPoolClosed    = errors.New("browser pool: closed")
+	ErrNoInstance    = errors.New("browser pool: no healthy instance available")
+	ErrAcquireFailed = errors.New("browser pool: acquire failed")
 )
 
 type BrowserInstance struct {
@@ -74,8 +81,11 @@ func (p *Pool) launchInstance() (*BrowserInstance, error) {
 		allocCtx, allocCancel = chromedp.NewExecAllocator(p.ctx, p.opts...)
 	}
 
-	// Create a tab to verify the browser launched
+	// Create a tab to verify the browser launched (with timeout)
 	verifyCtx, verifyCancel := chromedp.NewContext(allocCtx)
+	verifyCtx, verifyTimeoutCancel := context.WithTimeout(verifyCtx, 30*time.Second)
+	defer verifyTimeoutCancel()
+
 	if err := chromedp.Run(verifyCtx, chromedp.Navigate("about:blank")); err != nil {
 		verifyCancel()
 		allocCancel()
@@ -97,7 +107,11 @@ func (p *Pool) Acquire() (context.Context, func(), error) {
 	defer p.mu.Unlock()
 
 	if p.closed {
-		return nil, nil, nil
+		return nil, nil, ErrPoolClosed
+	}
+
+	if len(p.instances) == 0 {
+		return nil, nil, ErrNoInstance
 	}
 
 	// Try to find a healthy instance, starting with least-recently-used
@@ -107,7 +121,7 @@ func (p *Pool) Acquire() (context.Context, func(), error) {
 		inst = p.tryRestartInstance()
 	}
 	if inst == nil {
-		return nil, nil, nil
+		return nil, nil, ErrNoInstance
 	}
 
 	// Check if browser is still alive
@@ -115,17 +129,13 @@ func (p *Pool) Acquire() (context.Context, func(), error) {
 		inst.healthy = false
 		inst = p.tryRestartInstance()
 		if inst == nil {
-			return nil, nil, nil
+			return nil, nil, ErrNoInstance
 		}
 	}
 
 	inst.lastUsed = time.Now()
 
-	// Return the allocator context so callers can create their own tabs
-	// No tab-level release needed since we're returning the allocator directly
-	release := func() {}
-
-	return inst.browserCtx, release, nil
+	return inst.browserCtx, func() {}, nil
 }
 
 func (p *Pool) selectInstance() *BrowserInstance {

@@ -2,7 +2,10 @@
 
 > **Project:** Go-based browser-driven web cloner (chromedp)
 > **Binary size:** ~37MB | **Language:** Go 1.25
-> **Last updated:** 2026-07-30 (all phases complete)
+> **Module path:** `github.com/user/clone`
+> **Total SLOC:** ~9,500 Go + ~1,200 embedded JS
+> **Internal packages:** 16
+> **Last updated:** 2026-07-30 (comprehensive audit)
 
 ---
 
@@ -24,11 +27,11 @@
 14. [Storage & Output](#14-storage--output)
 15. [Crawling Infrastructure](#15-crawling-infrastructure)
 16. [CLI & Configuration](#16-cli--configuration)
-17. [Backend Queue Integrations](#17-backend-queue-integrations)
+17. [Queue Backend Integrations](#17-queue-backend-integrations)
 18. [Third-Party Integrations](#18-third-party-integrations)
 19. [Bugs & Issues](#19-bugs--issues)
 20. [Missing Features](#20-missing-features)
-21. [Phase Plan](#21-phase-plan)
+21. [Transformation Roadmap](#21-transformation-roadmap)
 
 ---
 
@@ -36,62 +39,108 @@
 
 ### Core Design
 
-The project uses `chromedp` (Go CDP client) with a **configurable multi-browser process pool** (`internal/browserpool/`). By default 1 Chrome process runs for the entire crawl, but `browser_pool_size` can be increased to N concurrent Chrome instances, each handling separate pages via LRU distribution. Health checks and auto-restart ensure resilience against Chrome crashes.
+The project uses `chromedp` (Go CDP client) with a **configurable multi-browser process pool** (`internal/browserpool/`). By default 1 Chrome process runs for the entire crawl, but `browser_pool_size` can be increased to N concurrent Chrome instances, each handling separate pages via LRU distribution across the pool. Health checks and auto-restart ensure resilience against Chrome crashes.
+
+**Key architectural decisions:**
+
+| Decision | Rationale |
+|---|---|
+| Multi-browser pool | N Chrome processes with LRU assignment. A crashed browser only loses its active pages; the pool auto-restarts it |
+| Per-page CDP tabs | Each page gets its own chromedp tab context for isolation |
+| BFS queue (heap) | Depth-ordering ensures shallow pages crawled before deep ones |
+| Token-bucket rate limiting | Per-host with dynamic capacity from robots.txt crawl-delay |
+| Pluggable queue backends | In-memory, Redis, PostgreSQL, Kafka for distributed crawling |
+| Interactive mode | Visible Chrome window for manual CAPTCHA/2FA/form solving |
 
 **Key files:**
-- `cmd/clone/main.go` — CLI entry point, cobra commands
-- `internal/crawler/crawler.go` — Core crawler logic (~3870 lines), all browser interactions
-- `internal/config/config.go` — Configuration struct and validation
-- `internal/browserpool/pool.go` — Multi-browser process pool (N Chrome instances, health checks)
-- `internal/network/interceptor.go` — CDP network interception (~606 lines)
-- `internal/jsengine/scripts.go` — All JS scripts injected into pages (~1071 lines)
-- `internal/jsengine/scroll.go` — Infinite scroll logic
-- `internal/jsengine/wait.go` — Wait strategies
-- `internal/jsengine/serviceworker.go` — Service worker detection/unregistration
-- `internal/jsengine/websocket.go` — WebSocket capture helpers
-- `internal/jsengine/intercept.go` — JSON extraction from page
-- `internal/jsanalyzer/analyzer.go` — JS dependency URL extraction patterns
-- `internal/storage/filesystem.go` — Filesystem output writer
-- `internal/storage/warc.go` — WARC archive writer
-- `internal/auth/auth.go` — Authentication manager
-- `internal/captcha/solver.go` — CAPTCHA solving client
-- `internal/robots/robots.go` — robots.txt parser
-- `internal/rewrite/html.go` — HTML/CSS URL rewriter
-- `internal/queue/` — Queue backends (local, redis, postgres, kafka)
+
+| File | Purpose | Lines |
+|---|---|---|
+| `cmd/clone/main.go` | CLI entry point, cobra commands, serve subcommand | 353 |
+| `internal/config/config.go` | Configuration struct, validation, defaults | 384 |
+| `internal/config/constants.go` | Shared constants (max sizes, timeouts) | 21 |
+| `internal/crawler/crawler.go` | Core crawler — all browser interactions, orchestration | 3843 |
+| `internal/crawler/retry.go` | Retry configuration with exponential backoff | — |
+| `internal/crawler/checkpoint.go` | Checkpoint save/load with gob encoding | — |
+| `internal/browserpool/pool.go` | Multi-browser process pool (N Chrome, health checks) | 230 |
+| `internal/network/interceptor.go` | CDP network interception (XHR/fetch/WS capture) | 606 |
+| `internal/jsengine/scripts.go` | All JS scripts injected into pages | 1152 |
+| `internal/jsengine/scroll.go` | Infinite scroll logic | — |
+| `internal/jsengine/wait.go` | Wait strategies (selector, networkidle, response, adaptive) | — |
+| `internal/jsengine/websocket.go` | WebSocket capture helpers | — |
+| `internal/jsengine/serviceworker.go` | Service worker detection/unregistration | — |
+| `internal/jsengine/intercept.go` | JSON extraction from page | — |
+| `internal/jsanalyzer/analyzer.go` | JS dependency URL extraction (import, require, webpack) | 229 |
+| `internal/storage/filesystem.go` | Filesystem output writer | 253 |
+| `internal/storage/warc.go` | WARC archive writer | 231 |
+| `internal/storage/wacz.go` | WACZ packaged archive writer | 250 |
+| `internal/storage/incremental.go` | Incremental crawl ETag/Last-Modified cache | — |
+| `internal/auth/auth.go` | Authentication manager | 313 |
+| `internal/captcha/solver.go` | CAPTCHA solving client | 347 |
+| `internal/robots/robots.go` | robots.txt parser | 376 |
+| `internal/rewrite/html.go` | HTML/CSS/JS URL rewriter for offline replay | 1151 |
+| `internal/queue/queue.go` | Priority queue + Queue interface | 189 |
+| `internal/queue/redis.go` | Redis queue backend | 192 |
+| `internal/queue/postgres.go` | PostgreSQL queue backend | 200 |
+| `internal/queue/kafka.go` | Kafka queue backend | 242 |
+| `internal/queue/bloom.go` | Bloom filter dedup | — |
+| `internal/queue/persistent.go` | File-backed persistent queue | 82 |
+| `internal/queue/factory.go` | Queue factory from config | 37 |
+| `internal/api/api.go` | REST API server | 144 |
+| `internal/webui/webui.go` | Real-time web dashboard | 123 |
+| `internal/scheduler/scheduler.go` | Cron-based crawl scheduler | 189 |
+| `internal/notify/notify.go` | Notifications (webhook, Slack, SMTP) | 158 |
+| `internal/ratelimit/limiter.go` | Per-host token-bucket rate limiter | — |
+| `internal/resilience/circuitbreaker.go` | 3-state per-host circuit breaker | — |
+| `internal/errors/crawl.go` | Error classification (14 kinds, retryability) | 186 |
+| `internal/httpclient/clientpool.go` | Shared HTTP client pool | 124 |
+| `internal/pool/objectpool.go` | Buffer pools (bytes, strings, maps) | 153 |
+| `internal/sync/sharded.go` | Sharded concurrent map (generics) | 143 |
+| `internal/util/lru.go` | LRU set + bounded queue | 179 |
+| `internal/util/metrics.go` | Atomic metrics counters | 32 |
+| `internal/util/memory.go` | Memory budget tracker | 61 |
+| `internal/util/cdp.go` | CDP cookie conversion helper | 24 |
+| `internal/util/logger.go` | Structured logging (zap) | 67 |
+| `internal/changedetection/detector.go` | Snapshot diff across crawls (HTML + line) | 291 |
 
 ### Dependencies
 
-| Dependency | Purpose |
-|---|---|
-| `github.com/chromedp/chromedp` | Chrome DevTools Protocol client |
-| `github.com/chromedp/cdproto` | CDP domain types |
-| `github.com/spf13/cobra` | CLI framework |
-| `go.uber.org/zap` | Structured logging |
-| `golang.org/x/net/html` | HTML tokenizer for link extraction |
-| `golang.org/x/sync/errgroup` | Goroutine error propagation |
-| `golang.org/x/sync/singleflight` | Duplicate request suppression |
-| `github.com/cespare/xxhash/v2` | Content fingerprint hashing |
+| Dependency | Purpose | Version |
+|---|---|---|
+| `github.com/chromedp/chromedp` | Chrome DevTools Protocol client | v0.9.0 |
+| `github.com/chromedp/cdproto` | CDP domain types | v0.0.0-20230220211738 |
+| `github.com/spf13/cobra` | CLI framework | v1.7.0 |
+| `go.uber.org/zap` | Structured logging | v1.25.0 |
+| `github.com/redis/go-redis/v9` | Redis queue backend | v9.7.0 |
+| `github.com/jackc/pgx/v5` | PostgreSQL queue backend | v5.7.1 |
+| `github.com/segmentio/kafka-go` | Kafka queue backend | v0.4.51 |
+| `github.com/bits-and-blooms/bloom/v3` | Bloom filter dedup | v3.7.1 |
+| `github.com/cespare/xxhash/v2` | Content fingerprint hashing | v2.2.0 |
+| `golang.org/x/net` | HTML tokenizer, publicsuffix | v0.57.0 |
+| `golang.org/x/sync` | errgroup, singleflight, semaphore | v0.22.0 |
+| `golang.org/x/time` | Rate limiter | v0.15.0 |
 
 ---
 
 ## 2. Browser / Chromium Features
 
-All browser-related features in `internal/crawler/crawler.go` and supporting files.
+All in `internal/crawler/crawler.go` and `internal/browserpool/pool.go`.
 
 ### Chrome Process Management
 
 | Feature | Status | File:Line | Implementation |
-|---|---|---|---|---|
-| Chrome process spawn | ✅ | `crawler.go:1392-1414` | `chromedp.NewExecAllocator` with Chrome flags |
-| Headless toggle | ✅ | `crawler.go:374` | `chromedp.Flag("headless", !cfg.Interactive)` |
-| Proxy via Chrome | ✅ | `crawler.go:395-397` | `chromedp.ProxyServer(proxy)` from config |
-| Browser restart (legacy) | ✅ | `crawler.go:1476-1498` | Cancel old allocator, create new Chrome (replaced by pool) |
-| Health check / restart | ✅ | `browserpool/pool.go:167-192` | Pool's `HealthCheck()` replaces per-page `browserCtx.Err()` |
-| Multi-browser process pool | ✅ | `browserpool/pool.go:1-193` | N Chrome processes, LRU selection, auto-restart on failure |
-| Configurable Chrome flags | ✅ | `config.go:84`, `crawler.go:402-417` | `ChromeFlags []string` + `--chrome-flag` CLI, appended to hardcoded set |
-| Remote Chrome connection | ✅ | `config.go:86`, `browserpool/pool.go:68-73` | `RemoteChromeURL` → `chromedp.NewRemoteAllocator`, pool-integrated |
+|---|---|---|---|
+| Chrome process spawn | ✅ | `crawler.go:449-495` | `chromedp.NewExecAllocator` with Chrome flags |
+| Headless toggle | ✅ | `crawler.go:450` | `chromedp.Flag("headless", !cfg.Interactive)` |
+| Proxy via Chrome | ✅ | `crawler.go:470-473` | `chromedp.ProxyServer(proxy)` from config |
+| Browser restart (legacy) | ✅ | `crawler.go:1475-1528` | Cancel old allocator, create new Chrome (replaced by pool) |
+| Health check / restart | ✅ | `browserpool/pool.go:187-206` | Pool's `HealthCheck()` replaces dead instances |
+| Multi-browser process pool | ✅ | `browserpool/pool.go:1-230` | N Chrome, LRU selection, auto-restart on failure |
+| Configurable Chrome flags | ✅ | `config.go:96`, `crawler.go:480-495` | `ChromeFlags []string` + `--chrome-flag` CLI |
+| Remote Chrome connection | ✅ | `config.go:97`, `browserpool/pool.go:78-79` | `RemoteChromeURL` → `chromedp.NewRemoteAllocator` |
+| User data directory | ✅ | `crawler.go:477-479` | `chromedp.Flag("user-data-dir", ...)` for persistent profiles |
 
-**Chrome flags set (hardcoded, `crawler.go:371-398`):**
+**Chrome flags set (hardcoded, `crawler.go:449-495`):**
 
 | Flag | Value | Purpose |
 |---|---|---|
@@ -104,25 +153,22 @@ All browser-related features in `internal/crawler/crawler.go` and supporting fil
 | `disable-extensions` | `true` | No extensions |
 | `disable-sync` | `true` | No sync |
 | `no-first-run` | `true` | Skip first-run dialog |
-| `window-size` | configurable (1920x1080) | Viewport dimensions |
+| `window-size` | ViewportWidth×ViewportHeight | Viewport dimensions |
 | `disable-features` | `TranslateUI,ChromeWhatsNewUI` | Disable translate/WhatsNew |
 | `disable-component-update` | `true` | No component updates |
-| `disable-blink-features` | `AutomationControlled` (stealth only) | Hide automation |
-| `excludeSwitches` | `enable-automation` (stealth only) | No automation banner |
-| `disable-renderer-backgrounding` | `true` (stealth only) | Keep rendering active |
-| `start-maximized` | `true` (interactive only) | Maximize visible window |
+| `disable-blink-features` | `AutomationControlled` (stealth) | Hide automation |
+| `excludeSwitches` | `enable-automation` (stealth) | No automation banner |
+| `disable-renderer-backgrounding` | `true` (stealth) | Keep rendering active |
+| `start-maximized` | `true` (interactive) | Maximize visible window |
+| `user-data-dir` | `UserDataDir` (if set) | Persistent Chrome profile |
 
-### Issues
+### Known Issues
 
 | Issue | Severity | Status | Details |
 |---|---|---|---|
-| **No multi-browser pool** | 🔴 Critical | ✅ **FIXED** | `internal/browserpool/` — N Chrome processes with health checks & auto-restart |
-| **Browser restart deadlock** | 🔴 Critical | ✅ **FIXED** | Pool uses separate goroutine for restarts; old restart code uses 30s timeout context |
-| **No graceful Chrome shutdown** | 🟡 Medium | ✅ **FIXED** | `browserCancel` now waits up to 5s for `allocCtx.Done()`; pool also waits on close |
-| **No user data directory** | 🟡 Medium | 🔴 Open | Every restart = fresh Chrome profile. Lost sessions, localStorage, IndexedDB. See [#16] |
-| **No configurable Chrome flags** | 🟡 Medium | ✅ **FIXED** | `ChromeFlags []string` + `--chrome-flag` CLI flag; appended to hardcoded flag set |
-| **No remote Chrome support** | 🟡 Medium | ✅ **FIXED** | `RemoteChromeURL` → `chromedp.NewRemoteAllocator` via pool |
-| **Chrome process leak** | 🟢 Low | 🟡 Open | No explicit kill on context cancel — `allocCancel()` only cancels context, doesn't SIGKILL |
+| **Chrome zombie processes** | 🟡 Medium | 🔴 **Open** | `process.Wait()` never called — PIDs accumulate on long crawls (`browserpool/pool.go:219-227`) |
+| **Browser restart deadlock (legacy)** | 🔴 Critical | ✅ **Fixed** | Pool uses separate goroutine; old `launchBrowser()` uses timeout context |
+| **No graceful Chrome shutdown** | 🟡 Medium | ✅ **Fixed** | `Close()` waits 5s for `allocCtx.Done()` |
 
 ---
 
@@ -130,28 +176,28 @@ All browser-related features in `internal/crawler/crawler.go` and supporting fil
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
-| Per-page CDP tab context | ✅ | `crawler.go:1507` | `chromedp.NewContext(browserCtx)` per page |
-| Page timeout | ✅ | `crawler.go:1510` | `context.WithTimeout(rawTabCtx, PageTimeout)` (default 120s) |
-| Max concurrent pages | ✅ | `crawler.go:209-213` | Semaphore-based goroutine limiter (default: 5) |
-| Tab cleanup on return | ✅ | `crawler.go:1508` | `defer tabCancel()` |
-| Console error capture | ✅ | `crawler.go:3190-3215` | `ListenTarget` for `EventConsoleAPICalled`, `EventExceptionThrown` |
-| WebSocket capture | ✅ | `crawler.go:3217-3240+` | `ListenTarget` for 4 WS events |
+| Per-page CDP tab context | ✅ | `crawler.go:1594` | `chromedp.NewContext(browserCtx)` per page |
+| Page timeout | ✅ | `crawler.go:1597-1598` | `context.WithTimeout(rawTabCtx, PageTimeout)` (default 120s) |
+| Max concurrent pages | ✅ | `crawler.go:241-245` | Semaphore-based goroutine limiter (default: 5) |
+| Tab cleanup on return | ✅ | `crawler.go:1595` | `defer tabCancel()` |
+| Console error capture | ✅ | `crawler.go:3300-3325` | `ListenTarget` for `EventConsoleAPICalled`, `EventExceptionThrown` |
+| WebSocket capture | ✅ | `crawler.go:3327-3392` | `ListenTarget` for 4 WS events (created, sent, received, error) |
 | Auth persistent tab | ✅ | `auth.go:74-76` | `sync.Once` tab for form login |
-| Memory budget | ✅ | `crawler.go:315` | `MemoryBudget` with cond-based blocking allocation |
+| Memory budget | ✅ | `crawler.go:2065-2066` | `MemoryBudget` with cond-based blocking allocation |
 
-### Issues
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **No tab pool** | 🟡 Medium | New CDP context per page. Context creation has overhead. Could reuse. |
-| **No context deadlines on all CDP calls** | 🟡 Medium | Multiple `chromedp.Run(tabCtx, ...)` calls don't have explicit timeouts. See [Issue #9] |
-| **Empty error handling on os.WriteFile** | 🟢 Low | Lines 1589-1591, 1808-1809, 1827-1828, 1836-1837 silently swallow errors. See [Issue #10] |
+| **Tab context timeout mid-capture** | 🔴 Critical | `captureCurrentPage()` uses same `tabCtx` that may timeout during capture → partial file writes (`crawler.go:1597-1598,2019`) |
+| **No tab pool** | 🟡 Medium | New CDP context per page. Context creation has overhead but acceptable |
+| **No context deadlines on all CDP calls** | 🟡 Medium | Some `chromedp.Run()` calls lack explicit timeout sub-contexts |
 
 ---
 
 ## 4. Stealth & Anti-Detection
 
-All in `internal/jsengine/scripts.go:14-172` and `crawler.go:385-391`.
+All in `internal/jsengine/scripts.go:14-172` and `crawler.go:463-469`.
 
 ### JavaScript Overrides (StealthScript)
 
@@ -172,11 +218,11 @@ All in `internal/jsengine/scripts.go:14-172` and `crawler.go:385-391`.
 | deviceMemory | ✅ | `navigator.deviceMemory` | 8 |
 | maxTouchPoints | ✅ | `navigator.maxTouchPoints` | 0 (desktop) |
 | connection.effectiveType | ✅ | `navigator.connection.effectiveType` | '4g' |
-| Screen dimensions | ✅ | `screen.width/height/avail*` | 1920x1080, 24-bit color |
+| Screen dimensions | ✅ | `screen.width/height/avail*` | 1920×1080, 24-bit color |
 | speechSynthesis | ✅ | `window.speechSynthesis.speaking` | `false` |
 | AudioContext | ✅ | `AudioContext.prototype.createOscillator` | Normalized sine wave |
 
-### Chrome Flag Overrides (Stealth Mode Only)
+### Chrome Flag Overrides (Stealth Mode Only, `crawler.go:463-469`)
 
 | Flag | Value |
 |---|---|
@@ -190,18 +236,18 @@ All in `internal/jsengine/scripts.go:14-172` and `crawler.go:385-391`.
 |---|---|---|---|
 | SW detection | ✅ | `jsengine/websocket.go:19-39` | `navigator.serviceWorker.getRegistrations()` |
 | SW unregistration | ✅ | `jsengine/websocket.go:41-57` | `reg.unregister()` for each found SW |
-| SW register override | ✅ | `crawler.go:1814-1818` | Stealth mode only — injects override before navigation |
+| SW register override | ✅ | `crawler.go:1609-1616` | Stealth mode — `page.AddScriptToEvaluateOnNewDocument` |
 
-### Issues
+### Missing Anti-Detection
 
-| Issue | Severity | Details |
+| Feature | Severity | Details |
 |---|---|---|
-| **No canvas fingerprint noise** | 🟡 Medium | Canvas rendering can detect headless by comparing image data |
-| **No font fingerprint mitigation** | 🟡 Medium | Font availability list is fingerprintable |
-| **No WebRTC IP leak prevention** | 🟡 Medium | `webRTC IP handling policy` not set to `disable_non_proxied_udp` |
-| **No navigator.platform override** | 🟢 Low | Stays as reported by OS |
-| **No navigator.vendor override** | 🟢 Low | Stays "Google Inc." |
-| **No UA via CDP Emulation** | 🟢 Low | UA is set at config level, not via `Emulation.setUserAgentOverride` |
+| **Canvas fingerprint noise** | 🟡 Medium | Canvas rendering can detect headless by comparing pixel data |
+| **Font fingerprint mitigation** | 🟡 Medium | Font availability list is fingerprintable |
+| **WebRTC IP leak prevention** | 🟡 Medium | `webRTC IP handling policy` not set to `disable_non_proxied_udp` |
+| **navigator.platform override** | 🟢 Low | Stays as reported by OS |
+| **navigator.vendor override** | 🟢 Low | Stays "Google Inc." |
+| **UA via CDP Emulation** | 🟢 Low | UA set at config level, not via `Emulation.setUserAgentOverride` |
 
 ---
 
@@ -217,7 +263,7 @@ All in `internal/network/interceptor.go` (606 lines).
 | Response capture | ✅ | `interceptor.go:170-203` | `EventResponseReceived` — status code, MIME type, headers |
 | Body fetch | ✅ | `interceptor.go:206-226` | `EventLoadingFinished` triggers `network.GetResponseBody()` |
 | Retry on body fetch | ✅ | `interceptor.go:278-305` | Up to 3 retries with jitter |
-| Worker pool | ✅ | `interceptor.go:90-103` | Configurable worker count (default: 10 or maxConcurrentPages*2) |
+| Worker pool | ✅ | `interceptor.go:90-103` | Configurable worker count (default: 10 or maxConcurrentPages×2) |
 | Body size limit | ✅ | `interceptor.go:235-237` | `MaxResponseBodySize = 50MB` |
 | URL dedup | ✅ | `interceptor.go:28` | `maxSeenURLs = 200,000` LRU |
 | Resource limit | ✅ | `interceptor.go:27` | `maxResources = 50,000` |
@@ -229,8 +275,8 @@ All in `internal/network/interceptor.go` (606 lines).
 |---|---|---|---|
 | JSON content type detection | ✅ | `interceptor.go:543-552` | `isJSONContentType()` — match against known JSON MIME types |
 | URL-based API detection | ✅ | `interceptor.go:554-577` | `isAPIContentType()` — match URL for api/graphql patterns |
-| GraphQL op extraction | ✅ | `crawler.go:1561` | `extractGraphQLOp()` from request body |
-| API response callback | ✅ | `crawler.go:1548-1592` | Real-time callback saves to filesystem and WARC |
+| GraphQL op extraction | ✅ | `crawler.go:1426-1437` | `extractGraphQLOp()` from request body |
+| API response callback | ✅ | `crawler.go:1641-1683` | Real-time callback saves to filesystem and WARC |
 
 ### Resource Fallback
 
@@ -240,12 +286,11 @@ All in `internal/network/interceptor.go` (606 lines).
 | HTTP fallback download | ✅ | `interceptor.go:422-470` | `DownloadResourceViaHTTP()` — Go HTTP client fallback |
 | Batch body fetch | ✅ | `interceptor.go:307-389` | `FetchBodies()` — process remaining pending resources |
 
-### Issues
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **No network request blocking** | 🟡 Medium | Can intercept but not block/abort requests. Ads/trackers waste bandwidth. See [#21] |
-| **No POST body for all methods** | 🟢 Low | Only non-GET POST body captured. GraphQL GET queries missed. |
+| **No request body for all methods** | 🟢 Low | Only non-GET POST body captured. GraphQL GET queries missed |
 | **No redirect chain handling** | 🟢 Low | `EventResponseReceived` fires before redirect response bodies available |
 | **No loading failed handler** | 🟢 Low | `EventLoadingFailed` not handled — silent failures |
 | **No request body for multipart** | 🟢 Low | `request.PostData` may miss `multipart/form-data` |
@@ -254,72 +299,74 @@ All in `internal/network/interceptor.go` (606 lines).
 
 ## 6. Page Capture Pipeline
 
-Core pipeline in `crawler.go:1506-2289` (`doCrawl`) and `crawler.go:1989-2289` (`captureCurrentPage`).
+Core pipeline in `crawler.go:1593-2017` (`doCrawl`) and `crawler.go:2019-2311` (`captureCurrentPage`).
 
 ### Full Pipeline (Order of Operations)
 
 ```
-1. Create tab context (chromedp.NewContext)                          :1507
-2. Inject stealth script (page.AddScriptToEvaluateOnNewDocument)     :1513-1519
-3. Inject pushState capture script                                   :1522-1529
-4. Setup console error listener                                      :1531
-5. Setup WebSocket listener                                          :1532
-6. Set config cookies                                                :1533
-7. Inject persisted cookies from jar                                 :1534
-8. Run form authentication (if enabled)                              :1536-1540
-9. Start network interceptor                                         :1546-1593
-10. Run JS-before-load scripts                                       :1595-1599
-11. Navigate to URL via page.Navigate()                              :1601-1610
-12. Wait for page ready (body + network idle)                        :1623
-13. Get final URL after redirects                                    :1625-1634
-14. Persist cookies from browser                                     :1635
-15. Apply wait strategy (selector/networkidle/response/adaptive)     :1637
-16. Dismiss overlays (cookie consents, modals)                       :1639-1641
-17. Expand collapsible sections                                      :1642-1644
-18. Click configured selectors                                       :1645-1656
-19. Trigger lazy loading                                             :1657-1659
-20. Run infinite scroll (if enabled)                                 :1661-1674
-21. Run JS-after-load scripts                                        :1676-1680
-22. Interactive prompt (if interactive mode)                          :1682-1684
-23. Run interaction engine (if enabled)                              :1687-1689
-24. Discover SPA routes + navigate to each                           :1691-1786
-25. Extract shadow DOM                                               :1789-1799
-26. Extract structured data (JSON-LD, OG, Twitter, meta)             :1801-1812
-27. Detect and unregister service workers                            :1814-1818
-28. Extract article content                                          :1820-1830
-29. Generate SingleFile snapshot                                     :1832-1839
-30. → captureCurrentPage()                                           :1841
-31. Extract links from rewritten HTML → queue                        :1846-1882
-32. Extract iframe sources → queue                                   :1885-1924
-33. Extract media sources (video/audio/poster) → queue               :1927-1978
-34. Fetch page metadata                                              :1980-1982
-35. Close network interceptor                                        :1984
+1.  Create tab context (chromedp.NewContext)                           :1594
+2.  Inject stealth script (page.AddScriptToEvaluateOnNewDocument)      :1600-1607
+3.  Inject pushState capture script                                    :1609-1616
+4.  Setup console error listener (ListenTarget)                        :1618
+5.  Setup WebSocket listener (ListenTarget)                            :1619
+6.  Set config cookies (network.SetCookie)                             :1620
+7.  Inject persisted cookies from cookie jar                           :1621
+8.  Set blocked URL patterns (network.SetBlockedURLS)                  :1623-1627
+9.  Run form authentication (if enabled)                               :1629-1633
+10. Start network interceptor                                          :1639-1684
+11. Run JS-before-load scripts                                         :1686-1690
+12. Navigate to URL via page.Navigate()                                :1692-1699
+13. Wait for page ready (body + network idle)                          :1701-1706
+14. Get final URL after redirects                                      :1708-1714
+15. Persist cookies from browser                                       :1716
+16. Apply wait strategy (selector/networkidle/response/adaptive)       :1718
+17. Dismiss overlays (cookie consents, modals)                         :1720-1722
+18. Expand collapsible sections                                        :1723-1725
+19. Click configured selectors                                         :1726-1737
+20. Trigger lazy loading                                               :1738-1740
+21. Run infinite scroll (if enabled)                                   :1742-1754
+22. Run JS-after-load scripts                                          :1756-1760
+23. Interactive prompt (if interactive mode)                            :1762-1764
+24. Run interaction engine (if enabled)                                :1766-1768
+25. Discover SPA routes → navigate to each                             :1770-1853
+26. Extract shadow DOM                                                 :1856-1870
+27. Extract structured data (JSON-LD, OG, Twitter, meta)               :1872-1882
+28. Detect and unregister service workers                              :1884-1888
+29. Extract article content                                            :1890-1900
+30. Generate SingleFile snapshot                                       :1902-1917
+31. → captureCurrentPage()                                             :1919
+32. Extract links from rewritten HTML → queue                          :1922-1962
+33. Extract iframe sources → queue                                     :1965-2004
+34. Extract media sources (video/audio/poster) → queue                 :2007-2008
+35. Fetch page metadata (favicon, manifest, robots.txt)                :2010-2012
+36. Close network interceptor                                          :2014
 ```
 
-### captureCurrentPage Sub-Pipeline:1989-2289
+### captureCurrentPage Sub-Pipeline (`crawler.go:2019-2311`)
 
 ```
-1. Serialize shadow DOM into page HTML (JS evaluation)              :1991-2033
-2. Memory budget reservation                                         :2035-2036
-3. Change detection snapshot comparison                              :2038-2055
-4. Solve CAPTCHAs                                                    :2058-2060
-5. Detect JS framework                                               :2064-2070
-6. Full-page screenshot (JPEG 80)                                    :2072-2077
-7. PDF capture (printBackground=true)                                :2079-2092
-8. Save HTML to filesystem                                           :2094-2097
-9. Rewrite URL base                                                  :2099
-10. Write HTML to WARC (if enabled)                                  :2101-2113
-11. Save screenshot file                                             :2115-2116
-12. Save PDF file                                                    :2118-2119
-13. Fetch remaining response bodies                                  :2122
-14. Process intercepted resources (dedup, save, map)                 :2124-2175
-15. HTTP-fallback for missing resources                              :2177-2201
-16. Download HTML-discovered assets (HTML tokenizer)                  :2203-2205
-17. Extract font @font-face from CSS, download                       :2210-2244
-18. Extract CSS @import URLs, download (recursive)                   :2246-2278
-19. Process CSS files (rewrite URLs)                                 :2281-2283
-20. Resolve JS dependencies (import(), require, webpack, etc.)       :2285
-21. Final HTML rewrite with relative paths                           :2286
+1.  Serialize shadow DOM into page HTML (JS evaluation)                :2019-2063
+2.  Memory budget reservation                                          :2065-2066
+3.  Change detection snapshot comparison                               :2068-2086
+4.  Solve CAPTCHAs                                                     :2088-2090
+5.  Increment pages-fetched counter                                    :2092
+6.  Detect JS framework                                                :2094-2100
+7.  Full-page screenshot (JPEG quality 80)                             :2102-2107
+8.  PDF capture (printBackground=true)                                 :2109-2122
+9.  Save HTML to filesystem                                            :2124-2127
+10. Rewrite URL base                                                   :2129
+11. Write HTML to WARC/WACZ (if enabled)                               :2131-2139
+12. Save screenshot file                                               :2141-2143
+13. Save PDF file                                                      :2144-2146
+14. Fetch remaining response bodies (batch)                            :2148
+15. Process intercepted resources (dedup via XXHash, save, map)        :2150-2197
+16. HTTP-fallback for missing CDP resources                            :2199-2223
+17. Download HTML-discovered assets (HTML tokenizer)                   :2225-2227
+18. Extract font @font-face from CSS → download                        :2232-2266
+19. Extract CSS @import URLs → download (recursive)                    :2268-2299
+20. Process CSS files (rewrite URLs)                                   :2303-2305
+21. Resolve JS dependencies (import(), require, webpack, etc.)         :2307
+22. Final HTML rewrite with relative paths                             :2308
 ```
 
 ### Output Formats Captured
@@ -327,26 +374,32 @@ Core pipeline in `crawler.go:1506-2289` (`doCrawl`) and `crawler.go:1989-2289` (
 | Format | Status | File:Line | Implementation |
 |---|---|---|---|
 | Static HTML | ✅ | `filesystem.go:166-193` | `.html` with relative paths |
-| Full-page screenshot (PNG) | ✅ | `crawler.go:2074-2077` | `chromedp.FullScreenshot` JPEG quality 80 |
-| PDF | ✅ | `crawler.go:2080-2092` | `page.PrintToPDF` with printBackground |
-| SingleFile HTML | ✅ | `jsengine/scripts.go:966-970` | Inline all CSS/images/scripts as data URLs |
-| WARC | 🟡 | `storage/warc.go:45-71` | WARC 1.0, gzip, **buggy** curSize tracking |
-| Shadow DOM JSON | ✅ | `filesystem.go:217-226` | tag + innerHTML per shadow root |
-| API response JSON | ✅ | `crawler.go:1587-1591` | Path-based JSON files |
-| Article JSON | ✅ | `crawler.go:1820-1830` | Readability extraction |
-| Structured data JSON | ✅ | `crawler.go:1801-1812` | JSON-LD + OG + Twitter + meta |
-| JS errors JSON | ✅ | `crawler.go:595` | `js-errors.json` |
-| WebSocket messages JSON | ✅ | `crawler.go:596` | `websocket.json` |
-| File index JSON | ✅ | `filesystem.go:238-253` | `index.json` URL→path mapping |
+| Full-page screenshot (JPEG 80) | ✅ | `crawler.go:2102-2107` | `chromedp.FullScreenshot` JPEG quality 80 |
+| PDF | ✅ | `crawler.go:2109-2122` | `page.PrintToPDF` with printBackground |
+| SingleFile HTML | ✅ | `jsengine/scripts.go:966-970` | Inline all CSS/images/scripts as data URIs |
+| WARC 1.0 | ✅ | `storage/warc.go:45-70` | WARC 1.0, gzip, proper payloadLen tracking |
+| WACZ | ✅ | `storage/wacz.go:55-205` | ZIP with WARC + CDX index + metadata |
+| Shadow DOM JSON | ✅ | `crawler.go:1856-1870` | tag + innerHTML per shadow root |
+| API response JSON | ✅ | `crawler.go:1676-1682` | Path-based JSON files |
+| Article JSON | ✅ | `crawler.go:1890-1900` | Readability extraction |
+| Structured data JSON | ✅ | `crawler.go:1872-1882` | JSON-LD + OG + Twitter + meta |
+| JS errors JSON | ✅ | `crawler.go:767-792` | `js-errors.json` with URL, message, level |
+| WebSocket messages JSON | ✅ | `crawler.go:794-819` | `ws-messages.json` with direction, data, opcode |
+| File index JSON | ✅ | `filesystem.go:238-253` | `index.json` URL→path→sha256→mime mapping |
+| HAR (HTTP Archive) | ✅ | `crawler.go:932-1045` | `api-responses.har` with request/response entries |
+| Service Worker (sw.js) | ✅ | `crawler.go:1047-1295` | Full SW for offline replay with API/WS/URL mapping |
+| WebSocket Replay (ws-replay.js) | ✅ | `crawler.go:1293-1395` | Mock WebSocket from captured data with timing |
+| Sitemap XML | ✅ | `crawler.go:1397-1424` | `sitemap.xml` of all discovered SPA routes |
 
-### Issues
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **WARC writer size tracking broken** | 🔴 Critical | `curSize` tracks gzip-compressed bytes, not content bytes. Rotation never triggers correctly. See [Bug #1] |
-| **No WACZ output** | 🟡 Medium | Industry standard format with dedup + CDX index. See [#15] |
-| **No HAR output** | 🟢 Low | HTTP Archive format not generated |
-| **No content-addressed storage** | 🟢 Low | Cross-crawl dedup not possible |
+| **Shadow DOM serialization races hydration** | 🔴 Critical | React/Vue may not have finished by serialization time → partial captures (`crawler.go:2019-2063`) |
+| **Content hash LRU eviction re-processes** | 🔴 Critical | 200k LRU full → evicted URLs re-downloaded (`crawler.go:2156-2165`) |
+| **CSS extraction missing bloom Add** | 🔴 Critical | `HasSeen` checked but `Add` missing → duplicate downloads (`crawler.go:2239,2272`) |
+| **Screenshot/PDF errors logged as Debug** | 🟡 Medium | Should be `LogError` not `LogDebug` (`crawler.go:2105,2120`) |
+| **CDP resource save errors swallowed** | 🟡 Medium | `continue` on error — debugging impossible (`crawler.go:2169`) |
 
 ---
 
@@ -356,25 +409,26 @@ All in `crawler.go` and `jsengine/wait.go`.
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
-| Page navigation | ✅ | `crawler.go:1601-1610` | `page.Navigate()` via CDP |
-| Redirect detection | ✅ | `crawler.go:1625-1634` | `window.location.href` comparison |
-| Wait for body ready | ✅ | `crawler.go:2692-2703` | `chromedp.WaitReady("body")` |
-| Wait for network idle | ✅ | `jsengine/scripts.go:421-451` | PerformanceObserver-based JS |
-| Wait for selector | ✅ | `jsengine/scripts.go:402-419` | Polling with timeout |
+| Page navigation via CDP | ✅ | `crawler.go:1692-1699` | `page.Navigate()` with error text check |
+| URL normalization | ✅ | `queue/normalize.go` | `NormalizeURL()` — lowercase, trailing slash, default port |
+| Redirect detection | ✅ | `crawler.go:1708-1714` | `window.location.href` comparison |
+| Wait for body ready | ✅ | `crawler.go:2712-2723` | `chromedp.WaitReady("body")` |
+| Wait for network idle | ✅ | `jsengine/scripts.go:421-451` | PerformanceObserver-based JS with configurable quiet period |
+| Wait for selector | ✅ | `jsengine/scripts.go:402-419` | Polling with timeout, returns when element exists |
 | Wait for response URL | ✅ | `jsengine/wait.go:22-50` | PerformanceObserver URL pattern matching |
-| Adaptive wait (framework-aware) | ✅ | `crawler.go:3456-3468` | Detect framework → framework-specific wait |
+| Adaptive wait (framework-aware) | ✅ | `crawler.go:3553-3595` | Detect framework → framework-specific wait |
 
-### Wait Strategies:3457-3479
+### Wait Strategies (`crawler.go:3553-3595`)
 
 | Strategy | Status | Implementation |
 |---|---|---|
 | `selector` | ✅ | Wait for CSS selector to appear in DOM |
 | `networkidle` | ✅ | Wait for no network activity for quiet period |
 | `response` | ✅ | Wait for matching response URL pattern |
-| `adaptive` | ✅ (default) | Detect framework → use framework-specific wait. Falls back to networkidle |
+| `adaptive` | ✅ (default) | Detect framework → use framework-specific wait; falls back to networkidle |
 | (default/timer) | ✅ | Simple timer wait |
 
-### Overlay & Interaction Pre-Capture:1639-1659
+### Overlay & Interaction Pre-Capture (`crawler.go:1720-1754`)
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
@@ -382,60 +436,69 @@ All in `crawler.go` and `jsengine/wait.go`.
 | Dismiss modals | ✅ | `jsengine/scripts.go:908-951` | `.modal-close`, `[data-dismiss="modal"]`, `[aria-label="Close"]` |
 | Remove fixed overlays | ✅ | `jsengine/scripts.go:942-948` | Elements with z-index > 1000 or modal/overlay class |
 | Expand sections | ✅ | `jsengine/scripts.go:890-906` | `[data-toggle]`, `[aria-expanded=false]`, `details`, `.collapsible` |
-| Click configured selectors | ✅ | `crawler.go:1645-1656` | Configurable `ClickSelectors` with 500ms delay |
+| Click configured selectors | ✅ | `crawler.go:1726-1737` | Configurable `ClickSelectors` with 500ms delay |
 | Lazy loading trigger | ✅ | `jsengine/scripts.go:174-191` | img[data-src], [data-bg], iframe[data-src] |
-| Custom JS before/after load | ✅ | `crawler.go:1595-1599,1676-1680` | Configurable `JSBeforeLoad`/`JSAfterLoad` |
 
 ---
 
 ## 8. Interaction Engine
 
-All in `crawler.go:2728-3040`.
+All in `crawler.go:2748-3149`. Forms **are** properly implemented (see Bug #6 clarification below).
 
-### Element Discovery:2749-2856
+### Element Discovery (`crawler.go:2749-2856`)
 
 The engine discovers interactive elements via 22+ CSS selectors executed in the page:
 
 ```javascript
-'button:not([disabled])',
+'button:not([disabled]):not([type="submit"]):not([type="reset"])',
 'a[href]:not([href^="mailto:"]):not([href^="tel:"]):not([href^="javascript:"]):not([target="_blank"])',
 'input[type="button"]:not([disabled])',
 'input[type="submit"]:not([disabled])',
 '[role="button"]:not([aria-disabled="true"])',
 '[onclick]',
-'.btn:not([disabled])',
-'button.btn:not([disabled])',
-'[data-action]', '[data-click]', '[data-toggle]',
-'[data-dismiss]', 'summary',
-'details:not([open]) > summary',
+'.btn:not([disabled])', 'button.btn:not([disabled])',
+'[data-action]', '[data-click]', '[data-toggle]', '[data-dismiss]',
+'summary', 'details:not([open]) > summary',
 '.accordion-header', '.accordion-trigger',
-'[aria-expanded="false"]',
-'.collapsible:not(.active)',
-'[data-bs-toggle="collapse"]',
-'[data-bs-toggle="modal"]',
+'[aria-expanded="false"]', '.collapsible:not(.active)',
+'[data-bs-toggle="collapse"]', '[data-bs-toggle="modal"]',
 '[data-toggle="tab"]', '[data-toggle="pill"]'
 ```
 
-Plus form and input discovery.
+Plus form and input discovery (`querySelectorAll('form')`, `querySelectorAll('input[type="text"], input[type="email"], ...')`).
 
 ### Interaction Types
 
-| Type | Status | Implementation |
-|---|---|---|
-| Click element | ✅ | `el.click()` via JS Evaluate |
-| Fill input | ✅ | Static values: `"test"`, `"test@example.com"`, `"testpassword123"`, `"test query"` |
-| Form submission | ❌ | `interactWithForm()` returns `false` — **no-op**. See [Bug #6] |
+| Type | Status | File:Line | Implementation |
+|---|---|---|---|
+| Click element | ✅ | `crawler.go:2957-2993` | `el.click()` via JS Evaluate with XPath resolution |
+| Fill input | ✅ | `crawler.go:3098-3149` | Context-aware values (name, email, password, search, tel) |
+| Form submission | ✅ | `crawler.go:2995-3096` | Fills ALL form elements, then submits via button click or `form.submit()` |
+| Lazy load trigger | ✅ | `crawler.go:2938-2940` | `jsengine.InjectLazyLoad()` |
+| Infinite scroll | ✅ | `crawler.go:2942-2954` | Configurable scroll with stability detection |
 
-### Issues
+### Interaction Flow (`crawler.go:2748-2954`)
+
+```
+1. Discover elements (22 selectors + forms + inputs)
+2. For each element (up to MaxInteractionsPerPage, default 50):
+   a. Check if element not already interacted (xpath dedup)
+   b. Click it / fill it / submit it
+   c. Wait for network idle (3s timeout)
+   d. Wait 500ms for DOM updates
+3. If new elements found after interactions, loop
+4. Run lazy loading + infinite scroll
+```
+
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **interactWithForm returns false** | 🔴 Critical | Forms detected and logged but never submitted. Core feature is broken. See [Bug #6] |
-| **No scroll-into-view before click** | 🟡 Medium | Element may be off-screen, `el.click()` may fail |
+| **No scroll-into-view before click** | 🟡 Medium | Elements below the fold — `el.click()` fails silently |
 | **No context-aware form values** | 🟢 Low | Static "test" values are detectable and insufficient |
 | **No aria-expanded verification** | 🟢 Low | No check that click actually changed state |
 | **No mobile gestures** | 🟢 Low | No swipe/long-press/touch patterns |
-| **target=_blank links excluded** | 🟢 Low | Links that open in new tab are skipped |
+| **target=_blank links excluded** | 🟢 Low | Links opening new tab are skipped |
 
 ---
 
@@ -448,7 +511,7 @@ All in `jsengine/scroll.go:36-189`.
 | Scroll to bottom | ✅ | — | `window.scrollTo(0, document.body.scrollHeight)` |
 | Scroll by distance | ✅ | 500px | Configurable step scroll |
 | Item counting | ✅ | `article,.card,.list-item,[data-infinite-scroll-item],.feed-item` | Configurable selector |
-| Stability detection | ✅ | 3 passes | Configurable stable passes |
+| Stability detection | ✅ | 3 passes | Configurable stable passes (no new items = stable) |
 | Load More button clicking | ✅ | — | Text matching: "Load More", "Show More", etc. |
 | Max scrolls | ✅ | 20 | Configurable |
 | Max duration | ✅ | 10s | Configurable |
@@ -460,9 +523,9 @@ All in `jsengine/scroll.go:36-189`.
 
 ## 10. SPA Route Discovery
 
-All in `crawler.go:1691-1786` and `jsengine/scripts.go:248-295,453-511`.
+All in `crawler.go:1770-1853` and `jsengine/scripts.go:248-295,453-511`.
 
-### Framework Detection
+### Framework Detection (`crawler.go:2094-2100`)
 
 | Framework | Detection Method |
 |---|---|
@@ -472,8 +535,9 @@ All in `crawler.go:1691-1786` and `jsengine/scripts.go:248-295,453-511`.
 | React | `[data-reactroot]` or `#__next` |
 | Vue | `[data-v-]` or `window.__VUE__` |
 | Svelte | `[class*="svelte-"]` |
+| Gatsby | `___gatsby` |
 
-### Route Interception
+### Route Interception (`jsengine/scripts.go:248-295`)
 
 | Method | Status | Implementation |
 |---|---|---|
@@ -483,20 +547,20 @@ All in `crawler.go:1691-1786` and `jsengine/scripts.go:248-295,453-511`.
 | popstate | ✅ | `window.addEventListener('popstate')` |
 | Link discovery | ✅ | `document.querySelectorAll('a[href]')` |
 
-### Route Processing:1691-1786
+### Route Processing (`crawler.go:1770-1853`)
 
 - Routes discovered from pushState events and `<a href>` links
 - Resolved to absolute URLs via `rewrite.ResolveURL()`
 - New routes queued for crawling (up to `MaxSPARoutes`, default: 50)
-- The crawler navigates to each SPA route in the **SAME** tab
+- Crawler navigates to each SPA route in the **same tab**
 - Waits for hydration: network idle + 2s
 - Captures HTML and saves
 
-### Issues
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **Single tab for all SPA routes** | 🟡 Medium | Navigations sequential in same tab — very slow |
+| **Single tab for all SPA routes** | 🟡 Medium | Navigations sequential in same tab — very slow for 50 routes |
 | **No route parameterization** | 🟢 Low | Dynamic routes like `/posts/:id` not discovered |
 | **No data store extraction** | 🟢 Low | Redux/Vuex state, React context, route data not captured |
 
@@ -508,27 +572,39 @@ All in `internal/auth/auth.go` (313 lines).
 
 | Method | Status | File:Line | Implementation |
 |---|---|---|---|
-| Form login | ✅ | `auth.go:61-147` | Navigate to login URL, fill fields from config, click submit |
+| Form login | ✅ | `auth.go:61-147` | Navigate to login URL, fill fields from config, click submit, persist cookies |
 | HTTP Basic auth | ✅ | `auth.go:149-163` | `network.SetExtraHTTPHeaders` with Authorization: Basic |
 | Custom header auth | ✅ | `auth.go:165-182` | `network.SetExtraHTTPHeaders` with custom headers |
 | OAuth 2.0 client credentials | ✅ | `auth.go:184-266` | Token exchange via HTTP POST, inject as Authorization: Bearer |
-| Interactive pre-crawl login | ✅ | `crawler.go:412-442` | Show browser, user logs in, press Enter |
-| Cookie persistence | ✅ | `crawler.go:3044-3088` | Cookies saved to `cookies.json`, loaded on restart |
-| Cookie injection via CDP | ✅ | `crawler.go:3132-3188` | `network.SetCookie()` per cookie |
+| Interactive pre-crawl login | ✅ | `crawler.go:511-543` | Show browser, user logs in, press Enter, cookies persisted |
+| Cookie persistence | ✅ | `crawler.go:3153-3200` | Cookies saved to `cookies.json`, loaded on restart |
+| Cookie injection via CDP | ✅ | `crawler.go:3243-3298` | `network.SetCookie()` per cookie with domain, path, secure, httpOnly, expiry |
 | Session validity check | ✅ | `auth.go:280-292` | `HasValidSession()` checks cookie expiry |
+| Cookie jar periodic save | ✅ | `crawler.go:3170-3182` | Every 5 minutes + on shutdown |
 
-### Issues
+### Form Login Flow (`auth.go:61-147`)
+
+1. Create/reuse dedicated tab (sync.Once)
+2. Navigate to `LoginURL`
+3. Fill form fields: `FormFields` maps selector→value
+   - Heuristic: selectors containing "user"/"email" → `Username`, "pass" → `Password`
+4. Click `SubmitSelector` if configured
+5. Wait `WaitAfterLogin` for redirect/session establishment
+6. Extract cookies via CDP
+7. Store cookies in jar
+
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **OAuth refresh token unused** | 🟢 Low | `refresh_token` stored but never used for token refresh |
-| **Cookie domain matching** | 🟡 Medium | Domain split by "." produces false negatives. See [Bug #5] |
+| **Form tab context never released** | 🟡 Medium | `formTabCancel` never called until `Close()` — context lives entire crawl (`auth.go:74-76`) |
+| **OAuth refresh token unused** | 🟢 Low | `refresh_token` stored but never used for token refresh (`auth.go:244-249`) |
 
 ---
 
 ## 12. CAPTCHA Handling
 
-All in `internal/captcha/solver.go` (347 lines) and `crawler.go:3549-3697`.
+All in `internal/captcha/solver.go` (347 lines) and `crawler.go:3694-3843`.
 
 ### Supported Providers
 
@@ -550,21 +626,27 @@ All in `internal/captcha/solver.go` (347 lines) and `crawler.go:3549-3697`.
 | Generic (data-sitekey) | ✅ |
 | Script-based detection | ✅ |
 
-### Detection & Solving Pipeline
+### Solving Pipeline (`crawler.go:3694-3843`)
 
-1. **Detection** (`crawler.go:3610-3675`):
+1. **Detection** (`crawler.go:3755-3820`):
    - Check for `.g-recaptcha`, `.h-captcha`, `.cf-turnstile` elements
    - Check for `[data-sitekey]` on any element
    - Check for loaded CAPTCHA scripts `<script src="...recaptcha...">`
-2. **Solving** (`crawler.go:3549-3608`):
+2. **Solving** (`crawler.go:3701-3753`):
    - Create `SolveRequest` with URL, sitekey, page HTML
-   - Call external API (poll for result)
-   - Retry up to `RetryCount` with 2s backoff
-3. **Injection** (`crawler.go:3677-3697`):
+   - Call external API (poll for result with 2s tick)
+   - Retry up to `RetryCount` with increasing backoff
+3. **Injection** (`crawler.go:3822-3843`):
    - reCAPTCHA: `g-recaptcha-response` innerHTML
-   - hCaptcha: `data-hcaptcha-response` innerHTML
-   - Turnstile: `data-turnstile-response` innerHTML
+   - hCaptcha: `[data-hcaptcha-response]` innerHTML
+   - Turnstile: `[data-turnstile-response]` innerHTML
 4. **Post-solve**: 2s wait for CAPTCHA re-evaluation
+
+### Known Issues
+
+| Issue | Severity | Details |
+|---|---|---|
+| **Provider API mismatch** | 🟡 Medium | 2Captcha and AntiCaptcha use different response formats but merged into same `poll2Captcha` path (`captcha/solver.go:115-129`) |
 
 ---
 
@@ -584,10 +666,11 @@ All in `internal/captcha/solver.go` (347 lines) and `crawler.go:3549-3697`.
 
 | Feature | Status | Implementation |
 |---|---|---|
-| Article extraction | ✅ | Readability-style: article→[role=main]→.content→#content→largest text container |
+| Article extraction (Readability) | ✅ | article→[role=main]→.content→#content→largest text container |
 | Shadow DOM extraction | ✅ | `querySelectorAll('*')` → `el.shadowRoot.innerHTML` |
 | Iframe source extraction | ✅ | `querySelectorAll('iframe, frame')` src + data-src fallback |
 | Media source extraction | ✅ | video/audio src + source children + poster |
+| SingleFile snapshot | ✅ | Inline all CSS/images/scripts as data URIs |
 
 ### JS Dependency Resolution
 
@@ -615,9 +698,9 @@ All in `internal/jsanalyzer/analyzer.go` (229 lines).
 
 ## 14. Storage & Output
 
-All in `internal/storage/filesystem.go` (253 lines), `storage/warc.go` (231 lines).
+All in `internal/storage/`.
 
-### Filesystem Storage:filesystem.go
+### Filesystem Storage (`filesystem.go` — 253 lines)
 
 | Feature | Status | Implementation |
 |---|---|---|
@@ -626,27 +709,41 @@ All in `internal/storage/filesystem.go` (253 lines), `storage/warc.go` (231 line
 | Query string handling | ✅ | Query params appended (sanitized) to filename |
 | Directory index (paths ending in /) | ✅ | `index.html` for directory-style paths |
 | Path extension detection | ✅ | Paths without extensions get `/index.html` appended |
-| Path traversal prevention | ✅ | Double-checked output directory containment |
-| API response paths | ✅ | `PathForAPI()` with .json extension |
+| Path traversal prevention | ✅ | Double-checked output directory containment (`filepath.Clean` + prefix check) |
+| API response paths | ✅ | `PathForAPI()` with `.json` extension |
 | File index | ✅ | `index.json` with URL→path→sha256→mime mapping |
+| Screenshot save | ✅ | URL path + `.png` |
+| PDF save | ✅ | URL path + `.pdf` |
+| Shadow DOM save | ✅ | URL path + `-shadowdom.json` |
 
-### WARC Writer:warc.go
+### WARC Writer (`warc.go` — 231 lines)
 
 | Feature | Status | Implementation |
 |---|---|---|
 | WARC 1.0 format | ✅ | Standard headers, block digest, content-length |
 | gzip compression | ✅ | `compress/gzip` writer |
-| File rotation | 🟡 | **Buggy** — See [Bug #1] |
+| File rotation | ✅ | Tracks **uncompressed** payload length (`payloadLen` returned from `formatWARCRecord`) |
 | warcinfo record | ✅ | Software identity and format metadata |
-| UUID generation | ✅ | crypto/rand based |
-| Concurrent writes | ✅ | sync.Mutex guard |
-| Max file size | ✅ | 1GB (but tracking is wrong) |
+| UUID generation | ✅ | crypto/rand based (RFC 4122 compliant) |
+| Concurrent writes | ✅ | `sync.Mutex` guard |
+| Max file size | ✅ | 1GB (based on uncompressed payload) |
 
-### Issues
+### WACZ Writer (`wacz.go` — 250 lines)
+
+| Feature | Status | Implementation |
+|---|---|---|
+| ZIP packaging | ✅ | `archive/zip` with archive/ directory |
+| WARC inside WACZ | ✅ | gzip-compressed WARC inside archive/ |
+| CDX index | ✅ | Sorted URL→offset lookup with SHA1 digest |
+| Metadata (datapackage.json) | ✅ | CreatedAt, title, description, software, format |
+| Concurrent writes | ✅ | `sync.Mutex` guard |
+| File rotation | ✅ | 1GB per WARC segment |
+
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **WARC curSize tracks compressed size** | 🔴 Critical | `n` from `gzip.Write()` is compressed bytes, not payload size. Rotation check `curSize >= maxSize` uses wrong metric. 1GB file rotation never triggers correctly. See [Bug #1] |
+| **WARC rotation threshold is fine** | 🟢 **FIXED** | Uses uncompressed `payloadLen` not gzip bytes — rotation works correctly |
 
 ---
 
@@ -657,97 +754,110 @@ All in `internal/storage/filesystem.go` (253 lines), `storage/warc.go` (231 line
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
 | Per-host token bucket | ✅ | `ratelimit/` | Dynamic capacity from robots.txt crawl-delay |
-| Latency observation | ✅ | `crawler.go:550-552` | `ObserveLatency()` for adaptive rate limiting |
+| Latency observation | ✅ | `crawler.go:654-657` | `ObserveLatency()` for adaptive rate limiting |
 | Circuit breaker (3-state) | ✅ | `resilience/` | Closed→half-open→open per host |
-| Exponential backoff with jitter | ✅ | `crawler.go:1447` | Retry with backoff |
-| Retry classification | ✅ | `crawlerrors/` | 14 error kinds, retryable flags |
+| Exponential backoff with jitter | ✅ | `crawler.go:1544-1565` | Retry with configurable backoff |
+| Retry classification | ✅ | `errors/crawl.go:101-112` | 14 error kinds, retryable flags |
 
 ### Deduplication
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
-| Bloom filter (probabilistic) | ✅ | `crawler.go:192-202` | Expected items: MaxTotalURLs * 10, false positive rate: 1% |
-| Bloom filter persistence | ✅ | `crawler.go:198-202` | Load from file on startup |
-| LRU exact dedup | ✅ | `crawler.go:255` | Size: max(MaxTotalURLs, 100k) |
-| Content hash dedup | ✅ | `crawler.go:2130` | XXHash, 200k LRU |
-| Bloom file save | ✅ | `BloomFilterPath` | Optional file persist |
+| Bloom filter (probabilistic) | ✅ | `crawler.go:224-234` | Expected items: MaxTotalURLs × 10, false positive rate: 1% |
+| Bloom filter persistence | ✅ | `crawler.go:230-234` | Load from file on startup, save on shutdown |
+| LRU exact dedup | ✅ | `crawler.go:287` | Size: max(MaxTotalURLs, 100k) |
+| Content hash dedup (XXHash) | ✅ | `crawler.go:2156-2165` | 200k LRU for content-level dedup |
+| Bloom file save | ✅ | `crawler.go:715-717` | Optional file persist via BloomFilterPath |
 
 ### Queue & Scheduling
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
-| BFS priority queue (heap) | ✅ | `queue/` | Depth-based ordering |
-| Memory queue | ✅ | `queue/local.go` | Default: in-memory |
-| Persistent (disk) queue | ✅ | `queue/persistent.go` | File-backed |
-| Redis queue | ✅ | `queue/redis.go` | Redis list |
-| PostgreSQL queue | ✅ | `queue/postgres.go` | PG table |
-| Kafka queue | ✅ | `queue/kafka.go` | Kafka topic |
-| Queue config swap | ✅ | `crawler.go:215-219` | `queue.NewQueueFromConfig()` |
-| Max queue size | ✅ | `crawler.go:84` | `maxQueueSize = 100,000` |
+| BFS priority queue (min-heap by depth) | ✅ | `queue/queue.go:29-174` | Depth-based ordering |
+| Memory queue | ✅ | `queue/queue.go:36-48` | Default: in-memory priority queue |
+| Persistent (disk) queue | ✅ | `queue/persistent.go` | File-backed with JSON serialization |
+| Redis queue | ✅ | `queue/redis.go` | Redis list + set (Lua scripts for atomicity) |
+| PostgreSQL queue | ✅ | `queue/postgres.go` | PG table with `FOR UPDATE SKIP LOCKED` |
+| Kafka queue | ✅ | `queue/kafka.go` | Kafka topic with separate seen topic |
+| Queue config from config | ✅ | `queue/factory.go` | `NewQueueFromConfig()` |
+| Max queue size | ✅ | `crawler.go:88` | `maxQueueSize = 100,000` |
 
 ### Checkpoint & Resume
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
-| Periodic checkpoint | ✅ | `crawler.go:3516-3531` | Configurable interval (default: 5min) |
+| Periodic checkpoint | ✅ | `crawler.go:3661-3676` | Configurable interval (default: 5min) |
 | Gob encoding | ✅ | `checkpoint.go` | Binary serialization |
 | Atomic rename | ✅ | `checkpoint.go` | Temp file + rename pattern |
-| Resume from checkpoint | ✅ | `crawler.go:330-343` | Load queue + visited on start |
-| **Race condition** | 🔴 | `crawler.go:1367` | See [Bug #2] |
+| Resume from checkpoint | ✅ | `crawler.go:408-421` | Load queue + visited on start |
 
 ### Incremental Crawling
 
 | Feature | Status | File:Line | Implementation |
 |---|---|---|---|
-| ETag caching | ✅ | `inc_cache.go` | Store ETags from responses |
-| Last-Modified caching | ✅ | `inc_cache.go` | Store Last-Modified headers |
-| Conditional requests | ✅ | `crawler.go:2126-2127` | 304 handling |
+| ETag caching | ✅ | `storage/incremental.go` | Store ETags from responses |
+| Last-Modified caching | ✅ | `storage/incremental.go` | Store Last-Modified headers |
+| Conditional requests | ✅ | `crawler.go:2152-2153` | 304 handling |
 | Cache file persistence | ✅ | `IncCacheFile` | File-based cache |
 
 ### Robots.txt
 
-| Feature | Status | File:Line | Implementation |
-|---|---|---|---|
-| robots.txt parser | ✅ | `robots/robots.go:1-376` | Wildcard patterns, user-agent matching |
-| Crawl-delay extraction | ✅ | `robots.go` | Parse Crawl-Delay directive |
-| Sitemap discovery | ✅ | `robots.go` | Parse Sitemap directive |
-| 24h cache | ✅ | `robots.go:43` | `cacheTTL = 24 * time.Hour` |
-| Singleflight dedup | ✅ | `robots.go:36` | `singleflight.Group` for concurrent fetches |
+All in `internal/robots/robots.go` (376 lines).
 
-### Error Handling
+| Feature | Status | Implementation |
+|---|---|---|
+| robots.txt parser | ✅ | Wildcard patterns, user-agent matching |
+| Crawl-delay extraction | ✅ | Parse Crawl-Delay directive from matching user-agent group |
+| Sitemap discovery | ✅ | Parse Sitemap directive (can be multiple) |
+| 24h cache | ✅ | `cacheTTL = 24 * time.Hour` |
+| Singleflight dedup | ✅ | `singleflight.Group` for concurrent fetches |
+| Rule evaluation | ✅ | Score-based matching: longer paths beat shorter, Allow beats Disallow |
 
-| Feature | Status | File:Line | Implementation |
+### Error Classification (`errors/crawl.go` — 186 lines)
+
+| Kind | Status | Retryable | Detection Method |
 |---|---|---|---|
-| Error classification | ✅ | `errors/` | 14 error kinds (timeout, network, DNS, TLS, HTTP, rate-limit, blocked, auth, parse, resource, browser, OOM, cancelled) |
-| Retryable vs non-retryable | ✅ | `errors/` | Per-kind retryability classification |
-| Panic recovery | ✅ | `crawler.go:554-566` | Per-goroutine recover with stack trace |
-| **Error inconsistency** | 🟡 | `crawler.go:1614` vs `retry.go` | 5xx classified differently. See [Issue #8] |
+| `KindTimeout` | ✅ | Yes | `interface{ Timeout() bool}` or string contains "timeout"/"deadline" |
+| `KindNetwork` | ✅ | Yes | String contains "connection refused"/"connection reset"/"broken pipe" |
+| `KindDNS` | ✅ | No | String contains "no such host"/"DNS" |
+| `KindTLS` | ✅ | No | String contains "tls"/"certificate"/"handshake" |
+| `KindHTTP` | ✅ | No | (reserved) |
+| `KindRateLimit` | ✅ | Yes | String contains "429"/"rate limit"/"too many" |
+| `KindBlocked` | ✅ | No | String contains "403"/"blocked"/"captcha" |
+| `KindAuth` | ✅ | No | String contains "401"/"auth"/"login" |
+| `KindParse` | ✅ | No | (reserved) |
+| `KindResource` | ✅ | Yes | (reserved) |
+| `KindBrowser` | ✅ | Yes | (reserved) |
+| `KindOOM` | ✅ | No | String contains "no memory"/"cannot allocate" |
+| `KindCancelled` | ✅ | No | Context cancellation |
+| `KindUnknown` | ✅ | No | Default fallback |
 
 ### Periodic Tasks
 
 | Task | Status | Interval | File:Line |
 |---|---|---|---|
-| Checkpoint save | ✅ | 5min (default) | `crawler.go:3516-3531` |
-| Progress report | ✅ | 30s | `crawler.go:406` |
-| Cookie jar save | ✅ | 5min | `crawler.go:3059-3071` |
-| Stale map cleanup | ✅ | 5min | `crawler.go:3481-3492` |
-| Memory GC pressure | ✅ | >80% budget | `crawler.go:493-497` |
+| Checkpoint save | ✅ | 5min (default) | `crawler.go:3661-3676` |
+| Progress report | ✅ | 30s | `crawler.go:745-765` |
+| Cookie jar save | ✅ | 5min | `crawler.go:3170-3182` |
+| Stale map cleanup | ✅ | 5min | `crawler.go:3626-3659` |
+| Memory GC pressure | ✅ | >80% budget | `crawler.go:598-602` |
+| Browser health check | ✅ | 30s | `crawler.go:389-402` |
 
-### Issues
+### Known Issues
 
 | Issue | Severity | Details |
 |---|---|---|
-| **Checkpoint race condition** | 🔴 Critical | `saveCheckpoint()` reads queue without lock while goroutines push. See [Bug #2] |
-| **Queue pointer aliasing** | 🟡 Medium | `Items()` returns values but heap stores pointers. See [Bug #4] |
-| **Retry classification inconsistency** | 🟡 Medium | 5xx errors classified as retryable in `retry.go` but mixed in `doCrawl` navigation handler. See [Issue #8] |
-| **Dedup logic duplicated 4x** | 🟢 Low | Same bloom/LRU/allowed/exclude/max check repeated for links, iframes, media, poster. See [Issue #13] |
-| **No distributed coordination** | 🟡 Medium | Queue backends exist but no worker pool coordination, leader election |
+| **Checkpoint race condition** | 🔴 Critical | `saveCheckpoint()` reads queue without lock while goroutines push (`crawler.go:1459-1473`) |
+| **Queue pointer aliasing** | 🟡 Medium | Heap stores `*URLItem` pointers — `Items()` returns copies but heap retains aliases (`queue/queue.go:30-34`) |
+| **Retry classification inconsistency** | 🟡 Medium | Ad-hoc string matching in `doCrawl` vs `errors.Classify()` (`crawler.go:1697-1698`) |
+| **Dedup logic duplicated 4×** | 🟢 Low | Same bloom/LRU/allowed/exclude/max check repeated for links, iframes, media, poster |
+| **No distributed coordination** | 🟡 Medium | Queue backends exist but no worker pool coordination or leader election |
 
 ---
 
 ## 16. CLI & Configuration
 
-All in `cmd/clone/main.go` (242 lines) and `internal/config/config.go` (367 lines).
+All in `cmd/clone/main.go` (353 lines) and `internal/config/config.go` (384 lines).
 
 ### CLI Flags
 
@@ -776,10 +886,14 @@ All in `cmd/clone/main.go` (242 lines) and `internal/config/config.go` (367 line
 | `--wacz` | | `false` | `EnableWACZ` |
 | `--blocked-urls` | | `[]` | `BlockedURLPatterns` |
 | `--dashboard-port` | | `0` | Dashboard HTTP port (0=disabled) |
+| `--api-port` | | `0` | REST API port (0=disabled) |
+| `--webhook-url` | | `""` | Notification webhook URL |
+| `--slack-url` | | `""` | Slack webhook URL |
+| `--schedule` | | `""` | Cron expression |
 | `--help` | `-h` | | Help text |
 | `--version` | | `1.0.0` | Version string |
 
-### Serve Command
+### Serve Subcommand (`cmd/clone/main.go:79-169`)
 
 | Flag | Default | Description |
 |---|---|---|
@@ -791,55 +905,65 @@ Serve features:
 - JSON fallback (missing file → try `.json` extension)
 - Host directory auto-detection
 
-### Config Validation
+### Config Validation (`config.go:276-372`)
 
 25+ validation rules across all subsystems:
 - Seeds required (unless manual-capture mode)
-- MaxDepth > 0
-- MaxConcurrentPages > 0
-- PageTimeout > 0
-- CrawlDelay >= 0
-- MaxURLsPerHost > 0
-- MaxTotalURLs > 0
+- MaxDepth > 0, MaxConcurrentPages > 0, PageTimeout > 0
+- CrawlDelay >= 0, MaxURLsPerHost > 0, MaxTotalURLs > 0
 - CheckpointInterval >= 0
 - WaitStrategyTimeout >= WaitTimeout
-- Auth: form requires login_url + username + password
-- Auth: basic requires username + password
-- Auth: header requires at least one header
-- Auth: oauth requires client_id + client_secret + token_url
+- Auth validation per type (form requires login_url + username + password; basic requires credentials; header requires at least one header; oauth requires client_id + client_secret + token_url)
 - CAPTCHA requires api_key + provider + timeout > 0
-- Queue: redis requires redis_url
-- Queue: postgres requires pg_dsn
-- Queue: kafka requires kafka_url
+- Queue backends: redis requires redis_url, postgres requires pg_dsn, kafka requires kafka_url
 - Change detection: max_snapshots > 0
+
+### Serve Command Features
+
+| Feature | Status | Implementation |
+|---|---|---|
+| Static file serving | ✅ | `http.FileServer(http.Dir(serveDir))` |
+| CORS headers | ✅ | `Access-Control-Allow-Origin: *` |
+| Fallback routing | ✅ | Missing file → try index.html |
+| JSON fallback | ✅ | Missing file → try `.json` extension |
+| Host auto-detection | ✅ | Scans output dir for hostname directories |
 
 ---
 
-## 17. Backend Queue Integrations
+## 17. Queue Backend Integrations
 
-### Redis Queue
+### Redis Queue (`internal/queue/redis.go` — 192 lines)
 
-| File | `internal/queue/redis.go` |
+| Aspect | Implementation |
 |---|---|
-| Data structure | Redis List (LPUSH/BRPOP) |
-| Persistence | Redis persistence |
+| Data structure | Redis List (RPUSH/LPOP) + Set (seen) + Hash (items) |
+| Atomic operations | Lua scripts (`pushScript`, `popScript`) for atomic push/pop |
+| Dedup | Server-side SISMEMBER check |
+| Persistence | Redis persistence (configurable) |
 | Distributed | Yes (shared Redis) |
+| Checkpoint load | Pipeline-based batch insert |
 
-### PostgreSQL Queue
+### PostgreSQL Queue (`internal/queue/postgres.go` — 200 lines)
 
-| File | `internal/queue/postgres.go` |
+| Aspect | Implementation |
 |---|---|
-| Data structure | PostgreSQL table with priority |
+| Data structure | `crawl_queue` table with url (PK), depth, item_data (JSONB), seen, created_at |
+| Atomic pop | `DELETE ... WHERE ctid = (SELECT ctid ... FOR UPDATE SKIP LOCKED)` |
+| Dedup | `INSERT ... ON CONFLICT (url) DO NOTHING` |
 | Persistence | PG durability |
 | Distributed | Yes (shared PG) |
+| Checkpoint load | Transaction + batch |
 
-### Kafka Queue
+### Kafka Queue (`internal/queue/kafka.go` — 242 lines)
 
-| File | `internal/queue/kafka.go` |
+| Aspect | Implementation |
 |---|---|
-| Data structure | Kafka topic |
+| Data structure | Kafka topic (`crawl_queue`) + separate seen topic (`crawl_seen`) |
+| Atomic pop | Kafka consumer group + commit |
+| Dedup | In-memory `seenSet` (`map[string]bool`) with background `consumeSeenTopic` |
 | Persistence | Kafka log |
 | Distributed | Yes (shared Kafka) |
+| Checkpoint load | Write messages to topic + mark seen |
 
 ---
 
@@ -851,397 +975,478 @@ Serve features:
 | 2Captcha | ✅ | CAPTCHA solving |
 | AntiCaptcha | ✅ | CAPTCHA solving |
 | CapMonster | ✅ | CAPTCHA solving |
-| SingleFile (inlined) | ✅ | Page serialization |
+| SingleFile (inlined JS) | ✅ | Page serialization |
 | Redis | ✅ | Queue backend |
 | PostgreSQL | ✅ | Queue backend |
 | Kafka | ✅ | Queue backend |
 | Service Worker (generated) | ✅ | Offline replay |
 | WebSocket Replay (generated) | ✅ | Offline replay |
-| Docker | ❌ | Not available |
-| Kubernetes/Helm | ❌ | Not available |
-| Prometheus | ❌ | Not available |
-| OpenTelemetry | ❌ | Not available |
-| Browserless.io | ❌ | Not available |
-| Playwright | ❌ | Not available |
-| Puppeteer | ❌ | Not available |
+| Docker | ✅ | Container deployment |
+| **Kubernetes/Helm** | ❌ | **Not available** |
+| **Prometheus** | ❌ | **Not available** |
+| **OpenTelemetry** | ❌ | **Not available** |
+| **Browserless.io** | ❌ | **Not available** |
+| **Playwright** | ❌ | **Not available** |
+| **Puppeteer** | ❌ | **Not available** |
 
 ---
 
 ## 19. Bugs & Issues
 
-### Bug #1: WARC Writer Size Tracking (🔴 Critical)
+This section is verified against actual code (2026-07-30 audit).
+
+### Bug #1: WARC curSize Tracking — RESOLVED (🟢 Fixed)
 
 **File:** `internal/storage/warc.go:56-61`
+**Old claim (features.md):** `curSize` tracks compressed bytes.
+**Actual code:**
 
-**Problem:**
 ```go
-n, err := w.gzipW.Write(record)  // n = compressed bytes
-w.curSize += int64(n)             // tracks compressed size
-if w.curSize >= w.maxSize {       // compares compressed vs 1GB
-    // rotate — never triggers correctly
-}
+record, payloadLen := formatWARCRecord(rec)   // payloadLen = uncompressed record length
+w.gzipW.Write(record)                           // write compressed bytes
+w.curSize += int64(payloadLen)                  // track UNCOMPRESSED length
 ```
 
-`gzip.Writer.Write()` returns the number of compressed bytes written, not the uncompressed payload length. The `formatWARCRecord()` function builds records with `Content-Length: <uncompressed payload>`, but `curSize` tracks compressed bytes. Since compression reduces size, `curSize` grows slower than actual content, so the 1GB file rotation limit may be reached far later than intended (or never, depending on compression ratio).
+`formatWARCRecord()` returns `([]byte(s), len(s))` where `s` is the full WARC string (headers + payload). The `payloadLen` used for `curSize` is the **uncompressed** length. Rotation triggers correctly at 1GB uncompressed content.
 
-**Fix:** Track uncompressed payload length separately. Either return it from `formatWARCRecord()` or compute it before gzip.
+**True verdict:** ✅ **Fixed.** Documentation was outdated.
 
 ---
 
-### Bug #2: Checkpoint Race Condition (🔴 Critical)
+### Bug #2: Checkpoint Race Condition (🔴 Critical — Open)
 
-**File:** `internal/crawler/crawler.go:1356-1368`
+**File:** `internal/crawler/crawler.go:1459-1473`
 
 **Problem:**
 ```go
 func (c *Crawler) saveCheckpoint() {
-    c.hostMu.RLock()
-    // snapshot hostLastCrawl and hostURLCount under lock
+    c.hostMu.RLock()          // locks host maps
     c.hostMu.RUnlock()
     c.checkpoint.Save(c.urlQueue, hlc, huc)  // urlQueue read WITHOUT lock
 }
 ```
 
-The queue is concurrently pushed to by crawling goroutines (line 1881: `c.urlQueue.PushURL(...)`). There is no mutex protecting the queue read during checkpoint. This is a data race: the queue's internal state (heap, slice) can be mutated during iteration.
-
-**Fix:** Add a `sync.RWMutex` to the Queue interface or snapshot queue items atomically.
+The queue is concurrently pushed/pop'd by crawling goroutines. There is no mutex protecting queue read during checkpoint. This is a data race: the heap's internal slice can be mutated during iteration.
 
 ---
 
-### Bug #3: Browser Restart Deadlock (🔴 Critical)
+### Bug #3: Browser Restart in `launchBrowser()` Legacy Path (🟡 Medium — Mitigated)
 
-**File:** `internal/crawler/crawler.go:1406-1436`
+**File:** `internal/crawler/crawler.go:1475-1528`
 
-**Problem:**
+**Problem:** The legacy `launchBrowser()` acquires `browserMu.Lock()` before spawning Chrome — may block if Chrome is unresponsive. All goroutines calling `getBrowserCtx()` block during this time.
+
+**Mitigation:** The browser pool (`internal/browserpool/`) replaces this path for pool sizes > 0. The legacy path only runs when `browserPool` is nil (should not happen in production).
+
+---
+
+### Bug #4: Queue Pointer Aliasing (🟡 Medium — Open)
+
+**File:** `internal/queue/queue.go:62-76`
+
+**Problem:** Heap stores `*URLItem` pointers. `Pop()` returns the same pointer that the heap retains. While `Items()` returns value copies, the heap's internal `items` slice still holds pointers to the same memory.
+
 ```go
-func (c *Crawler) restartBrowser() context.Context {
-    c.browserMu.Lock()                              // LOCK HELD
-    // ...
-    allocCtx, allocCancel := chromedp.NewExecAllocator(c.ctx, c.allocOpts...)  // MAY BLOCK
-    browserCtx, browserCancel := chromedp.NewContext(allocCtx)
-    if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
-        // MORE BLOCKING OPS
-    }
-    c.browserMu.Unlock()
+func (pq *PriorityQueue) Pop() interface{} {
+    item := old[n-1]      // pointer
+    old[n-1] = nil         // prevent leak
+    return item            // caller gets the same pointer
 }
 ```
 
-`chromedp.NewExecAllocator()` spawns Chrome and connects via CDP — may block if Chrome doesn't start, port is busy, or Chrome is unresponsive. All goroutines calling `getBrowserCtx()` (which acquires the same mutex) block during this time. If all goroutines are blocked and the crawl loop can't proceed, the entire crawl hangs.
-
-**Fix:** Add timeout context for the allocator, or move blocking operations outside the lock using channels.
+**Impact:** Low — callers only use the returned item for the current page crawl.
 
 ---
 
-### Bug #4: Queue Interface Leak / Pointer Aliasing (🟡 Medium)
+### Bug #5: Cookie Domain Matching — PARTIALLY FIXED (🟡 Medium — Open)
 
-**File:** `internal/queue/interface.go`
+**File:** `internal/crawler/crawler.go:3256`
 
-**Problem:** The queue heap stores `*URLItem` pointers. The `Items()` method returns slice copies of pointer values. While the returned slice is a copy, the internal heap still holds the same pointers. This means if an external caller modifies the items they got (unlikely since they're value copies), the internal state is unaffected. However, the heap operations (Pop) return `*URLItem` pointers that alias the same memory. This is more a design smell than active bug.
-
-**Fix:** Use Go generics (`[]URLItem` instead of `[]*URLItem`) to eliminate pointer sharing entirely.
-
----
-
-### Bug #5: Cookie Domain Matching (🟡 Medium)
-
-**File:** `internal/crawler/crawler.go:3145-3147`
-
-**Problem:**
+**Current code:**
 ```go
-parts := strings.Split(domain, ".")
-for i := 0; i < len(parts); i++ {
-    d := strings.Join(parts[i:], ".")
-    for _, ck := range c.cookieJar[d] { ... }
-}
+if domain == jarDomain || strings.HasSuffix(domain, "."+jarDomain) {
 ```
 
-For domain `sub.example.com`, parts = `["sub", "example", "com"]`, tries: `"sub.example.com"`, `"example.com"`, `"com"`. This works. But it doesn't handle the case where a cookie domain like `"x.com"` is a suffix of `"yxx.com"` incorrectly — this is actually fine because the split produces different starting positions. The **real bug** is that the split treats TLDs like `"com"` as a valid domain to check, which is always a wasted lookup. Not a security issue but wastes lookups and could cause false positives if someone stores cookies under `"com"` or `"co.uk"` keys.
-
-**Fix:** Use proper public suffix matching (golang.org/x/net/publicsuffix) or at minimum skip iteration when remaining parts have no dot.
+**Problem:** This is correct for subdomain matching. However, it treats TLDs like `"com"` as valid domains to check (wasted lookup). Fixed from previous version.
 
 ---
 
-### Bug #6: interactWithForm is No-Op (🔴 Critical)
+### Bug #6: `interactWithForm` — FALSE POSITIVE (🟢 Already Implemented)
 
-**File:** `internal/crawler/crawler.go:2975-2987`
+**File:** `internal/crawler/crawler.go:2995-3096`
+**Old claim (features.md):** "Forms detected and logged but never submitted."
 
-**Problem:**
+**Actual code (verified):**
 ```go
 func (c *Crawler) interactWithForm(ctx context.Context, xpath string, item map[string]interface{}) bool {
-    action := ""   // read from item
-    method := ""   // read from item
-    util.LogDebug("interaction: found form", ...)
-    return false   // ALWAYS returns false — form never submitted
+    action := ""
+    if a, ok := item["action"].(string); ok { action = a }
+    if action == "" || strings.HasPrefix(action, "javascript:") { return false }
+    // ... fills ALL inputs/selects/textareas inside the form
+    // ... clicks submit button OR calls form.submit()
+    // ... returns true on success
 }
 ```
 
-Forms are discovered, logged, but never filled or submitted. The interaction engine skips them because `handled` stays false. This means the interaction engine cannot handle any form on any page.
+The JS script:
+1. Iterates all `form.elements`
+2. Fills inputs with context-aware values (text, email, password, checkbox, radio, select, textarea)
+3. Dispatches `input` and `change` events
+4. Clicks submit button or calls `form.submit()`
+5. Returns `{ success: true }`
 
-**Fix:** Implement form field filling (use existing values from the page or apply filler heuristics), then submit via `form.submit()` or click the submit button.
-
----
-
-### Issue #7: No Graceful Chrome Shutdown (🟡 Medium)
-
-**File:** `internal/crawler/crawler.go:1393-1396`
-
-**Problem:** `browserCancel` cancels the allocator context which kills Chrome, but the Go process for Chrome is never `Wait()`ed on. This leaves zombie processes that consume PID slots.
-
-**Fix:** Store Chrome's `*os.Process` and call `process.Wait()` during `Stop()`.
+**True verdict:** ✅ **Already implemented.** Documentation Bug #6 was a false positive.
 
 ---
 
-### Issue #8: Retry Classification Inconsistency (🟡 Medium)
+### Bug #7: Navigation Error Handling (🔴 Critical — Open)
 
-**Files:** `internal/crawler/crawler.go:1612-1620`, `internal/errors/retry.go`
+**File:** `internal/crawler/crawler.go:1692-1698`
 
-**Problem:** `doCrawl` has ad-hoc string matching for HTTP status codes in navigation errors, while `retry.go` has a proper retry classification system. They disagree on what's retryable. The string-based check at line 1614 treats 4xx as non-retryable but doesn't handle 5xx distinctly. The error classification system may classify the same error differently.
+**Problem:**
+```go
+_, _, errorText, err := page.Navigate(urlStr).Do(ctx)
+if err != nil {
+    return err                                          // OK
+}
+if errorText != "" {
+    return fmt.Errorf("navigation error: %w", fmt.Errorf("%s", errorText))  // Bug: wraps string as error
+}
+```
 
-**Fix:** Replace the string matching with a call to `crawlerrors.Classify()`.
+`errorText` from CDP is a string like `"net::ERR_NAME_NOT_RESOLVED"` or `"net::ERR_CONNECTION_TIMED_OUT"`. It gets wrapped as `fmt.Errorf("%s", errorText)` which creates a raw string error — not a classified `CrawlError`. This means the retry system at `crawler.go:1580` (`crawlerrors.Classify(lastErr)`) may fail to properly classify and retry navigation failures.
 
----
-
-### Issue #9: No Context Deadlines on Chromedp.Run (🟡 Medium)
-
-**Locations:** `crawler.go:1514,1596,1626,1677,1773,1991,2009,2025,2032,2040,2074,2081,2959,2960` and more
-
-**Problem:** Multiple `chromedp.Run(tabCtx, ...)` calls use `tabCtx` which has the page timeout, but some calls like `chromedp.Title`, `chromedp.OuterHTML`, `chromedp.Evaluate` may use contexts that are near expiry or already expired. These can hang indefinitely if the CDP connection is broken.
-
-**Fix:** Create a helper `c.shortContext(duration)` that returns a fresh context with timeout, and use it for all `chromedp.Run` calls.
-
----
-
-### Issue #10: Empty Error Handling (🟢 Low)
-
-**Locations:** Multiple across codebase
-
-**Problem:** Pattern `io.Copy(io.Discard, resp.Body)` silently swallows errors at many resource-download sites. `os.WriteFile(path, data, 0644)` errors ignored at lines 1589, 1808, 1827, 1837, 3056. These make debugging resource download failures impossible.
-
-**Fix:** Log errors at minimum. Better: aggregate and report at crawl end.
+**Fix:** Replace with `crawlerrors.Wrap(crawlerrors.KindBrowser, errorText, err)`.
 
 ---
 
-### Issue #11: No WebSocket Frame Size Limit (🟢 Low)
+### Bug #8: Content Hash LRU Eviction (🔴 Critical — Open)
 
-**File:** `internal/crawler/crawler.go:3231-3235`
+**File:** `internal/crawler/crawler.go:2156-2165`
 
-**Problem:** Binary WebSocket frames are stored with no size cap. A single large binary WS message (e.g., video stream) could OOM the process.
+**Problem:**
+```go
+hashStr := strconv.FormatUint(xxhash.Sum64(resource.Body), 36)
+added := c.contentHashes.AddIfAbsent(hashStr)
+if !added { continue }  // skip if already seen
+```
 
-**Fix:** Add configurable `MaxWSFrameSize` (default: 10MB), truncate or skip frames exceeding it.
+`contentHashes` is a 200k-entry LRU set. Once full, previously-evicted URLs' hashes will be seen as "new" again. This causes:
+1. Duplicate file saves
+2. Duplicate bandwidth
+3. Duplicate WARC records
+
+**Fix:** Use a larger persistent dedup set, or combine with bloom filter that never evicts.
 
 ---
 
-### Issue #12: No CSS @import Cycle Detection (🟢 Low)
+### Bug #9: CSS Font/Import Extraction Missing Dedup Add (🔴 Critical — Open)
 
-**File:** `internal/crawler/crawler.go:2246-2278`
+**File:** `internal/crawler/crawler.go:2239,2272`
 
-**Problem:** CSS @import resolution follows URLs and marks files as processed, but circular @import chains (A→B→C→A) could cause infinite loops in the recursive processing (`processCSSImports` in rewrite module).
+**Problem:**
+```go
+// Line 2239:
+if !c.bloomFilter.HasSeen(absFontURL) {     // Check only — no Add!
+    // ... download ...
+}
 
-**Fix:** Add visited URL set before processing CSS imports, skip already-visited URLs.
+// Line 2272:
+if !c.bloomFilter.HasSeen(absCSSURL) {      // Check only — no Add!
+    // ... download ...
+}
+```
+
+`HasSeen` is called but `Add` is NOT. Same URL can be processed twice if it appears in both font extraction AND CSS import extraction, or in consecutive pages.
+
+**Fix:** Add `c.bloomFilter.Add(absFontURL)` after the check.
 
 ---
 
-### Issue #13: Duplicate Dedup Logic (🟢 Low)
+### Issue #10: Tab Context Timeout Mid-Capture (🔴 Critical — Open)
 
-**File:** `internal/crawler/crawler.go:1855-1978`
+**File:** `internal/crawler/crawler.go:1597-1598,2019`
 
-**Problem:** The same 12-line URL dedup / queue push pattern is repeated verbatim 4+ times:
-- Links (line 1855-1882)
-- Iframe sources (line 1885-1924)
-- Media sources (line 1927-1963)
-- Poster URLs (line 1965-1975)
+**Problem:**
+```go
+tabCtx, tabCancel2 := context.WithTimeout(rawTabCtx, c.cfg.PageTimeout)
+// ... navigation takes time ...
+// ... then:
+func (c *Crawler) captureCurrentPage(tabCtx, rawTabCtx context.Context, ...) {
+    // Still using the same tabCtx that may be near/at timeout
+```
 
-Small variations make maintenance error-prone. Adding a new URL source type requires copying the same block again.
+If `doCrawl`'s navigation + waiting takes most of the page timeout, `captureCurrentPage` can timeout during capture, causing:
+- Partial HTML writes to filesystem
+- Missing assets
+- Incomplete WARC records
 
-**Fix:** Extract `shouldQueue(rawURL string) bool` method.
+**Fix:** Create a fresh sub-context for capture:
+```go
+captureCtx, captureCancel := context.WithTimeout(rawTabCtx, 30*time.Second)
+defer captureCancel()
+// use captureCtx for all capture operations
+```
+
+---
+
+### Issue #11: Chrome Zombie Processes (🟡 Medium — Open)
+
+**File:** `internal/browserpool/pool.go:219-227`
+
+**Problem:** `allocCancel()` only cancels the context — it does not SIGKILL or `Wait()` on the Chrome process. The Chrome `*os.Process` is never stored or waited on.
+
+**Impact:** Over long crawls with frequent restarts, zombie PIDs accumulate → PID exhaustion.
+
+---
+
+### Issue #12: Form Login Tab Context Leak (🟡 Medium — Open)
+
+**File:** `internal/auth/auth.go:74-76`
+
+**Problem:**
+```go
+am.formTabOnce.Do(func() {
+    am.formTabCtx, am.formTabCancel = chromedp.NewContext(ctx)
+})
+```
+
+`formTabCancel` is only called in `Close()` (line 309-312). The tab context lives for the entire crawl duration, consuming CDP resources.
+
+---
+
+### Issue #13: Provider API Mismatch in CAPTCHA Solver (🟡 Medium — Open)
+
+**File:** `internal/captcha/solver.go:115-129`
+
+**Problem:** Both 2Captcha and AntiCaptcha use `poll2Captcha` but their response formats differ:
+- 2Captcha: returns `status=completed` with `solution.text` or `solution.captchaIds`
+- AntiCaptcha: returns `status=ready` with `solution.text`
+
+The `poll2Captcha` method handles both but with fragile `map[string]interface{}` type assertions.
+
+---
+
+### Issue #14: `isAllowedDomain()` Port Handling (🟡 Medium — Open)
+
+**File:** `internal/crawler/crawler.go:3529-3540`
+
+**Problem:**
+```go
+func (c *Crawler) isAllowedDomain(rawURL string) bool {
+    host := getHost(rawURL)    // returns hostname without port
+    for _, domain := range c.cfg.AllowedDomains {
+        if host == domain || strings.HasSuffix(host, "."+domain) {
+            return true
+        }
+    }
+    return false
+}
+```
+
+`getHost()` uses `url.Parse().Hostname()` which strips port. If `AllowedDomains` contains `example.com` and the URL is `http://example.com:8080/page`, `host == "example.com"` matches correctly. This is actually **correct** — no port issue.
+
+**Verdict:** 🟢 **False alarm.** `Hostname()` strips port so matching works fine.
+
+---
+
+### Issue #15: No Canvas Fingerprint Mitigation (🟡 Medium — Open)
+
+**File:** `internal/jsengine/scripts.go`
+
+**Problem:** Canvas rendering can detect headless mode by comparing pixel data. Real GPUs produce slightly different renders than headless Chrome.
+
+**Fix:** Inject canvas noise:
+```javascript
+const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
+    const imageData = originalGetImageData.call(this, x, y, w, h);
+    // Add subtle noise to pixels
+    for (let i = 0; i < imageData.data.length; i += 4) {
+        imageData.data[i] = imageData.data[i] ^ 1;     // R
+        imageData.data[i + 1] = imageData.data[i + 1] ^ 1;  // G
+        imageData.data[i + 2] = imageData.data[i + 2] ^ 1;  // B
+    }
+    return imageData;
+};
+```
+
+---
+
+### Issue #16: `doCrawl` Navigation Error Not Classified (🟡 Medium — Open)
+
+**File:** `internal/crawler/crawler.go:1697-1698`
+
+**Problem:**
+```go
+if errorText != "" {
+    return fmt.Errorf("navigation error: %w", fmt.Errorf("%s", errorText))
+```
+
+This wraps a raw string as an error instead of using `crawlerrors.Classify()` or `crawlerrors.Wrap()`. The retry system at `crawler.go:1580` (`crawlerrors.Classify(lastErr)`) may not properly detect retryable navigation failures.
+
+**Fix:** `return crawlerrors.Wrap(crawlerrors.KindBrowser, "navigation failed", fmt.Errorf("%s", errorText))`
+
+---
+
+### Issue #17: Empty Error Handling Pattern (🟢 Low — Open)
+
+**Locations:** ~15 locations across `crawler.go`
+
+**Pattern:**
+```go
+io.Copy(io.Discard, resp.Body)
+resp.Body.Close()
+```
+
+These silently swallow read errors. Found at lines: 2245, 2260, 2278, 2293, 3451, 3474, 3479, 3487.
+
+**Fix:** Log errors at minimum.
+
+---
+
+### Issue #18: SPA Route Discovery Sequential (🟡 Medium — Open)
+
+**File:** `internal/crawler/crawler.go:1770-1853`
+
+**Problem:** All SPA routes are navigated sequentially in the same tab. 50 routes × 2s each = 100s for SPA discovery.
 
 ---
 
 ## 20. Missing Features
 
-### Remaining Missing Features
+### Missing World-Class Features (Priority-Ordered)
 
-| # | Feature | Why | Priority |
-|---|---|---|---|
-| 28 | SPA data store capture (Redux/Vuex) | Critical app state not in DOM | Medium |
-| 29 | OAuth token refresh | Token expires but refresh_token stored but unused | Low |
-| 30 | Tab pool | Deferred - browser pool handles parallelism | Low |
-| 31 | Plugin/behavior system | Extensible JS behaviors | Niche |
-| 32 | Screencasting | Live browser view via WebSocket | Niche |
-| 33 | LLM-optimized (markdown) output | AI-ready content extraction | Niche |
-| 34 | Social media behaviors | Twitter/Instagram/TikTok specific patterns | Niche |
-| 35 | Performance budgets | Lighthouse integration | Niche |
-| 36 | Git-native storage | Version-controlled archiving | Niche |
-| 37 | WebRTC stream capture | Real-time communication archiving | Niche |
-| 38 | HTTP/3 + QUIC support | Non-browser downloads | Niche |
-| 39 | Mobile emulation | Device metrics, touch events | Niche |
-| 40 | CAPTCHA via ML | Bypass external API services | Niche |
-| 41 | Distributed coordination | Leader election, work stealing | Niche |
-| 42 | Prometheus metrics | OpenTelemetry integration | Niche |
-| 43 | Playwright backend | Alternative to chromedp | Niche |
-| 44 | Accessibility capture | ARIA tree, focus order | Niche |
-| 45 | Multi-language extraction | OCR, subtitle extraction | Niche |
-
-### Niche / Future Missing Features
-
-| # | Feature |
-|---|---|
-| 31 | Plugin/behavior system (extensible JS behaviors) |
-| 32 | Screencasting (live browser view via WebSocket) |
-| 33 | LLM-optimized (markdown) output |
-| 34 | Social media behaviors (Twitter scroll, Instagram load-more, TikTok) |
-| 35 | Performance budgets (Lighthouse integration) |
-| 36 | Git-native storage (version-controlled archiving) |
-| 37 | WebRTC stream capture |
-| 38 | HTTP/3 + QUIC support for non-browser downloads |
-| 39 | Mobile emulation (device metrics, touch events) |
-| 40 | CAPTCHA solving via ML (bypass external API) |
-| 41 | Distributed worker coordination (leader election, work stealing) |
-| 42 | Prometheus / OpenTelemetry metrics |
-| 43 | Playwright integration as alternative browser backend |
-| 44 | Accessibility capture (ARIA tree, focus order) |
-| 45 | Multi-language extraction (OCR, subtitle extraction) |
+| # | Feature | Priority | Complexity | User Value | Architectural Impact |
+|---|---|---|---|---|---|
+| M1 | **Distributed worker coordination** | 🔴 P0 | High | High — enables horizontal scaling | New: `internal/coordinator/` |
+| M2 | **Prometheus / OpenTelemetry metrics** | 🔴 P0 | Low | High — production observability | Extend: `util/metrics.go` |
+| M3 | **Plugin/extension system (WASM)** | 🔴 P0 | High | High — extensibility | New: `internal/plugin/`, `internal/sdk/` |
+| M4 | **Helm chart + K8s deployment** | 🟡 P1 | Medium | Medium — cloud-native | New: `deploy/helm/` |
+| M5 | **Canvas/font/WebRTC anti-fingerprinting** | 🟡 P1 | Low | Medium — anti-detection | Extend: `jsengine/scripts.go` |
+| M6 | **OAuth token refresh** | 🟡 P1 | Low | Low — token lifecycle | Fix: `auth/auth.go:184-266` |
+| M7 | **Mobile emulation** | 🟡 P1 | Low | Medium — mobile site support | Extend: `config/` → CDP params |
+| M8 | **HAR standard export fix** | 🟡 P1 | Low | Medium — spec compliance | Fix: `crawler.go:932-1045` |
+| M9 | **Tab pool (context reuse)** | 🟡 P1 | Low | Low — CPU saving | New: `internal/tabpool/` |
+| M10 | **LLM-optimized Markdown output** | 🟡 P2 | Medium | High — AI-ready content | New: `internal/markdown/` |
+| M11 | **Git-native storage backend** | 🟡 P2 | Medium | Medium — versioned archives | New: `internal/gitstore/` |
+| M12 | **Playwright/Puppeteer backend** | 🟡 P2 | High | Medium — alternative engines | New: `internal/playwright/` |
+| M13 | **ML-based CAPTCHA solving** | 🟢 P3 | High | Medium — no external API costs | Extend: `captcha/solver.go` |
+| M14 | **WebRTC stream capture** | 🟢 P3 | High | Low — real-time comms archiving | Extend: `network/interceptor.go` |
+| M15 | **Screencasting (live browser view)** | 🟢 P3 | Medium | Low — debugging | New: `internal/screencast/` |
+| M16 | **Accessibility tree capture** | 🟢 P3 | Low | Low — a11y archiving | New: `internal/a11y/` |
+| M17 | **HTTP/3 + QUIC downloads** | 🟢 P3 | High | Low — faster non-browser downloads | Extend: `httpclient/` |
+| M18 | **SPA data store capture (Redux/Vuex)** | 🟢 P3 | Medium | Medium — app state archiving | Extend: `jsengine/` |
+| M19 | **Multi-language extraction (OCR)** | 🟢 P3 | High | Low — subtitle extraction | New: `internal/extract/` |
 
 ---
 
-## 21. Phase Plan
+## 21. Transformation Roadmap
 
-### Phase 0 — Fix Critical Bugs (P0) — ✅ COMPLETED
+### Stage 1: Foundation (Immediate)
 
-| # | Item | Effort | Status |
+| # | Item | Effort | Verification |
 |---|---|---|---|
-| 1 | Fix WARC `curSize` tracking | ~1h | ✅ Done |
-| 2 | Fix checkpoint race condition | ~1h | ✅ Done |
-| 3 | Fix browser restart deadlock | ~1h | ✅ Done |
-| 6 | Fix `interactWithForm` no-op | ~2h | ✅ Done |
-| 5 | Fix cookie domain matching | ~30m | ✅ Done |
-| 7 | Add graceful Chrome shutdown | ~1h | ✅ Done |
+| 1.1 | Fix Bug B1: Navigation error → `CrawlError` | ~30m | `go test ./...` |
+| 1.2 | Fix Bug B2: Capture sub-context timeout | ~30m | Captures survive timeout |
+| 1.3 | Fix Bug B3: Content hash LRU → larger/bloom | ~1h | No duplicate dedup |
+| 1.4 | Fix Bug B4: CSS extraction bloom Add | ~15m | No duplicate downloads |
+| 1.5 | Fix Bug B5: Checkpoint queue lock | ~1h | Race detector clean |
+| 1.6 | Fix Bug B7: Form tab context leak | ~15m | Context released on close |
+| 1.7 | Fix Bug B8: CAPTCHA provider API | ~1h | 2Captcha/AntiCaptcha both work |
+| 1.8 | Fix Bug B9: Zombie Chrome Wait() | ~30m | No zombie processes |
+| 1.9 | Update features.md (this document) | ✅ Done | Accurate, verified |
 
-### Phase 1 — Core Reliability (P1) — ✅ COMPLETED
+### Stage 2: Code Quality (Week 1)
 
-| # | Item | Effort | Status |
-|---|---|---|---|
-| 14 | Multi-browser pool | ~5h | ✅ Done |
-| 13 | Dedup DRY refactor | ~30m | ✅ Done |
-| 8 | Fix retry classification inconsistency | ~30m | ✅ Done |
-| 9 | Add context deadlines to CDP calls | ~1h | ✅ Done |
-| 12 | Add CSS @import cycle detection | ~15m | ✅ Done |
-| 10 | Error handling cleanup | ~1h | ✅ Done |
-| 11 | WS frame size limit | ~30m | ✅ Done |
+| # | Item | Effort |
+|---|---|---|
+| 2.1 | Add doc comments to all exported symbols | ~2h |
+| 2.2 | Fix all 15 swallowed-error locations | ~1h |
+| 2.3 | Replace `0644` with `0600` for sensitive files | ~30m |
+| 2.4 | Add sentinel error types in `errors/crawl.go` | ~1h |
+| 2.5 | Add canvas/font/WebRTC anti-fingerprinting | ~2h |
 
-### Phase 2 — Feature Completeness (P2) — ✅ COMPLETED
+### Stage 3: Architecture & Features (Week 2-3)
 
-| # | Item | Effort | Status |
-|---|---|---|---|
-| 15 | WACZ output | ~5h | ✅ Done |
-| 17 | Configurable Chrome flags | ~30m | ✅ Done |
-| 18 | Remote Chrome connection | ~1h | ✅ Done |
-| 21 | Network request blocking | ~2h | ✅ Done |
-| 4 | Queue pointer aliasing fix | ~1h | ✅ Done |
-| 16 | Browser profiles | ~2h | ✅ Done |
+| # | Item | Effort |
+|---|---|---|
+| 3.1 | Refactor `crawler.go` → same-package multi-file split | ~4h |
+| 3.2 | Prometheus metrics integration | ~2h |
+| 3.3 | Plugin system (WASM-based) | ~8h |
+| 3.4 | OAuth token refresh flow | ~1h |
+| 3.5 | Mobile emulation support | ~1h |
 
-### Phase 3 — Operational Maturity (P3) — ✅ COMPLETED
+### Stage 4: Infrastructure (Week 4)
 
-| # | Item | Effort | Status |
-|---|---|---|---|
-| 20 | Enhanced stealth (canvas/WebRTC/font) | ~3h | ✅ Done |
-| 27 | Context-aware form filling | ~2h | ✅ Done |
-| 28 | Tab pool | ~2h | 🟡 Deferred (browser pool covers need) |
+| # | Item | Effort |
+|---|---|---|
+| 4.1 | Distributed worker coordination (Go-only libs) | ~8h |
+| 4.2 | Helm chart | ~3h |
+| 4.3 | Mock-based integration tests (80%+ coverage) | ~8h |
+| 4.4 | Create ARCHITECTURE.md, SECURITY.md, TESTING.md | ~3h |
 
-### Phase 4 — Infrastructure (P4) — ✅ COMPLETED
+### Stage 5: Optimization (Week 5+)
 
-| # | Item | Effort | Status |
-|---|---|---|---|
-| 19 | Docker support | ~3h | ✅ Done |
-| 22 | Minimal Web UI | ~4h | ✅ Done |
-| 23 | REST API | ~4h | ✅ Done |
-| 24 | Crawl scheduling (cron) | ~3h | ✅ Done |
-| 25 | Notifications (webhook/Slack/email) | ~3h | ✅ Done |
-| 28 | Tab pool | ~2h | 🟡 Deferred (browser pool makes this lower priority) |
-
-**Remaining:** Tab pool (low priority)
-
-### Phase 3 — Operational Maturity (P3)
-
-| # | Item | Effort | Dependencies |
-|---|---|---|---|
-| 19 | Docker support | ~3h | None |
-| 16 | Browser profiles | ~2h | Phase 1 (multi-browser pool) |
-| 22 | Minimal Web UI | ~4h | Phase 1 |
-| 20 | Enhanced stealth | ~3h | None |
-| 27 | Context-aware form filling | ~2h | Phase 0 form fix |
-| 28 | Tab pool | ~2h | Phase 1 |
-
-**Total:** ~16 hours
-
-### Phase 4 — Premium / Niche (P4+)
-
-Items 23-45 as time/resources allow.
+| # | Item | Effort |
+|---|---|---|
+| 5.1 | Performance benchmarks (throughput, memory) | ~3h |
+| 5.2 | Fuzz testing (URL parser, HTML rewriter, CSS) | ~2h |
+| 5.3 | LLM Markdown output | ~4h |
+| 5.4 | ADRs for all major decisions | ~2h |
+| 5.5 | HAR standard export fix | ~2h |
 
 ---
 
-## Appendix: File Reference
+## Appendix: Complete File Reference
 
 ```
-cmd/clone/main.go         — CLI entry, cobra commands, serve subcommand
+cmd/clone/main.go                     CLI entry, cobra commands, serve subcommand (353 lines)
 internal/
-  api/api.go              — REST API server (start, stop, status, pause, resume)
-  auth/auth.go            — Authentication manager (form, basic, header, oauth)
-  browserpool/pool.go     — Multi-browser process pool (N Chrome, health checks, auto-restart)
-  captcha/solver.go       — CAPTCHA solving (2captcha, anticaptcha, capmonster)
-  config/config.go        — Configuration struct, validation, defaults
-  crawler/
-    crawler.go            — Core crawler (~3850 lines), all browser interactions
-    redirect.go           — HTTP redirect handling
-    retry.go              — Retry configuration
-  errors/
-    errors.go             — Error classification (14 kinds)
-    retry.go              — Retry classification
-  httpclient/
-    client.go             — HTTP client pool
-  jsanalyzer/
-    analyzer.go           — JS dependency URL extraction (import, require, webpack, etc.)
-  jsengine/
-    intercept.go          — JSON extraction from page
-    scripts.go            — All JS injection scripts (~1150 lines), including enhanced stealth
-    scroll.go             — Infinite scroll implementation
-    serviceworker.go      — Service worker manager
-    wait.go               — Wait strategies
-    websocket.go          — Service worker + websocket helpers
-  network/
-    interceptor.go        — CDP network interception (~606 lines)
-  notify/notify.go        — Notifications (webhook, Slack, SMTP email)
-  pool/
-    bufferpool.go         — Buffer pool for panic recovery
-  queue/
-    interface.go          — Queue interface
-    local.go              — In-memory + persistent queue
-    redis.go              — Redis queue backend
-    postgres.go           — PostgreSQL queue backend
-    kafka.go              — Kafka queue backend
-    bloom.go              — Bloom filter dedup
-    heap.go               — Priority heap implementation
-    checkpoint.go         — Checkpoint save/load
-  ratelimit/
-    ratelimit.go           — Per-host token bucket rate limiter
-  resilience/
-    circuitbreaker.go     — Per-host circuit breaker (3-state)
-  rewrite/
-    html.go               — HTML/CSS URL rewriter (~1151 lines)
-  robots/
-    robots.go             — robots.txt parser
-  scheduler/scheduler.go  — Cron-based crawl scheduler
-  storage/
-    filesystem.go         — Filesystem output writer
-    warc.go               — WARC archive writer
-    wacz.go               — WACZ packaged archive writer
-    resource_cache.go     — Incremental crawl cache
-  sync/
-  util/
-    metrics.go            — Atomic metrics counters (pages, assets, errors, bytes)
-    lru.go                — LRU set for deduplication
-    memory.go             — Memory budget tracker
-    cdp.go                — CDP helper utilities
-    logger.go             — Structured logging (zap)
-  webui/webui.go          — Real-time crawl dashboard (HTML + JSON API)
+  api/api.go                          REST API server (start, stop, status) (144 lines)
+  auth/auth.go                        Authentication manager (313 lines)
+  browserpool/pool.go                 Multi-browser process pool (230 lines)
+  captcha/solver.go                   CAPTCHA solving (347 lines)
+  changedetection/detector.go         Snapshot diff across crawls (291 lines)
+  config/config.go                    Configuration struct, validation, defaults (384 lines)
+  config/constants.go                 Shared constants (21 lines)
+  crawler/crawler.go                  Core crawler (3843 lines) — ALL browser interactions
+  crawler/checkpoint.go               Checkpoint save/load (gob encoding)
+  crawler/retry.go                    Retry configuration
+  errors/crawl.go                     Error classification (186 lines)
+  httpclient/clientpool.go            Shared HTTP client pool (124 lines)
+  jsanalyzer/analyzer.go              JS dependency URL extraction (229 lines)
+  jsengine/scripts.go                 All JS injection scripts (1152 lines)
+  jsengine/scroll.go                  Infinite scroll logic
+  jsengine/wait.go                    Wait strategies
+  jsengine/websocket.go               WebSocket capture + SW helpers
+  jsengine/serviceworker.go           Service worker detection
+  jsengine/intercept.go               JSON extraction from page
+  network/interceptor.go              CDP network interception (606 lines)
+  notify/notify.go                    Notifications (webhook, Slack, SMTP) (158 lines)
+  pool/objectpool.go                  Buffer pools (4K/64K/1M bytes, strings, maps) (153 lines)
+  queue/queue.go                      Priority queue + Queue interface (189 lines)
+  queue/redis.go                      Redis queue backend (192 lines)
+  queue/postgres.go                   PostgreSQL queue backend (200 lines)
+  queue/kafka.go                      Kafka queue backend (242 lines)
+  queue/persistent.go                 File-backed persistent queue (82 lines)
+  queue/bloom.go                      Bloom filter dedup
+  queue/factory.go                    Queue factory from config (37 lines)
+  queue/normalize.go                  URL normalization
+  ratelimit/limiter.go                Per-host token-bucket rate limiter
+  resilience/circuitbreaker.go        Per-host 3-state circuit breaker
+  rewrite/html.go                     HTML/CSS URL rewriter (1151 lines)
+  robots/robots.go                    robots.txt parser (376 lines)
+  scheduler/scheduler.go              Cron-based crawl scheduler (189 lines)
+  storage/filesystem.go               Filesystem output writer (253 lines)
+  storage/warc.go                     WARC archive writer (231 lines)
+  storage/wacz.go                     WACZ packaged archive writer (250 lines)
+  storage/incremental.go              Incremental crawl cache (ETag/Last-Modified)
+  sync/sharded.go                     Sharded concurrent map (generics) (143 lines)
+  util/metrics.go                     Atomic metrics counters (32 lines)
+  util/lru.go                         LRU set + BoundedQueue (179 lines)
+  util/memory.go                      Memory budget tracker (61 lines)
+  util/cdp.go                         CDP cookie conversion (24 lines)
+  util/logger.go                      Structured logging (zap) (67 lines)
+  webui/webui.go                      Real-time crawl dashboard (123 lines)
 ```

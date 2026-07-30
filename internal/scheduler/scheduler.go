@@ -68,6 +68,7 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 	if err != nil {
 		return
 	}
+	running := false
 	for {
 		now := time.Now()
 		nextRun := next(now)
@@ -81,16 +82,34 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 
 		timer := time.NewTimer(dur)
 		s.mu.Lock()
+		idx := len(s.timers)
 		s.timers = append(s.timers, timer)
 		s.mu.Unlock()
 
 		select {
 		case <-timer.C:
-			if err := job.RunFunc(ctx); err != nil {
-				// Log error (caller handles logging)
+			s.mu.Lock()
+			// Remove timer from slice
+			if idx < len(s.timers) && s.timers[idx] == timer {
+				s.timers = append(s.timers[:idx], s.timers[idx+1:]...)
 			}
+			s.mu.Unlock()
+
+			if running {
+				continue
+			}
+			running = true
+			func() {
+				defer func() { running = false }()
+				job.RunFunc(ctx)
+			}()
 		case <-ctx.Done():
 			timer.Stop()
+			s.mu.Lock()
+			if idx < len(s.timers) && s.timers[idx] == timer {
+				s.timers = append(s.timers[:idx], s.timers[idx+1:]...)
+			}
+			s.mu.Unlock()
 			return
 		}
 	}

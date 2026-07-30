@@ -218,7 +218,9 @@ func runClone(cmd *cobra.Command, args []string) error {
 	cfg.MaxDepth = maxDepth
 	cfg.MaxConcurrentPages = concurrency
 	cfg.OutputDir = output
-	cfg.EnableScreenshot = screenshot
+	if cmd.Flags().Changed("screenshot") {
+		cfg.EnableScreenshot = screenshot
+	}
 	cfg.EnablePDF = pdf
 	cfg.Proxy = proxy
 	cfg.PageTimeout = timeout
@@ -291,7 +293,7 @@ func runClone(cmd *cobra.Command, args []string) error {
 		n = notify.New(&notify.Config{
 			WebhookURL: cfg.WebhookURL,
 			SlackURL:   cfg.SlackURL,
-			SMTP:       (*notify.SMTPConfig)(cfg.SMTPConfig),
+			SMTP:       cfg.SMTPConfig,
 		})
 		n.Send(notify.Notification{Title: "Crawl Started", Message: "Crawl has been initialized.", Level: "info"})
 	}

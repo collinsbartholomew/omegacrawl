@@ -4,28 +4,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type CrawlStatus struct {
-	Running       bool   `json:"running"`
-	PagesFetched  int64  `json:"pages_fetched"`
-	AssetsSaved   int64  `json:"assets_saved"`
-	Errors        int64  `json:"errors"`
-	BytesTotal    int64  `json:"bytes_total"`
-	QueueSize     int    `json:"queue_size"`
-	Elapsed       string `json:"elapsed"`
-	CurrentURL    string `json:"current_url,omitempty"`
-	SeedURLs      int    `json:"seed_urls"`
+	Running      bool   `json:"running"`
+	PagesFetched int64  `json:"pages_fetched"`
+	AssetsSaved  int64  `json:"assets_saved"`
+	Errors       int64  `json:"errors"`
+	BytesTotal   int64  `json:"bytes_total"`
+	QueueSize    int    `json:"queue_size"`
+	Elapsed      string `json:"elapsed"`
+	CurrentURL   string `json:"current_url,omitempty"`
+	SeedURLs     int    `json:"seed_urls"`
 }
 
 type CrawlControl interface {
 	Status() CrawlStatus
 	Start(seeds []string) error
 	Stop()
-	Pause()
-	Resume()
 }
 
 type Server struct {
@@ -33,6 +32,8 @@ type Server struct {
 	server  *http.Server
 	start   time.Time
 	running atomic.Bool
+	mu      sync.Mutex
+	active  bool
 }
 
 func New(ctl CrawlControl) *Server {
@@ -47,8 +48,6 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/start", s.handleStart)
 	mux.HandleFunc("/api/stop", s.handleStop)
-	mux.HandleFunc("/api/pause", s.handlePause)
-	mux.HandleFunc("/api/resume", s.handleResume)
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
@@ -85,6 +84,10 @@ func (s *Server) json(w http.ResponseWriter, data interface{}) {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	status := s.ctl.Status()
 	status.Elapsed = time.Since(s.start).Round(time.Second).String()
 	s.json(w, status)
@@ -105,25 +108,37 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "seeds required", http.StatusBadRequest)
 		return
 	}
-	if err := s.ctl.Start(req.Seeds); err != nil {
-		s.json(w, map[string]string{"error": err.Error()})
+
+	s.mu.Lock()
+	if s.active {
+		s.mu.Unlock()
+		http.Error(w, "crawl already running", http.StatusConflict)
 		return
 	}
+	s.active = true
+	s.mu.Unlock()
 	s.start = time.Now()
 	s.json(w, map[string]string{"status": "started"})
+
+	// Run crawl asynchronously
+	go func() {
+		if err := s.ctl.Start(req.Seeds); err != nil {
+			// Error logged by crawler
+		}
+		s.mu.Lock()
+		s.active = false
+		s.mu.Unlock()
+	}()
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	s.ctl.Stop()
+	s.mu.Lock()
+	s.active = false
+	s.mu.Unlock()
 	s.json(w, map[string]string{"status": "stopped"})
-}
-
-func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
-	s.ctl.Pause()
-	s.json(w, map[string]string{"status": "paused"})
-}
-
-func (s *Server) handleResume(w http.ResponseWriter, r *http.Request) {
-	s.ctl.Resume()
-	s.json(w, map[string]string{"status": "resumed"})
 }

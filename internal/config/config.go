@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/user/clone/internal/notify"
 )
 
 type Config struct {
@@ -79,7 +81,7 @@ type Config struct {
 	APIPort             int                   `json:"api_port"`              // REST API port (0 = disabled)
 	WebhookURL          string                `json:"webhook_url"`           // notification webhook URL
 	SlackURL            string                `json:"slack_url"`             // Slack webhook URL
-	SMTPConfig          *SMTPConfig           `json:"smtp"`                  // email notification config
+	SMTPConfig          *notify.SMTPConfig    `json:"smtp"`                  // email notification config
 	ScheduleCron        string                `json:"schedule_cron"`         // cron expression for scheduled crawls
 	ScheduleTimezone    string                `json:"schedule_timezone"`     // timezone for scheduler (default "UTC")
 	EnableAPICapture bool `json:"enable_api_capture"`
@@ -165,15 +167,6 @@ type InfiniteScrollConfig struct {
 	LoadMoreSelector string        `json:"load_more_selector"`
 	ScrollDelay      time.Duration `json:"scroll_delay"`
 	ScrollDistance    int           `json:"scroll_distance"`
-}
-
-type SMTPConfig struct {
-	Host string   `json:"host"`
-	Port int      `json:"port"`
-	User string   `json:"user"`
-	Pass string   `json:"pass"`
-	From string   `json:"from"`
-	To   []string `json:"to"`
 }
 
 type Cookie struct {

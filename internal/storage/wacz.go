@@ -21,6 +21,7 @@ type WACZWriter struct {
 	outputName string
 	mu         sync.Mutex
 	records    []*WARCRecord
+	offsets    []int64
 	buf        bytes.Buffer
 	gzipW      *gzip.Writer
 	seqNum     int
@@ -58,11 +59,13 @@ func (w *WACZWriter) WriteRecord(rec *WARCRecord) error {
 	if w.gzipW == nil {
 		w.gzipW = gzip.NewWriter(&w.buf)
 	}
+	offset := int64(w.buf.Len())
 	if err := w.writeWARCRecord(rec); err != nil {
 		return err
 	}
 
 	w.records = append(w.records, rec)
+	w.offsets = append(w.offsets, offset)
 
 	w.curSize += rec.ContentLen
 	if w.curSize >= w.maxSize {
@@ -202,26 +205,32 @@ func (w *WACZWriter) Close() error {
 }
 
 func (w *WACZWriter) buildCDXIndex(warcName string) ([]byte, error) {
-	sorted := make([]*WARCRecord, len(w.records))
-	copy(sorted, w.records)
-	sort.Slice(sorted, func(i, j int) bool {
-		if sorted[i].URL == sorted[j].URL {
-			return sorted[i].Date.Before(sorted[j].Date)
+	type recWithOffset struct {
+		rec    *WARCRecord
+		offset int64
+	}
+	combined := make([]recWithOffset, len(w.records))
+	for i := range w.records {
+		combined[i] = recWithOffset{rec: w.records[i], offset: w.offsets[i]}
+	}
+	sort.Slice(combined, func(i, j int) bool {
+		if combined[i].rec.URL == combined[j].rec.URL {
+			return combined[i].rec.Date.Before(combined[j].rec.Date)
 		}
-		return sorted[i].URL < sorted[j].URL
+		return combined[i].rec.URL < combined[j].rec.URL
 	})
 
 	var b bytes.Buffer
 	b.WriteString(" CDX a b a m s k r S v g M V U\r\n")
-	for i, rec := range sorted {
+	for _, ro := range combined {
+		rec := ro.rec
 		dateStr := rec.Date.UTC().Format("20060102150405")
 		digest := sha1.Sum(rec.Body)
 		digestStr := base32.StdEncoding.EncodeToString(digest[:])
-		offset := int64(i) * 512
 
 		fields := []string{
 			warcName,
-			fmt.Sprintf("%d", offset),
+			fmt.Sprintf("%d", ro.offset),
 			"",
 			"",
 			dateStr,

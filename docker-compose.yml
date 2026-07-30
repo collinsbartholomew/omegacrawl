@@ -27,4 +27,4 @@ services:
       - --output-dir=/data/output
       - --max-concurrent=10
       - --browser-pool-size=3
-      - ${SEEDS:-https://example.com}
+      - "${SEEDS:-https://example.com}"

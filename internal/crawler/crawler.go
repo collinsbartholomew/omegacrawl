@@ -182,6 +182,7 @@ type Crawler struct {
 	routeMu            sync.RWMutex
 	totalURLs          atomic.Int64
 	checkpointDone     chan struct{}
+	checkpointMu       sync.Mutex
 	shutdown           atomic.Bool
 
 	browserCtx         context.Context
@@ -360,14 +361,6 @@ func (c *Crawler) Stop() {
 	}
 }
 
-func (c *Crawler) Pause() {
-	c.shutdown.Store(true)
-}
-
-func (c *Crawler) Resume() {
-	c.shutdown.Store(false)
-}
-
 func (c *Crawler) Status() api.CrawlStatus {
 	pages, assets, errors, bytes := c.metrics.Snapshot()
 	return api.CrawlStatus{
@@ -377,7 +370,7 @@ func (c *Crawler) Status() api.CrawlStatus {
 		BytesTotal:   bytes,
 		QueueSize:    c.urlQueue.Size(),
 		Running:      !c.shutdown.Load(),
-		SeedURLs:     c.urlQueue.Size(),
+		SeedURLs:     len(c.cfg.Seeds),
 	}
 }
 
@@ -526,7 +519,9 @@ func (c *Crawler) Start(seeds []string) error {
 			c.closeWriters()
 			return fmt.Errorf("failed to acquire browser for login: %w", err)
 		}
-		if err := chromedp.Run(loginTabCtx, chromedp.Navigate(c.cfg.AuthConfig.LoginURL)); err != nil {
+		loginCtx, loginTimeoutCancel := context.WithTimeout(loginTabCtx, 30*time.Second)
+		defer loginTimeoutCancel()
+		if err := chromedp.Run(loginCtx, chromedp.Navigate(c.cfg.AuthConfig.LoginURL)); err != nil {
 			loginTabRelease()
 			c.closeWriters()
 			return fmt.Errorf("failed to navigate to login URL: %w", err)
@@ -1462,6 +1457,8 @@ func jsonHeadrs(h map[string]string) string {
 }
 
 func (c *Crawler) saveCheckpoint() {
+	c.checkpointMu.Lock()
+	defer c.checkpointMu.Unlock()
 	c.hostMu.RLock()
 	hlc := make(map[string]time.Time, len(c.hostLastCrawl))
 	for k, v := range c.hostLastCrawl {
@@ -1493,7 +1490,9 @@ func (c *Crawler) launchBrowser() error {
 		allocCtx, allocCancel = chromedp.NewRemoteAllocator(c.ctx, c.cfg.RemoteChromeURL)
 		browserCtx, browserCancel = chromedp.NewContext(allocCtx)
 
-		if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
+		navCtx, navCancel := context.WithTimeout(browserCtx, 30*time.Second)
+		defer navCancel()
+		if err := chromedp.Run(navCtx, chromedp.Navigate("about:blank")); err != nil {
 			allocCancel()
 			browserCancel()
 			return fmt.Errorf("remote browser connection failed: %w", err)
@@ -1502,7 +1501,9 @@ func (c *Crawler) launchBrowser() error {
 		allocCtx, allocCancel = chromedp.NewExecAllocator(c.ctx, c.allocOpts...)
 		browserCtx, browserCancel = chromedp.NewContext(allocCtx)
 
-		if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
+		navCtx, navCancel := context.WithTimeout(browserCtx, 30*time.Second)
+		defer navCancel()
+		if err := chromedp.Run(navCtx, chromedp.Navigate("about:blank")); err != nil {
 			allocCancel()
 			browserCancel()
 			return fmt.Errorf("browser launch failed: %w", err)
@@ -1530,44 +1531,6 @@ func (c *Crawler) getBrowserCtx() context.Context {
 	c.browserMu.Lock()
 	defer c.browserMu.Unlock()
 	return c.browserCtx
-}
-
-func (c *Crawler) restartBrowser() context.Context {
-	// Create allocator with timeout to prevent indefinite blocking
-	restartCtx, restartCancel := context.WithTimeout(c.ctx, 30*time.Second)
-	defer restartCancel()
-
-	c.browserMu.Lock()
-	if c.browserCancel != nil {
-		c.browserCancel()
-	}
-
-	allocCtx, allocCancel := chromedp.NewExecAllocator(restartCtx, c.allocOpts...)
-	browserCtx, browserCancel := chromedp.NewContext(allocCtx)
-
-	if err := chromedp.Run(browserCtx, chromedp.Navigate("about:blank")); err != nil {
-		c.browserMu.Unlock()
-		allocCancel()
-		browserCancel()
-		util.LogError("browser restart failed", err)
-		return nil
-	}
-
-	c.browserCtx = browserCtx
-	c.browserCancel = func() {
-		allocCancel()
-		browserCancel()
-		// Wait for Chrome to exit gracefully (up to 5 seconds)
-		waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer waitCancel()
-		select {
-		case <-allocCtx.Done():
-		case <-waitCtx.Done():
-		}
-	}
-	c.browserMu.Unlock()
-	util.LogInfo("browser restarted successfully")
-	return browserCtx
 }
 
 func (c *Crawler) crawlPage(ctx context.Context, urlStr string, depth int) {
@@ -1732,7 +1695,7 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 			return err
 		}
 		if errorText != "" {
-			return fmt.Errorf("navigation error: %w", fmt.Errorf("%s", errorText))
+			return fmt.Errorf("navigation error: %s", errorText)
 		}
 		return nil
 	}))
@@ -1959,7 +1922,9 @@ func (c *Crawler) doCrawl(browserCtx context.Context, urlStr string, depth int) 
 		if err == nil && singleFile != "" {
 			singleFilePath := c.cfg.OutputDir + "/" + getHost(urlStr) + "/singlefile.html"
 			os.MkdirAll(filepath.Dir(singleFilePath), 0755)
-			os.WriteFile(singleFilePath, []byte(singleFile), 0644)
+	if err := os.WriteFile(singleFilePath, []byte(singleFile), 0644); err != nil {
+			util.LogError("failed to save single file", err)
+		}
 		}
 	}
 
@@ -3197,7 +3162,9 @@ func (c *Crawler) saveCookieJar() {
 	}
 	path := filepath.Join(c.cfg.OutputDir, cookieJarFile)
 	os.MkdirAll(c.cfg.OutputDir, 0755)
-	os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		util.LogError("failed to save cookie jar", err)
+	}
 }
 
 func (c *Crawler) periodicCookieSave() {
