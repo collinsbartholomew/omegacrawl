@@ -7,6 +7,7 @@ import (
 	"sync"
 )
 
+// PersistentQueue is a PriorityQueue that can be persisted to and restored from a JSON file.
 type PersistentQueue struct {
 	PriorityQueue
 	filePath string
@@ -14,6 +15,8 @@ type PersistentQueue struct {
 	saveMu   sync.Mutex
 }
 
+// NewPersistentQueue creates a PersistentQueue with the given filePath and maxSize,
+// restoring prior state from filePath if present.
 func NewPersistentQueue(filePath string, maxSize int) *PersistentQueue {
 	pq := &PersistentQueue{
 		PriorityQueue: PriorityQueue{
@@ -47,10 +50,12 @@ func NewPersistentQueue(filePath string, maxSize int) *PersistentQueue {
 	return pq
 }
 
+// Close is a no-op for PersistentQueue.
 func (q *PersistentQueue) Close() error {
 	return nil
 }
 
+// Save writes the queue items and seen set to the configured file path.
 func (q *PersistentQueue) Save() error {
 	if q.filePath == "" {
 		return nil

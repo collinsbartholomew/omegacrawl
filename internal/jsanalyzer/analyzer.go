@@ -5,30 +5,32 @@ import (
 	"strings"
 )
 
+// AnalyzedURL pairs an extracted URL with the pattern type that produced it.
 type AnalyzedURL struct {
 	URL  string
 	Type string
 }
 
 var (
-	dynamicImportRegex    = regexp.MustCompile(`import\s*\(\s*["']([^"']+)["']\s*\)`)
-	requireRegex          = regexp.MustCompile(`require\s*\(\s*["']([^"']+)["']\s*\)`)
-	fetchRegex            = regexp.MustCompile(`fetch\s*\(\s*["']([^"']+)["']`)
-	xhrOpenRegex          = regexp.MustCompile(`\.open\s*\(\s*["'][^"']*["']\s*,\s*["']([^"']+)["']`)
-	importScriptsRegex    = regexp.MustCompile(`importScripts\s*\(\s*["']([^"']+)["']`)
-	systemImportRegex     = regexp.MustCompile(`System\.import\s*\(\s*["']([^"']+)["']`)
-	axiosRegex            = regexp.MustCompile(`axios\s*\.\s*(?:get|post|put|patch|delete|head|options)\s*\(\s*["']([^"']+)["']`)
-	jqueryAjaxRegex       = regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]*url\s*:\s*["']([^"']+)["']`)
-	defineAsyncRegex      = regexp.MustCompile(`defineAsyncComponent\s*\(\s*\(\s*\)\s*=>\s*import\s*\(\s*["']([^"']+)["']`)
-	reactLazyRegex        = regexp.MustCompile(`React\.lazy\s*\(\s*\(\s*\)\s*=>\s*import\s*\(\s*["']([^"']+)["']`)
-	vueLazyRegex          = regexp.MustCompile(`Vue\.component\s*\(\s*["'][^"']+["']\s*,\s*\(\s*\)\s*=>\s*import\s*\(\s*["']([^"']+)["']`)
-	webpackChunkRegex     = regexp.MustCompile(`webpackChunkName\s*:\s*["']([^"']+)["']`)
-	amazonRequireRegex    = regexp.MustCompile(`__webpack_require__\s*\(\s*["']([^"']+)["']`)
-	importMapRegex        = regexp.MustCompile(`<script[^>]*type=["']importmap["'][^>]*>([\s\S]*?)</script>`)
-	moduleScriptRegex     = regexp.MustCompile(`<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["']`)
-	urlInImportMapRegex   = regexp.MustCompile(`["']([^"']+)["']\s*:\s*["']([^"']+)["']`)
+	dynamicImportRegex  = regexp.MustCompile(`import\s*\(\s*["']([^"']+)["']\s*\)`)
+	requireRegex        = regexp.MustCompile(`require\s*\(\s*["']([^"']+)["']\s*\)`)
+	fetchRegex          = regexp.MustCompile(`fetch\s*\(\s*["']([^"']+)["']`)
+	xhrOpenRegex        = regexp.MustCompile(`\.open\s*\(\s*["'][^"']*["']\s*,\s*["']([^"']+)["']`)
+	importScriptsRegex  = regexp.MustCompile(`importScripts\s*\(\s*["']([^"']+)["']`)
+	systemImportRegex   = regexp.MustCompile(`System\.import\s*\(\s*["']([^"']+)["']`)
+	axiosRegex          = regexp.MustCompile(`axios\s*\.\s*(?:get|post|put|patch|delete|head|options)\s*\(\s*["']([^"']+)["']`)
+	jqueryAjaxRegex     = regexp.MustCompile(`\$\.ajax\s*\(\s*\{[^}]*url\s*:\s*["']([^"']+)["']`)
+	defineAsyncRegex    = regexp.MustCompile(`defineAsyncComponent\s*\(\s*\(\s*\)\s*=>\s*import\s*\(\s*["']([^"']+)["']`)
+	reactLazyRegex      = regexp.MustCompile(`React\.lazy\s*\(\s*\(\s*\)\s*=>\s*import\s*\(\s*["']([^"']+)["']`)
+	vueLazyRegex        = regexp.MustCompile(`Vue\.component\s*\(\s*["'][^"']+["']\s*,\s*\(\s*\)\s*=>\s*import\s*\(\s*["']([^"']+)["']`)
+	webpackChunkRegex   = regexp.MustCompile(`webpackChunkName\s*:\s*["']([^"']+)["']`)
+	amazonRequireRegex  = regexp.MustCompile(`__webpack_require__\s*\(\s*["']([^"']+)["']`)
+	importMapRegex      = regexp.MustCompile(`<script[^>]*type=["']importmap["'][^>]*>([\s\S]*?)</script>`)
+	moduleScriptRegex   = regexp.MustCompile(`<script[^>]*type=["']module["'][^>]*src=["']([^"']+)["']`)
+	urlInImportMapRegex = regexp.MustCompile(`["']([^"']+)["']\s*:\s*["']([^"']+)["']`)
 )
 
+// ExtractJSURLs scans JavaScript content for resource URLs and returns deduplicated results resolved against baseURL.
 func ExtractJSURLs(jsContent, baseURL string) []AnalyzedURL {
 	var urls []AnalyzedURL
 	seen := make(map[string]bool)
@@ -48,18 +50,18 @@ func extractWithRegex(jsContent, baseURL string) []AnalyzedURL {
 	var urls []AnalyzedURL
 
 	patterns := map[string]*regexp.Regexp{
-		"dynamic-import": dynamicImportRegex,
-		"require":        requireRegex,
-		"fetch":          fetchRegex,
-		"xhr-open":       xhrOpenRegex,
-		"importScripts":  importScriptsRegex,
-		"system-import":  systemImportRegex,
-		"axios":          axiosRegex,
-		"jquery-ajax":    jqueryAjaxRegex,
-		"define-async":   defineAsyncRegex,
-		"react-lazy":     reactLazyRegex,
-		"vue-lazy":       vueLazyRegex,
-		"webpack-chunk":  webpackChunkRegex,
+		"dynamic-import":  dynamicImportRegex,
+		"require":         requireRegex,
+		"fetch":           fetchRegex,
+		"xhr-open":        xhrOpenRegex,
+		"importScripts":   importScriptsRegex,
+		"system-import":   systemImportRegex,
+		"axios":           axiosRegex,
+		"jquery-ajax":     jqueryAjaxRegex,
+		"define-async":    defineAsyncRegex,
+		"react-lazy":      reactLazyRegex,
+		"vue-lazy":        vueLazyRegex,
+		"webpack-chunk":   webpackChunkRegex,
 		"webpack-require": amazonRequireRegex,
 	}
 
@@ -78,6 +80,7 @@ func extractWithRegex(jsContent, baseURL string) []AnalyzedURL {
 	return urls
 }
 
+// ExtractFromHTML scans HTML content for import maps and module scripts, returning deduplicated URLs resolved against baseURL.
 func ExtractFromHTML(htmlContent, baseURL string) []AnalyzedURL {
 	var urls []AnalyzedURL
 	seen := make(map[string]bool)
@@ -170,12 +173,14 @@ func parseURL(raw string) (*URL, error) {
 	return &URL{Path: raw}, nil
 }
 
+// URL is a minimal URL representation used for reference resolution.
 type URL struct {
 	Scheme string
 	Host   string
 	Path   string
 }
 
+// ResolveReference resolves ref against the receiver URL, returning ref unchanged when it is absolute.
 func (u *URL) ResolveReference(ref *URL) *URL {
 	if ref.Scheme != "" {
 		return ref
@@ -214,6 +219,7 @@ func resolvePath(basePath, refPath string) string {
 	return "/" + strings.Join(result, "/")
 }
 
+// String returns the URL as a string, using the path alone when no scheme or host is set.
 func (u *URL) String() string {
 	if u.Scheme != "" && u.Host != "" {
 		return u.Scheme + "://" + u.Host + u.Path

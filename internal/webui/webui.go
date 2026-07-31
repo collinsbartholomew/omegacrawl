@@ -9,34 +9,41 @@ import (
 	"time"
 )
 
+// CrawlStats is a snapshot of crawl progress served to the web UI.
 type CrawlStats struct {
-	PagesFetched int64 `json:"pages_fetched"`
-	AssetsSaved  int64 `json:"assets_saved"`
-	Errors       int64 `json:"errors"`
-	BytesTotal   int64 `json:"bytes_total"`
-	QueueSize    int   `json:"queue_size"`
-	Running      bool  `json:"running"`
+	PagesFetched int64  `json:"pages_fetched"`
+	AssetsSaved  int64  `json:"assets_saved"`
+	Errors       int64  `json:"errors"`
+	BytesTotal   int64  `json:"bytes_total"`
+	QueueSize    int    `json:"queue_size"`
+	Running      bool   `json:"running"`
 	Elapsed      string `json:"elapsed"`
 }
 
+// StatsProvider is implemented by components that can report crawl statistics.
 type StatsProvider interface {
 	Stats() CrawlStats
 }
 
+// Server serves the crawl dashboard web UI and its stats API.
 type Server struct {
 	provider atomic.Value
 	server   *http.Server
 	start    time.Time
 }
 
+// New creates a web UI server with no stats provider configured.
 func New() *Server {
 	return &Server{start: time.Now()}
 }
 
+// SetProvider installs the stats provider used by the stats API.
 func (s *Server) SetProvider(p StatsProvider) {
 	s.provider.Store(p)
 }
 
+// Start begins serving the web UI and stats API on the given port, blocking
+// until the server stops.
 func (s *Server) Start(port int) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
@@ -46,6 +53,7 @@ func (s *Server) Start(port int) error {
 	return s.server.ListenAndServe()
 }
 
+// Stop gracefully shuts down the HTTP server.
 func (s *Server) Stop() {
 	if s.server != nil {
 		s.server.Shutdown(context.Background())

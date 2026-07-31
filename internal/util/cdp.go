@@ -7,6 +7,8 @@ import (
 	"github.com/chromedp/cdproto/network"
 )
 
+// CDPCookiesToHTTP converts a slice of Chrome DevTools Protocol cookies into
+// standard net/http cookies.
 func CDPCookiesToHTTP(cdpCookies []*network.Cookie) []*http.Cookie {
 	cookies := make([]*http.Cookie, 0, len(cdpCookies))
 	for _, c := range cdpCookies {

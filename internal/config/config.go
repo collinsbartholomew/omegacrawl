@@ -10,153 +10,176 @@ import (
 	"github.com/user/clone/internal/notify"
 )
 
+// Config holds the full set of configuration options for a crawl, covering
+// crawling behavior, browser automation, authentication, and capture settings.
 type Config struct {
-	Seeds              []string      `json:"seeds"`
-	MaxDepth           int           `json:"max_depth"`
-	MaxConcurrentPages int           `json:"max_concurrent_pages"`
-	PageTimeout        time.Duration `json:"page_timeout"`
-	UserAgent          string        `json:"user_agent"`
-	OutputDir          string        `json:"output_dir"`
-	CrawlDelay         time.Duration `json:"crawl_delay"`
-	RespectRobots      bool          `json:"respect_robots"`
-	EnableScreenshot   bool          `json:"enable_screenshot"`
-	EnablePDF          bool          `json:"enable_pdf"`
-	EnableWARC         bool          `json:"enable_warc"`
-	EnableWACZ         bool          `json:"enable_wacz"`
-	EnableSingleFile   bool          `json:"enable_singlefile"`
-	EnableArticleExtract bool        `json:"enable_article_extract"`
-	Proxy              string        `json:"proxy"`
-	Proxies            []string      `json:"proxies"`
-	Cookies            []Cookie      `json:"cookies"`
-	AllowedDomains     []string      `json:"allowed_domains"`
-	ExcludePatterns    []string      `json:"exclude_patterns"`
-	ScrollHeight       int           `json:"scroll_height"`
-	MaxRetries         int           `json:"max_retries"`
-	MaxURLsPerHost     int           `json:"max_urls_per_host"`
-	MaxTotalURLs       int           `json:"max_total_urls"`
-	CheckpointInterval time.Duration `json:"checkpoint_interval"`
-	CheckpointFile     string        `json:"checkpoint_file"`
-	BloomFilterPath    string        `json:"bloom_filter_path"`
-	RotateUserAgents   bool          `json:"rotate_user_agents"`
-	UserAgents         []string      `json:"user_agents"`
+	Seeds                []string      `json:"seeds"`
+	MaxDepth             int           `json:"max_depth"`
+	MaxConcurrentPages   int           `json:"max_concurrent_pages"`
+	PageTimeout          time.Duration `json:"page_timeout"`
+	UserAgent            string        `json:"user_agent"`
+	OutputDir            string        `json:"output_dir"`
+	CrawlDelay           time.Duration `json:"crawl_delay"`
+	RespectRobots        bool          `json:"respect_robots"`
+	EnableScreenshot     bool          `json:"enable_screenshot"`
+	EnablePDF            bool          `json:"enable_pdf"`
+	EnableWARC           bool          `json:"enable_warc"`
+	EnableWACZ           bool          `json:"enable_wacz"`
+	EnableSingleFile     bool          `json:"enable_singlefile"`
+	EnableArticleExtract bool          `json:"enable_article_extract"`
+	Proxy                string        `json:"proxy"`
+	Proxies              []string      `json:"proxies"`
+	Cookies              []Cookie      `json:"cookies"`
+	AllowedDomains       []string      `json:"allowed_domains"`
+	ExcludePatterns      []string      `json:"exclude_patterns"`
+	ScrollHeight         int           `json:"scroll_height"`
+	MaxRetries           int           `json:"max_retries"`
+	MaxURLsPerHost       int           `json:"max_urls_per_host"`
+	MaxTotalURLs         int           `json:"max_total_urls"`
+	CheckpointInterval   time.Duration `json:"checkpoint_interval"`
+	CheckpointFile       string        `json:"checkpoint_file"`
+	BloomFilterPath      string        `json:"bloom_filter_path"`
+	RotateUserAgents     bool          `json:"rotate_user_agents"`
+	UserAgents           []string      `json:"user_agents"`
 
-	WaitStrategy       string        `json:"wait_strategy"`
-	WaitSelector       string        `json:"wait_selector"`
-	WaitTimeout        time.Duration `json:"wait_timeout"`
-	NetworkIdleQuiet   time.Duration `json:"network_idle_quiet"`
-	WaitForResponse    string        `json:"wait_for_response"`
-	WaitForPageTimeout time.Duration `json:"wait_for_page_timeout"`
+	WaitStrategy        string        `json:"wait_strategy"`
+	WaitSelector        string        `json:"wait_selector"`
+	WaitTimeout         time.Duration `json:"wait_timeout"`
+	NetworkIdleQuiet    time.Duration `json:"network_idle_quiet"`
+	WaitForResponse     string        `json:"wait_for_response"`
+	WaitForPageTimeout  time.Duration `json:"wait_for_page_timeout"`
 	WaitStrategyTimeout time.Duration `json:"wait_strategy_timeout"`
 
-	InfiniteScroll     *InfiniteScrollConfig `json:"infinite_scroll"`
-	InterceptAPIs      []string              `json:"intercept_apis"`
+	InfiniteScroll *InfiniteScrollConfig `json:"infinite_scroll"`
+	InterceptAPIs  []string              `json:"intercept_apis"`
 
-	ClickSelectors     []string      `json:"click_selectors"`
-	JSBeforeLoad       []string      `json:"js_before_load"`
-	JSAfterLoad        []string      `json:"js_after_load"`
-	ExpandSections     bool          `json:"expand_sections"`
-	DismissOverlays    bool          `json:"dismiss_overlays"`
+	ClickSelectors  []string `json:"click_selectors"`
+	JSBeforeLoad    []string `json:"js_before_load"`
+	JSAfterLoad     []string `json:"js_after_load"`
+	ExpandSections  bool     `json:"expand_sections"`
+	DismissOverlays bool     `json:"dismiss_overlays"`
 
-	EnableStealth      bool          `json:"enable_stealth"`
-	EnableLazyLoad     bool          `json:"enable_lazy_load"`
-	EnableShadowDOM    bool          `json:"enable_shadow_dom"`
-	EnableIframes      bool          `json:"enable_iframes"`
-	EnableRouteDiscovery bool        `json:"enable_route_discovery"`
-	EnableMediaCapture bool          `json:"enable_media_capture"`
-	EnableStructuredData bool          `json:"enable_structured_data"`
-	MaxSPARoutes         int           `json:"max_spa_routes"`
+	EnableStealth        bool `json:"enable_stealth"`
+	EnableLazyLoad       bool `json:"enable_lazy_load"`
+	EnableShadowDOM      bool `json:"enable_shadow_dom"`
+	EnableIframes        bool `json:"enable_iframes"`
+	EnableRouteDiscovery bool `json:"enable_route_discovery"`
+	EnableMediaCapture   bool `json:"enable_media_capture"`
+	EnableStructuredData bool `json:"enable_structured_data"`
+	MaxSPARoutes         int  `json:"max_spa_routes"`
 
 	EnableInteractionEngine bool `json:"enable_interaction_engine"`
 	MaxInteractionsPerPage  int  `json:"max_interactions_per_page"`
 
-	ViewportWidth      int           `json:"viewport_width"`
-	ViewportHeight     int           `json:"viewport_height"`
+	ViewportWidth  int `json:"viewport_width"`
+	ViewportHeight int `json:"viewport_height"`
 
-	NormalizeURLs      bool          `json:"normalize_urls"`
+	MobileEmulation *MobileEmulationConfig `json:"mobile_emulation,omitempty"`
 
-	MaxIframeDepth     int           `json:"max_iframe_depth"`
-	IframeSkipPatterns []string      `json:"iframe_skip_patterns"`
+	NormalizeURLs bool `json:"normalize_urls"`
 
-	BlockedURLPatterns  []string              `json:"blocked_url_patterns"`  // URL patterns to block (e.g. *doubleclick*, *ads*)
-	APIPort             int                   `json:"api_port"`              // REST API port (0 = disabled)
-	WebhookURL          string                `json:"webhook_url"`           // notification webhook URL
-	SlackURL            string                `json:"slack_url"`             // Slack webhook URL
-	SMTPConfig          *notify.SMTPConfig    `json:"smtp"`                  // email notification config
-	ScheduleCron        string                `json:"schedule_cron"`         // cron expression for scheduled crawls
-	ScheduleTimezone    string                `json:"schedule_timezone"`     // timezone for scheduler (default "UTC")
-	EnableAPICapture bool `json:"enable_api_capture"`
-	DisableTLSVerify bool `json:"disable_tls_verify"`
-	Incremental      bool   `json:"incremental"`
-	IncCacheFile     string `json:"inc_cache_file"`
-	Interactive      bool   `json:"interactive"` // show browser window, user handles CAPTCHAs and forms manually
-	ManualCapture    bool   `json:"manual_capture"` // user navigates freely in browser, each page is captured
+	MaxIframeDepth     int      `json:"max_iframe_depth"`
+	IframeSkipPatterns []string `json:"iframe_skip_patterns"`
 
-	BrowserPoolSize      int                   `json:"browser_pool_size"`     // number of concurrent browser processes (default 1)
-	UserDataDir          string                `json:"user_data_dir"`         // Chrome user data directory (persistent profiles)
-	ChromeFlags          []string              `json:"chrome_flags"`          // additional Chrome CLI flags
-	RemoteChromeURL      string                `json:"remote_chrome_url"`     // ws://host:port/devtools/browser/... for remote Chrome
+	BlockedURLPatterns []string           `json:"blocked_url_patterns"` // URL patterns to block (e.g. *doubleclick*, *ads*)
+	APIPort            int                `json:"api_port"`             // REST API port (0 = disabled)
+	WebhookURL         string             `json:"webhook_url"`          // notification webhook URL
+	SlackURL           string             `json:"slack_url"`            // Slack webhook URL
+	SMTPConfig         *notify.SMTPConfig `json:"smtp"`                 // email notification config
+	ScheduleCron       string             `json:"schedule_cron"`        // cron expression for scheduled crawls
+	ScheduleTimezone   string             `json:"schedule_timezone"`    // timezone for scheduler (default "UTC")
+	EnableAPICapture   bool               `json:"enable_api_capture"`
+	DisableTLSVerify   bool               `json:"disable_tls_verify"`
+	Incremental        bool               `json:"incremental"`
+	IncCacheFile       string             `json:"inc_cache_file"`
+	Interactive        bool               `json:"interactive"`    // show browser window, user handles CAPTCHAs and forms manually
+	ManualCapture      bool               `json:"manual_capture"` // user navigates freely in browser, each page is captured
 
-	AuthConfig           *AuthConfig           `json:"auth"`
-	CAPTCHAConfig        *CAPTCHAConfig        `json:"captcha"`
-	QueueConfig          *QueueConfig          `json:"queue"`
+	BrowserPoolSize int      `json:"browser_pool_size"` // number of concurrent browser processes (default 1)
+	UserDataDir     string   `json:"user_data_dir"`     // Chrome user data directory (persistent profiles)
+	ChromeFlags     []string `json:"chrome_flags"`      // additional Chrome CLI flags
+	RemoteChromeURL string   `json:"remote_chrome_url"` // ws://host:port/devtools/browser/... for remote Chrome
+
+	AuthConfig            *AuthConfig            `json:"auth"`
+	CAPTCHAConfig         *CAPTCHAConfig         `json:"captcha"`
+	QueueConfig           *QueueConfig           `json:"queue"`
 	ChangeDetectionConfig *ChangeDetectionConfig `json:"change_detection"`
 }
 
+// ChangeDetectionConfig configures periodic snapshot-based change detection for crawled pages.
 type ChangeDetectionConfig struct {
-	Enabled       bool   `json:"enabled"`
-	SnapshotDir   string `json:"snapshot_dir"`
-	MaxSnapshots  int    `json:"max_snapshots"`
-	ReportDir     string `json:"report_dir"`
+	Enabled      bool   `json:"enabled"`
+	SnapshotDir  string `json:"snapshot_dir"`
+	MaxSnapshots int    `json:"max_snapshots"`
+	ReportDir    string `json:"report_dir"`
 }
 
+// MobileEmulationConfig configures mobile device emulation via CDP device
+// metrics and user-agent overrides. Enabled is implied by a non-nil value.
+type MobileEmulationConfig struct {
+	Width             int     `json:"width"`
+	Height            int     `json:"height"`
+	DeviceScaleFactor float64 `json:"device_scale_factor"`
+	Mobile            bool    `json:"mobile"`
+	UserAgent         string  `json:"user_agent,omitempty"`
+}
+
+// AuthConfig configures how the crawler authenticates against protected sites.
 type AuthConfig struct {
-	Enabled       bool              `json:"enabled"`
-	Type          string            `json:"type"`           // "form", "basic", "header", "oauth"
-	LoginURL      string            `json:"login_url"`
-	FormFields    map[string]string `json:"form_fields"`    // selector -> value (username/password selectors)
-	Username      string            `json:"username"`
-	Password      string            `json:"password"`
-	SubmitSelector string           `json:"submit_selector"`
-	WaitAfterLogin time.Duration    `json:"wait_after_login"`
-	BasicAuth     *BasicAuthConfig   `json:"basic_auth"`
-	HeaderAuth    *HeaderAuthConfig  `json:"header_auth"`
-	OAuthConfig   *OAuthConfig       `json:"oauth"`
+	Enabled        bool              `json:"enabled"`
+	Type           string            `json:"type"` // "form", "basic", "header", "oauth"
+	LoginURL       string            `json:"login_url"`
+	FormFields     map[string]string `json:"form_fields"` // selector -> value (username/password selectors)
+	Username       string            `json:"username"`
+	Password       string            `json:"password"`
+	SubmitSelector string            `json:"submit_selector"`
+	WaitAfterLogin time.Duration     `json:"wait_after_login"`
+	BasicAuth      *BasicAuthConfig  `json:"basic_auth"`
+	HeaderAuth     *HeaderAuthConfig `json:"header_auth"`
+	OAuthConfig    *OAuthConfig      `json:"oauth"`
 }
 
+// BasicAuthConfig holds HTTP basic authentication credentials.
 type BasicAuthConfig struct {
 	Username string `json:"username"`
 	Password string `json:"password"`
 }
 
+// HeaderAuthConfig holds custom headers used for header-based authentication.
 type HeaderAuthConfig struct {
 	Headers map[string]string `json:"headers"` // Authorization, Cookie, etc.
 }
 
+// OAuthConfig holds the client credentials and endpoints used for OAuth authentication.
 type OAuthConfig struct {
 	ClientID     string   `json:"client_id"`
 	ClientSecret string   `json:"client_secret"`
 	AuthURL      string   `json:"auth_url"`
 	TokenURL     string   `json:"token_url"`
+	RefreshURL   string   `json:"refresh_url,omitempty"`
 	Scopes       []string `json:"scopes"`
 	RedirectURL  string   `json:"redirect_url"`
 	State        string   `json:"state"`
 }
 
+// CAPTCHAConfig configures solving of CAPTCHAs via an external provider.
 type CAPTCHAConfig struct {
-	Enabled   bool          `json:"enabled"`
-	Provider  string        `json:"provider"`  // "2captcha", "anticaptcha", "capmonster"
-	APIKey    string        `json:"api_key"`
-	Timeout   time.Duration `json:"timeout"`
-	RetryCount int          `json:"retry_count"`
+	Enabled    bool          `json:"enabled"`
+	Provider   string        `json:"provider"` // "2captcha", "anticaptcha", "capmonster"
+	APIKey     string        `json:"api_key"`
+	Timeout    time.Duration `json:"timeout"`
+	RetryCount int           `json:"retry_count"`
 }
 
+// QueueConfig configures the URL queue backend (local, redis, postgres, or kafka).
 type QueueConfig struct {
-	Backend  string `json:"backend"`  // "local", "redis", "postgres", "kafka"
+	Backend  string `json:"backend"` // "local", "redis", "postgres", "kafka"
 	RedisURL string `json:"redis_url"`
 	PgDSN    string `json:"pg_dsn"`
 	KafkaURL string `json:"kafka_url"`
 }
 
+// InfiniteScrollConfig controls automatic infinite-scroll behavior on pages.
 type InfiniteScrollConfig struct {
 	Enabled          bool          `json:"enabled"`
 	MaxScrolls       int           `json:"max_scrolls"`
@@ -166,9 +189,10 @@ type InfiniteScrollConfig struct {
 	ScrollContainer  string        `json:"scroll_container"`
 	LoadMoreSelector string        `json:"load_more_selector"`
 	ScrollDelay      time.Duration `json:"scroll_delay"`
-	ScrollDistance    int           `json:"scroll_distance"`
+	ScrollDistance   int           `json:"scroll_distance"`
 }
 
+// Cookie represents a single cookie to seed into the browser session.
 type Cookie struct {
 	Name     string `json:"name"`
 	Value    string `json:"value"`
@@ -179,40 +203,41 @@ type Cookie struct {
 	SameSite string `json:"same_site"`
 }
 
+// DefaultConfig returns a new Config populated with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		Seeds:              []string{},
-		MaxDepth:           10,
-		MaxConcurrentPages: 5,
-		PageTimeout:        120 * time.Second,
-		UserAgent:          "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-		OutputDir:          "output",
-		CrawlDelay:         1 * time.Second,
-		RespectRobots:      true,
-		EnableScreenshot:   true,
-		EnablePDF:          false,
-		EnableWARC:         false,
-		EnableWACZ:         false,
-		EnableSingleFile:   true,
+		Seeds:                []string{},
+		MaxDepth:             10,
+		MaxConcurrentPages:   5,
+		PageTimeout:          120 * time.Second,
+		UserAgent:            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		OutputDir:            "output",
+		CrawlDelay:           1 * time.Second,
+		RespectRobots:        true,
+		EnableScreenshot:     true,
+		EnablePDF:            false,
+		EnableWARC:           false,
+		EnableWACZ:           false,
+		EnableSingleFile:     true,
 		EnableArticleExtract: true,
-		ScrollHeight:       5000,
-		MaxRetries:         3,
-		MaxURLsPerHost:     10000,
-		MaxTotalURLs:       100000,
-		CheckpointInterval: 5 * time.Minute,
-		CheckpointFile:     "",
-		BloomFilterPath:    "",
-		RotateUserAgents:   false,
+		ScrollHeight:         5000,
+		MaxRetries:           3,
+		MaxURLsPerHost:       10000,
+		MaxTotalURLs:         100000,
+		CheckpointInterval:   5 * time.Minute,
+		CheckpointFile:       "",
+		BloomFilterPath:      "",
+		RotateUserAgents:     false,
 		UserAgents: []string{
 			"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 			"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 			"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
 		},
-		WaitStrategy:     "adaptive",
-		WaitSelector:     "",
-		WaitTimeout:      60 * time.Second,
-		NetworkIdleQuiet: 1 * time.Second,
-		WaitForPageTimeout: 30 * time.Second,
+		WaitStrategy:        "adaptive",
+		WaitSelector:        "",
+		WaitTimeout:         60 * time.Second,
+		NetworkIdleQuiet:    1 * time.Second,
+		WaitForPageTimeout:  30 * time.Second,
 		WaitStrategyTimeout: 60 * time.Second,
 
 		InfiniteScroll: &InfiniteScrollConfig{
@@ -224,31 +249,31 @@ func DefaultConfig() *Config {
 			ScrollContainer:  "",
 			LoadMoreSelector: "",
 			ScrollDelay:      2 * time.Second,
-			ScrollDistance:    500,
+			ScrollDistance:   500,
 		},
 
-		ClickSelectors:   []string{},
-		JSBeforeLoad:     []string{},
-		JSAfterLoad:      []string{},
-		ExpandSections:   true,
-		DismissOverlays:  true,
+		ClickSelectors:  []string{},
+		JSBeforeLoad:    []string{},
+		JSAfterLoad:     []string{},
+		ExpandSections:  true,
+		DismissOverlays: true,
 
-		EnableStealth:      true,
-		EnableLazyLoad:     true,
-		EnableShadowDOM:    true,
-		EnableIframes:      true,
+		EnableStealth:        true,
+		EnableLazyLoad:       true,
+		EnableShadowDOM:      true,
+		EnableIframes:        true,
 		EnableRouteDiscovery: true,
 		EnableMediaCapture:   true,
 		EnableStructuredData: true,
-		MaxSPARoutes:        50,
+		MaxSPARoutes:         50,
 
 		EnableInteractionEngine: false,
 		MaxInteractionsPerPage:  50,
 
-		ViewportWidth:    1920,
-		ViewportHeight:   1080,
+		ViewportWidth:  1920,
+		ViewportHeight: 1080,
 
-		NormalizeURLs:      true,
+		NormalizeURLs: true,
 
 		MaxIframeDepth:     2,
 		IframeSkipPatterns: []string{"googleads", "doubleclick", "facebook.com/tr"},
@@ -266,6 +291,8 @@ func DefaultConfig() *Config {
 	}
 }
 
+// TLSConfig returns a *tls.Config with TLS certificate verification disabled
+// when DisableTLSVerify is set, or nil otherwise.
 func (c *Config) TLSConfig() *tls.Config {
 	if c.DisableTLSVerify {
 		return &tls.Config{InsecureSkipVerify: true}
@@ -273,6 +300,8 @@ func (c *Config) TLSConfig() *tls.Config {
 	return nil
 }
 
+// Validate checks the configuration for invalid or missing values and returns
+// an error describing the first problem found, or nil if the config is valid.
 func (c *Config) Validate() error {
 	if !c.ManualCapture && len(c.Seeds) == 0 {
 		return fmt.Errorf("at least one seed URL is required")
@@ -371,6 +400,8 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+// LoadFromFile reads a JSON configuration file and returns the parsed Config,
+// starting from the defaults and overlaying the file contents.
 func LoadFromFile(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {

@@ -8,6 +8,8 @@ import (
 	"github.com/user/clone/internal/config"
 )
 
+// NewQueueFromConfig builds a Queue from the given config, selecting the backend
+// based on cfg.Backend. A nil cfg returns an in-memory priority queue.
 func NewQueueFromConfig(ctx context.Context, cfg *config.QueueConfig) (Queue, error) {
 	if cfg == nil {
 		return NewPriorityQueue(), nil

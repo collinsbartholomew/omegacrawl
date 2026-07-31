@@ -14,6 +14,7 @@ import (
 	"golang.org/x/net/html"
 )
 
+// Snapshot captures the state of a page at a point in time.
 type Snapshot struct {
 	URL       string            `json:"url"`
 	Title     string            `json:"title"`
@@ -24,14 +25,19 @@ type Snapshot struct {
 	Checksums map[string]string `json:"checksums,omitempty"`
 }
 
+// ChangeType describes the kind of change detected between snapshots.
 type ChangeType string
 
 const (
-	ChangeAdded   ChangeType = "added"
+	// ChangeAdded indicates an element was added.
+	ChangeAdded ChangeType = "added"
+	// ChangeRemoved indicates an element was removed.
 	ChangeRemoved ChangeType = "removed"
+	// ChangeModified indicates an element changed value.
 	ChangeModified ChangeType = "modified"
 )
 
+// Change describes a single detected change between snapshots.
 type Change struct {
 	Type      ChangeType `json:"type"`
 	Path      string     `json:"path"`
@@ -41,6 +47,7 @@ type Change struct {
 	Attribute string     `json:"attribute,omitempty"`
 }
 
+// DiffReport summarizes the differences between two snapshots.
 type DiffReport struct {
 	URL         string    `json:"url"`
 	PreviousRun time.Time `json:"previous_run"`
@@ -51,12 +58,14 @@ type DiffReport struct {
 	NewHash     string    `json:"new_hash"`
 }
 
+// Detector stores snapshots and detects changes between page versions.
 type Detector struct {
 	snapDir   string
 	snapshots map[string]*Snapshot
 	mu        sync.RWMutex
 }
 
+// NewDetector creates a Detector that persists snapshots in snapDir.
 func NewDetector(snapDir string) *Detector {
 	return &Detector{
 		snapDir:   snapDir,
@@ -64,10 +73,12 @@ func NewDetector(snapDir string) *Detector {
 	}
 }
 
+// SnapshotDir returns the directory where snapshots are stored.
 func (d *Detector) SnapshotDir() string {
 	return d.snapDir
 }
 
+// LoadSnapshot loads the stored snapshot for the given URL, or nil if none exists.
 func (d *Detector) LoadSnapshot(url string) (*Snapshot, error) {
 	d.mu.RLock()
 	if s, ok := d.snapshots[url]; ok {
@@ -94,6 +105,7 @@ func (d *Detector) LoadSnapshot(url string) (*Snapshot, error) {
 	return &snap, nil
 }
 
+// SaveSnapshot stores a snapshot for the given URL and content.
 func (d *Detector) SaveSnapshot(url, title string, content []byte) (*Snapshot, error) {
 	hash := fmt.Sprintf("%x", sha256.Sum256(content))
 	snap := &Snapshot{
@@ -113,7 +125,7 @@ func (d *Detector) SaveSnapshot(url, title string, content []byte) (*Snapshot, e
 	if err != nil {
 		return snap, err
 	}
-	if err := os.WriteFile(snapPath, data, 0644); err != nil {
+	if err := os.WriteFile(snapPath, data, 0600); err != nil {
 		return snap, err
 	}
 
@@ -123,6 +135,7 @@ func (d *Detector) SaveSnapshot(url, title string, content []byte) (*Snapshot, e
 	return snap, nil
 }
 
+// DetectChanges compares two snapshots and returns a report of any differences.
 func (d *Detector) DetectChanges(url string, old, new *Snapshot) *DiffReport {
 	report := &DiffReport{
 		URL:         url,
@@ -172,10 +185,10 @@ func computeDiff(oldContent, newContent []byte) []Change {
 			})
 		} else if !bytes.Equal(oldLines[i], newLines[i]) {
 			changes = append(changes, Change{
-				Type:      ChangeModified,
-				Path:      fmt.Sprintf("line:%d", i+1),
-				OldValue:  string(oldLines[i]),
-				NewValue:  string(newLines[i]),
+				Type:     ChangeModified,
+				Path:     fmt.Sprintf("line:%d", i+1),
+				OldValue: string(oldLines[i]),
+				NewValue: string(newLines[i]),
 			})
 		}
 	}
@@ -246,8 +259,8 @@ func diffNodes(old, new *html.Node, path string) []Change {
 	for k, nv := range newAttrs {
 		if _, ok := oldAttrs[k]; !ok {
 			changes = append(changes, Change{
-				Type:    ChangeAdded,
-				Path:    path + "@" + k,
+				Type:     ChangeAdded,
+				Path:     path + "@" + k,
 				NewValue: nv,
 			})
 		}
@@ -273,8 +286,8 @@ func diffNodes(old, new *html.Node, path string) []Change {
 	}
 	for newChild != nil {
 		changes = append(changes, Change{
-			Type:    ChangeAdded,
-			Path:    fmt.Sprintf("%s/%s[%d]", path, newChild.Data, idx),
+			Type:     ChangeAdded,
+			Path:     fmt.Sprintf("%s/%s[%d]", path, newChild.Data, idx),
 			NewValue: newChild.Data,
 		})
 		newChild = newChild.NextSibling

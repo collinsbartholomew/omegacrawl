@@ -11,8 +11,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/chromedp/chromedp"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/config"
@@ -20,6 +20,7 @@ import (
 	"github.com/user/clone/internal/util"
 )
 
+// AuthManager handles authentication for crawl targets.
 type AuthManager struct {
 	cfg       *config.AuthConfig
 	cookieJar map[string][]*http.Cookie
@@ -32,6 +33,7 @@ type AuthManager struct {
 	formTabCancel context.CancelFunc
 }
 
+// NewAuthManager creates an AuthManager from the given auth configuration.
 func NewAuthManager(cfg *config.AuthConfig) *AuthManager {
 	return &AuthManager{
 		cfg:       cfg,
@@ -39,6 +41,7 @@ func NewAuthManager(cfg *config.AuthConfig) *AuthManager {
 	}
 }
 
+// Authenticate applies the configured authentication flow to the target URL.
 func (am *AuthManager) Authenticate(ctx context.Context, targetURL string) error {
 	if am.cfg == nil || !am.cfg.Enabled {
 		return nil
@@ -143,6 +146,16 @@ func (am *AuthManager) formLogin(ctx context.Context, targetURL string) error {
 		)
 	}
 
+	// Fixed Bug B7: release the form tab context as soon as the login flow
+	// completes. Cookies are persisted in the jar, so the dedicated tab is no
+	// longer needed; previously it lived for the entire crawl duration,
+	// consuming CDP target resources. The sync.Once is reset so a later
+	// re-authentication can create a fresh tab.
+	am.formTabCancel()
+	am.formTabCtx = nil
+	am.formTabCancel = nil
+	am.formTabOnce = sync.Once{}
+
 	return nil
 }
 
@@ -192,6 +205,25 @@ func (am *AuthManager) oauthFlow(ctx context.Context, targetURL string) error {
 		return am.injectOAuthToken(ctx)
 	}
 
+	// Token is missing or expiring. Prefer refreshing over a full exchange when
+	// a refresh token is available, so long-lived crawls do not renegotiate
+	// client credentials on every expiry.
+	if am.token != nil && am.token.RefreshToken != "" {
+		refreshed, err := am.refreshOAuthToken(ctx, am.token.RefreshToken)
+		if err == nil {
+			// Servers that do not rotate refresh tokens omit a new one in the
+			// response; preserve the existing token so refresh keeps working.
+			if refreshed.RefreshToken == "" {
+				refreshed.RefreshToken = am.token.RefreshToken
+			}
+			am.token = refreshed
+			am.tokenMu.Unlock()
+			util.LogInfo("refreshed oauth token")
+			return am.injectOAuthToken(ctx)
+		}
+		util.LogDebug("oauth token refresh failed, falling back to full exchange", zap.Error(err))
+	}
+
 	token, err := am.exchangeOAuthToken(ctx)
 	if err != nil {
 		am.tokenMu.Unlock()
@@ -202,6 +234,43 @@ func (am *AuthManager) oauthFlow(ctx context.Context, targetURL string) error {
 	am.tokenMu.Unlock()
 
 	return am.injectOAuthToken(ctx)
+}
+
+func (am *AuthManager) refreshOAuthToken(ctx context.Context, refreshToken string) (*OAuthToken, error) {
+	oc := am.cfg.OAuthConfig
+	refreshURL := oc.RefreshURL
+	if refreshURL == "" {
+		refreshURL = oc.TokenURL
+	}
+
+	data := url.Values{}
+	data.Set("grant_type", "refresh_token")
+	data.Set("refresh_token", refreshToken)
+	data.Set("client_id", oc.ClientID)
+	data.Set("client_secret", oc.ClientSecret)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", refreshURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := httpclient.GlobalClient().Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("oauth token refresh failed: %d", resp.StatusCode)
+	}
+
+	var tokenResp oauthTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return nil, err
+	}
+
+	return tokenFromResponse(tokenResp)
 }
 
 func (am *AuthManager) exchangeOAuthToken(ctx context.Context) (*OAuthToken, error) {
@@ -230,23 +299,53 @@ func (am *AuthManager) exchangeOAuthToken(ctx context.Context) (*OAuthToken, err
 		return nil, fmt.Errorf("oauth token request failed: %d", resp.StatusCode)
 	}
 
-	var tokenResp struct {
-		AccessToken  string `json:"access_token"`
-		TokenType    string `json:"token_type"`
-		ExpiresIn    int    `json:"expires_in"`
-		RefreshToken string `json:"refresh_token"`
-	}
-
+	var tokenResp oauthTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 		return nil, err
 	}
 
+	return tokenFromResponse(tokenResp)
+}
+
+type oauthTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int    `json:"expires_in"`
+	RefreshToken string `json:"refresh_token"`
+	Error        string `json:"error"`
+}
+
+// tokenFromResponse validates a decoded token response before it can be stored.
+// A missing access_token usually means the server returned an OAuth error body
+// (e.g. {"error":"invalid_grant"}) with HTTP 200; surfacing that as an error
+// prevents a header like "Bearer " from being injected into every request.
+func tokenFromResponse(resp oauthTokenResponse) (*OAuthToken, error) {
+	if resp.AccessToken == "" {
+		if resp.Error != "" {
+			return nil, fmt.Errorf("oauth server error: %s", resp.Error)
+		}
+		return nil, fmt.Errorf("oauth response missing access_token")
+	}
+	tokenType := resp.TokenType
+	if tokenType == "" {
+		tokenType = "Bearer"
+	}
 	return &OAuthToken{
-		AccessToken:  tokenResp.AccessToken,
-		TokenType:    tokenResp.TokenType,
-		ExpiresAt:    time.Now().Add(time.Duration(tokenResp.ExpiresIn) * time.Second),
-		RefreshToken: tokenResp.RefreshToken,
+		AccessToken:  resp.AccessToken,
+		TokenType:    tokenType,
+		ExpiresAt:    expiryTime(resp.ExpiresIn),
+		RefreshToken: resp.RefreshToken,
 	}, nil
+}
+
+// expiryTime converts a server-provided lifetime (seconds) into an ExpiresAt
+// timestamp. A missing or zero lifetime falls back to a conservative 5-minute
+// validity so the token is not immediately expired and refreshable in time.
+func expiryTime(expiresIn int) time.Time {
+	if expiresIn <= 0 {
+		return time.Now().Add(5 * time.Minute)
+	}
+	return time.Now().Add(time.Duration(expiresIn) * time.Second)
 }
 
 func (am *AuthManager) injectOAuthToken(ctx context.Context) error {
@@ -271,12 +370,14 @@ func (am *AuthManager) storeCookies(domain string, cookies []*http.Cookie) {
 	am.cookieJar[domain] = cookies
 }
 
+// GetCookies returns the cookies stored for the given domain.
 func (am *AuthManager) GetCookies(domain string) []*http.Cookie {
 	am.jarMu.RLock()
 	defer am.jarMu.RUnlock()
 	return am.cookieJar[domain]
 }
 
+// HasValidSession reports whether the stored cookies for the domain are still valid.
 func (am *AuthManager) HasValidSession(domain string) bool {
 	cookies := am.GetCookies(domain)
 	if len(cookies) == 0 {
@@ -291,6 +392,7 @@ func (am *AuthManager) HasValidSession(domain string) bool {
 	return false
 }
 
+// OAuthToken holds the credentials for an OAuth client-credentials token.
 type OAuthToken struct {
 	AccessToken  string    `json:"access_token"`
 	TokenType    string    `json:"token_type"`
@@ -298,6 +400,7 @@ type OAuthToken struct {
 	RefreshToken string    `json:"refresh_token"`
 }
 
+// IsValid reports whether the token is non-empty and not near expiry.
 func (t *OAuthToken) IsValid() bool {
 	if t == nil || t.AccessToken == "" {
 		return false
@@ -305,6 +408,7 @@ func (t *OAuthToken) IsValid() bool {
 	return time.Now().Before(t.ExpiresAt.Add(-30 * time.Second))
 }
 
+// Close releases any resources held by the AuthManager.
 func (am *AuthManager) Close() {
 	if am.formTabCancel != nil {
 		am.formTabCancel()

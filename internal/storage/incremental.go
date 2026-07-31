@@ -7,6 +7,7 @@ import (
 	"time"
 )
 
+// ResourceCacheEntry stores HTTP validation metadata for a cached resource.
 type ResourceCacheEntry struct {
 	ETag         string    `json:"etag,omitempty"`
 	LastModified string    `json:"last_modified,omitempty"`
@@ -14,13 +15,18 @@ type ResourceCacheEntry struct {
 	FetchedAt    time.Time `json:"fetched_at,omitempty"`
 }
 
+// ResourceCache tracks conditional request metadata (ETag, Last-Modified)
+// per URL to enable incremental re-crawling. Changes can be persisted to a
+// JSON file on disk.
 type ResourceCache struct {
-	mu        sync.RWMutex
-	entries   map[string]*ResourceCacheEntry
-	path      string
-	dirty     bool
+	mu      sync.RWMutex
+	entries map[string]*ResourceCacheEntry
+	path    string
+	dirty   bool
 }
 
+// NewResourceCache creates a cache backed by the JSON file at path, loading
+// any existing entries. If path is empty the cache is memory-only.
 func NewResourceCache(path string) *ResourceCache {
 	c := &ResourceCache{
 		entries: make(map[string]*ResourceCacheEntry),
@@ -46,6 +52,8 @@ func (c *ResourceCache) load() {
 	c.mu.Unlock()
 }
 
+// Save persists the cache to disk if it has been modified since the last
+// save.
 func (c *ResourceCache) Save() error {
 	c.mu.Lock()
 	if !c.dirty {
@@ -66,7 +74,7 @@ func (c *ResourceCache) Save() error {
 		c.mu.Unlock()
 		return err
 	}
-	if err := os.WriteFile(c.path, data, 0644); err != nil {
+	if err := os.WriteFile(c.path, data, 0600); err != nil {
 		c.mu.Lock()
 		c.dirty = true
 		c.mu.Unlock()
@@ -75,6 +83,7 @@ func (c *ResourceCache) Save() error {
 	return nil
 }
 
+// Get returns the cache entry for url, if present.
 func (c *ResourceCache) Get(url string) (*ResourceCacheEntry, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -85,6 +94,7 @@ func (c *ResourceCache) Get(url string) (*ResourceCacheEntry, bool) {
 	return e, true
 }
 
+// Set stores entry for url and marks the cache dirty.
 func (c *ResourceCache) Set(url string, entry *ResourceCacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -92,6 +102,8 @@ func (c *ResourceCache) Set(url string, entry *ResourceCacheEntry) {
 	c.dirty = true
 }
 
+// ConditionalHeaders returns the stored ETag and Last-Modified values for
+// url, which may be sent as conditional request headers.
 func (c *ResourceCache) ConditionalHeaders(url string) (etag, lastModified string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -102,6 +114,8 @@ func (c *ResourceCache) ConditionalHeaders(url string) (etag, lastModified strin
 	return e.ETag, e.LastModified
 }
 
+// UpdateFromResponse records validation headers from an HTTP response for
+// url, updating the entry only when new validation data is available.
 func (c *ResourceCache) UpdateFromResponse(url string, statusCode int, headers map[string]string) {
 	etag := headers["Etag"]
 	if etag == "" {

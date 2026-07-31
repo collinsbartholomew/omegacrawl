@@ -10,6 +10,8 @@ type lruNode struct {
 	next *lruNode
 }
 
+// LRUSet is a thread-safe set of strings with a fixed capacity that evicts
+// the least recently used entry when full.
 type LRUSet struct {
 	capacity int
 	mu       sync.Mutex
@@ -18,6 +20,8 @@ type LRUSet struct {
 	tail     *lruNode
 }
 
+// NewLRUSet creates an LRUSet with the given capacity, defaulting to 1000 if
+// capacity is non-positive.
 func NewLRUSet(capacity int) *LRUSet {
 	if capacity <= 0 {
 		capacity = 1000
@@ -33,6 +37,8 @@ func NewLRUSet(capacity int) *LRUSet {
 	return s
 }
 
+// Add inserts key into the set, marking it as most recently used and evicting
+// the least recently used entry if the set is full.
 func (s *LRUSet) Add(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -51,6 +57,7 @@ func (s *LRUSet) Add(key string) {
 	}
 }
 
+// AddIfAbsent inserts key and reports whether it was not already present.
 func (s *LRUSet) AddIfAbsent(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -69,6 +76,7 @@ func (s *LRUSet) AddIfAbsent(key string) bool {
 	return true
 }
 
+// Contains reports whether key is in the set.
 func (s *LRUSet) Contains(key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -77,12 +85,14 @@ func (s *LRUSet) Contains(key string) bool {
 	return ok
 }
 
+// Len returns the number of entries in the set.
 func (s *LRUSet) Len() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.items)
 }
 
+// Clear removes all entries from the set.
 func (s *LRUSet) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -110,6 +120,7 @@ func (s *LRUSet) moveToHead(node *lruNode) {
 	s.addToHead(node)
 }
 
+// Keys returns a snapshot of all keys currently in the set.
 func (s *LRUSet) Keys() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -130,12 +141,16 @@ func (s *LRUSet) removeLRU() {
 	delete(s.items, node.key)
 }
 
+// BoundedQueue is a thread-safe FIFO queue with a fixed capacity that drops
+// the oldest item when full.
 type BoundedQueue struct {
 	capacity int
 	mu       sync.Mutex
 	items    []interface{}
 }
 
+// NewBoundedQueue creates a BoundedQueue with the given capacity, defaulting
+// to 1000 if capacity is non-positive.
 func NewBoundedQueue(capacity int) *BoundedQueue {
 	if capacity <= 0 {
 		capacity = 1000
@@ -146,6 +161,8 @@ func NewBoundedQueue(capacity int) *BoundedQueue {
 	}
 }
 
+// Push appends item to the queue, discarding the oldest item if the queue is
+// at capacity.
 func (q *BoundedQueue) Push(item interface{}) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -157,6 +174,7 @@ func (q *BoundedQueue) Push(item interface{}) {
 	q.items = append(q.items, item)
 }
 
+// GetAll returns a copy of the items currently in the queue.
 func (q *BoundedQueue) GetAll() []interface{} {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -166,12 +184,14 @@ func (q *BoundedQueue) GetAll() []interface{} {
 	return result
 }
 
+// Len returns the number of items in the queue.
 func (q *BoundedQueue) Len() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return len(q.items)
 }
 
+// Clear removes all items from the queue.
 func (q *BoundedQueue) Clear() {
 	q.mu.Lock()
 	defer q.mu.Unlock()

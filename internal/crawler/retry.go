@@ -6,6 +6,7 @@ import (
 	"time"
 )
 
+// RetryConfig controls exponential backoff with jitter for retried requests.
 type RetryConfig struct {
 	MaxRetries     int
 	InitialBackoff time.Duration
@@ -14,6 +15,7 @@ type RetryConfig struct {
 	JitterFraction float64
 }
 
+// DefaultRetryConfig returns a RetryConfig with sensible defaults.
 func DefaultRetryConfig() *RetryConfig {
 	return &RetryConfig{
 		MaxRetries:     3,
@@ -24,6 +26,7 @@ func DefaultRetryConfig() *RetryConfig {
 	}
 }
 
+// GetBackoff returns the backoff duration to wait before the given retry attempt.
 func (r *RetryConfig) GetBackoff(attempt int) time.Duration {
 	backoff := float64(r.InitialBackoff) * math.Pow(r.Multiplier, float64(attempt))
 
@@ -37,20 +40,24 @@ func (r *RetryConfig) GetBackoff(attempt int) time.Duration {
 	return time.Duration(backoff)
 }
 
+// RetryableError wraps an error that may be retried based on the HTTP status code.
 type RetryableError struct {
-	Err         error
-	Retryable   bool
-	StatusCode  int
+	Err        error
+	Retryable  bool
+	StatusCode int
 }
 
+// Error returns the string representation of the wrapped error.
 func (e *RetryableError) Error() string {
 	return e.Err.Error()
 }
 
+// Unwrap returns the underlying error.
 func (e *RetryableError) Unwrap() error {
 	return e.Err
 }
 
+// IsRetryable reports whether the given HTTP status code indicates a retryable failure.
 func IsRetryable(statusCode int) bool {
 	switch {
 	case statusCode == 429:
@@ -68,10 +75,13 @@ func IsRetryable(statusCode int) bool {
 	}
 }
 
+// IsRateLimited reports whether the given HTTP status code indicates rate limiting.
 func IsRateLimited(statusCode int) bool {
 	return statusCode == 429 || statusCode == 503
 }
 
+// ParseRetryAfter parses a Retry-After header value into a duration; it returns
+// 0 if the value is empty or cannot be parsed.
 func ParseRetryAfter(retryAfter string) time.Duration {
 	if retryAfter == "" {
 		return 0

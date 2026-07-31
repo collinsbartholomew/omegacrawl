@@ -11,21 +11,24 @@ import (
 	"time"
 )
 
+// Config holds the notification channel configuration.
 type Config struct {
-	WebhookURL string `json:"webhook_url"`
-	SlackURL   string `json:"slack_url"`
+	WebhookURL string      `json:"webhook_url"`
+	SlackURL   string      `json:"slack_url"`
 	SMTP       *SMTPConfig `json:"smtp"`
 }
 
+// SMTPConfig holds the SMTP server and recipient settings for email notifications.
 type SMTPConfig struct {
-	Host     string   `json:"host"`
-	Port     int      `json:"port"`
-	User     string   `json:"user"`
-	Pass     string   `json:"pass"`
-	From     string   `json:"from"`
-	To       []string `json:"to"`
+	Host string   `json:"host"`
+	Port int      `json:"port"`
+	User string   `json:"user"`
+	Pass string   `json:"pass"`
+	From string   `json:"from"`
+	To   []string `json:"to"`
 }
 
+// Notification is a single notification message with optional crawl metadata.
 type Notification struct {
 	Title    string `json:"title"`
 	Message  string `json:"message"`
@@ -37,11 +40,13 @@ type Notification struct {
 	Bytes    int64  `json:"bytes,omitempty"`
 }
 
+// Notifier delivers notifications to the configured channels.
 type Notifier struct {
 	cfg    *Config
 	client *http.Client
 }
 
+// New creates a Notifier with an HTTP client using the given config.
 func New(cfg *Config) *Notifier {
 	return &Notifier{
 		cfg:    cfg,
@@ -49,6 +54,7 @@ func New(cfg *Config) *Notifier {
 	}
 }
 
+// Send delivers the notification to all configured channels and returns any errors.
 func (n *Notifier) Send(nt Notification) error {
 	var errs []string
 	if n.cfg.WebhookURL != "" {
@@ -73,7 +79,10 @@ func (n *Notifier) Send(nt Notification) error {
 }
 
 func (n *Notifier) sendWebhook(nt Notification) error {
-	body, _ := json.Marshal(nt)
+	body, err := json.Marshal(nt)
+	if err != nil {
+		return fmt.Errorf("failed to marshal webhook body: %w", err)
+	}
 	resp, err := n.client.Post(n.cfg.WebhookURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -100,7 +109,10 @@ func (n *Notifier) sendSlack(nt Notification) error {
 			},
 		},
 	}
-	body, _ := json.Marshal(payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal slack payload: %w", err)
+	}
 	resp, err := n.client.Post(n.cfg.SlackURL, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err

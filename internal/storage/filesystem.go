@@ -16,6 +16,8 @@ import (
 	"github.com/user/clone/internal/util"
 )
 
+// FileInfo describes a file saved to disk, recording its source URL and
+// metadata such as SHA256 hash, MIME type and size.
 type FileInfo struct {
 	URL       string `json:"url"`
 	LocalPath string `json:"local_path"`
@@ -24,12 +26,16 @@ type FileInfo struct {
 	Size      int    `json:"size"`
 }
 
+// Filesystem stores crawled content on disk and keeps an in-memory index of
+// saved files keyed by their original URL.
 type Filesystem struct {
 	outputDir string
 	index     map[string]*FileInfo
 	mu        sync.RWMutex
 }
 
+// NewFilesystem creates a Filesystem that writes to the configured output
+// directory.
 func NewFilesystem(cfg *config.Config) *Filesystem {
 	return &Filesystem{
 		outputDir: cfg.OutputDir,
@@ -37,6 +43,8 @@ func NewFilesystem(cfg *config.Config) *Filesystem {
 	}
 }
 
+// SaveFile writes raw file content to disk under the path derived from
+// rawURL and records it in the index. It returns the local path.
 func (fs *Filesystem) SaveFile(rawURL string, data []byte, mimeType string) (string, error) {
 	path := fs.PathForURL(rawURL)
 	dir := filepath.Dir(path)
@@ -71,6 +79,8 @@ func (fs *Filesystem) SaveFile(rawURL string, data []byte, mimeType string) (str
 	return path, nil
 }
 
+// PathForURL returns the local filesystem path where content for the given
+// URL should be stored, guarding against path traversal.
 func (fs *Filesystem) PathForURL(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -82,7 +92,7 @@ func (fs *Filesystem) PathForURL(rawURL string) string {
 		host = "_unknown"
 	}
 
-cleanPath := u.Path
+	cleanPath := u.Path
 	if cleanPath == "" || cleanPath == "/" {
 		cleanPath = "/index.html"
 	}
@@ -138,6 +148,8 @@ cleanPath := u.Path
 	return resolved
 }
 
+// PathForAPI returns the local path for a captured API response, or an empty
+// string if the URL cannot be mapped safely.
 func (fs *Filesystem) PathForAPI(rawURL string) string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -163,6 +175,7 @@ func (fs *Filesystem) PathForAPI(rawURL string) string {
 	return resolved
 }
 
+// SaveHTML writes an HTML document to disk and records it in the index.
 func (fs *Filesystem) SaveHTML(rawURL string, data []byte) (string, error) {
 	path := fs.PathForURL(rawURL)
 	dir := filepath.Dir(path)
@@ -192,6 +205,7 @@ func (fs *Filesystem) SaveHTML(rawURL string, data []byte) (string, error) {
 	return path, nil
 }
 
+// SaveScreenshot writes a PNG screenshot for the given URL to disk.
 func (fs *Filesystem) SaveScreenshot(rawURL string, data []byte) (string, error) {
 	path := fs.PathForURL(rawURL) + ".png"
 	dir := filepath.Dir(path)
@@ -203,6 +217,7 @@ func (fs *Filesystem) SaveScreenshot(rawURL string, data []byte) (string, error)
 	return path, os.WriteFile(path, data, 0644)
 }
 
+// SavePDF writes a PDF document for the given URL to disk.
 func (fs *Filesystem) SavePDF(rawURL string, data []byte) (string, error) {
 	path := fs.PathForURL(rawURL) + ".pdf"
 	dir := filepath.Dir(path)
@@ -214,6 +229,7 @@ func (fs *Filesystem) SavePDF(rawURL string, data []byte) (string, error) {
 	return path, os.WriteFile(path, data, 0644)
 }
 
+// SaveShadowDOM writes captured shadow DOM content for the given URL to disk.
 func (fs *Filesystem) SaveShadowDOM(rawURL string, data []byte) (string, error) {
 	path := fs.PathForURL(rawURL) + "-shadowdom.json"
 	dir := filepath.Dir(path)
@@ -225,6 +241,7 @@ func (fs *Filesystem) SaveShadowDOM(rawURL string, data []byte) (string, error) 
 	return path, os.WriteFile(path, data, 0644)
 }
 
+// GetLocalPath returns the local path previously saved for rawURL, if any.
 func (fs *Filesystem) GetLocalPath(rawURL string) (string, bool) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()
@@ -235,6 +252,8 @@ func (fs *Filesystem) GetLocalPath(rawURL string) (string, bool) {
 	return info.LocalPath, true
 }
 
+// WriteIndex serializes the current index to index.json in the output
+// directory.
 func (fs *Filesystem) WriteIndex() error {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()

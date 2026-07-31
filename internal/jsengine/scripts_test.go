@@ -2,8 +2,44 @@ package jsengine
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 )
+
+func TestStealthScriptAntiFingerprinting(t *testing.T) {
+	checks := []struct {
+		name    string
+		pattern string
+	}{
+		{"canvas getImageData noise", `CanvasRenderingContext2D.prototype.getImageData`},
+		{"canvas toDataURL noise", `HTMLCanvasElement.prototype.toDataURL`},
+		{"webdriver hidden", `'webdriver'`},
+		{"plugins mocked", `'plugins'`},
+		{"webgl vendor masked", `37445`},
+		{"hardwareConcurrency fixed", `'hardwareConcurrency'`},
+		{"maxTouchPoints fixed", `'maxTouchPoints'`},
+		{"screen size fixed", `screen, 'width'`},
+	}
+	for _, c := range checks {
+		if !strings.Contains(StealthScript, c.pattern) {
+			t.Errorf("StealthScript missing %s (pattern %q)", c.name, c.pattern)
+		}
+	}
+
+	broken := []struct {
+		name    string
+		pattern string
+	}{
+		{"font check forced true", `fonts.check = function() { return true; }`},
+		{"broken webrtc sdp regex", `c=IN IP4\\d`},
+		{"broken webrtc ip6 regex", `c=IN IP6[^`},
+	}
+	for _, b := range broken {
+		if strings.Contains(StealthScript, b.pattern) {
+			t.Errorf("StealthScript still contains broken pattern %q (%s)", b.pattern, b.name)
+		}
+	}
+}
 
 func TestPushStateRouteJSON(t *testing.T) {
 	jsonStr := `[{"url":"/about","type":"pushState","title":"About","timestamp":1000},{"url":"/contact","type":"replaceState","title":"","timestamp":2000}]`

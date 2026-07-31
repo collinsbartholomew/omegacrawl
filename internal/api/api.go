@@ -9,6 +9,13 @@ import (
 	"time"
 )
 
+// MetricsHandler serves metrics in the Prometheus text exposition format.
+type MetricsHandler interface {
+	// MetricsHandler returns an HTTP handler serving scrape metrics.
+	MetricsHandler() http.Handler
+}
+
+// CrawlStatus reports the current state of a crawl operation.
 type CrawlStatus struct {
 	Running      bool   `json:"running"`
 	PagesFetched int64  `json:"pages_fetched"`
@@ -21,12 +28,14 @@ type CrawlStatus struct {
 	SeedURLs     int    `json:"seed_urls"`
 }
 
+// CrawlControl defines the interface for controlling a crawl lifecycle.
 type CrawlControl interface {
 	Status() CrawlStatus
 	Start(seeds []string) error
 	Stop()
 }
 
+// Server serves the crawl control HTTP API.
 type Server struct {
 	ctl     CrawlControl
 	server  *http.Server
@@ -36,10 +45,12 @@ type Server struct {
 	active  bool
 }
 
+// New creates a new API Server backed by the given crawl controller.
 func New(ctl CrawlControl) *Server {
 	return &Server{ctl: ctl, start: time.Now()}
 }
 
+// Start begins serving the HTTP API on the given port.
 func (s *Server) Start(port int) error {
 	if !s.running.CompareAndSwap(false, true) {
 		return fmt.Errorf("server already running")
@@ -48,6 +59,10 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/api/status", s.handleStatus)
 	mux.HandleFunc("/api/start", s.handleStart)
 	mux.HandleFunc("/api/stop", s.handleStop)
+
+	if mh, ok := s.ctl.(MetricsHandler); ok {
+		mux.Handle("/metrics", mh.MetricsHandler())
+	}
 
 	s.server = &http.Server{
 		Addr:         fmt.Sprintf(":%d", port),
@@ -58,6 +73,7 @@ func (s *Server) Start(port int) error {
 	return s.server.ListenAndServe()
 }
 
+// Stop shuts down the HTTP server if it is running.
 func (s *Server) Stop() {
 	if s.running.Load() {
 		s.server.Shutdown(nil)

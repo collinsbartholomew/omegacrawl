@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+// WARCWriter writes gzip-compressed WARC records to sequentially numbered
+// files, rotating to a new file when the size limit is reached.
 type WARCWriter struct {
 	outputDir string
 	mu        sync.Mutex
@@ -23,18 +25,20 @@ type WARCWriter struct {
 	curSize   int64
 }
 
+// WARCRecord represents a single WARC record to be written.
 type WARCRecord struct {
-	URL         string
-	Body        []byte
-	MimeType    string
-	IP          string
-	Date        time.Time
-	StatusCode  int
-	RecordType  string
-	ContentLen  int64
-	Headers     map[string]string
+	URL        string
+	Body       []byte
+	MimeType   string
+	IP         string
+	Date       time.Time
+	StatusCode int
+	RecordType string
+	ContentLen int64
+	Headers    map[string]string
 }
 
+// NewWARCWriter creates a WARCWriter that writes WARC files into outputDir.
 func NewWARCWriter(outputDir string) *WARCWriter {
 	return &WARCWriter{
 		outputDir: outputDir,
@@ -42,6 +46,8 @@ func NewWARCWriter(outputDir string) *WARCWriter {
 	}
 }
 
+// WriteRecord writes rec to the current WARC file, opening a new file when
+// the size limit is reached.
 func (w *WARCWriter) WriteRecord(rec *WARCRecord) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -69,6 +75,7 @@ func (w *WARCWriter) WriteRecord(rec *WARCRecord) error {
 	return nil
 }
 
+// Close flushes and closes the current gzip stream and underlying file.
 func (w *WARCWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -92,7 +99,7 @@ func (w *WARCWriter) openFile() error {
 	if err := os.MkdirAll(w.outputDir, 0755); err != nil {
 		return err
 	}
-	f, err := os.Create(path)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}

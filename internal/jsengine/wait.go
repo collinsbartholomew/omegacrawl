@@ -9,18 +9,24 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+// WaitStrategy defines a strategy for waiting on page conditions.
 type WaitStrategy interface {
 	Wait(ctx context.Context) error
 	Name() string
 }
 
+// WaitForResponseStrategy waits until a resource matching the URL pattern is loaded or the timeout elapses.
 type WaitForResponseStrategy struct {
 	URLPattern string
 	Timeout    time.Duration
 }
 
+// Wait waits until a network resource matching the URL pattern is observed or the timeout elapses.
 func (w *WaitForResponseStrategy) Wait(ctx context.Context) error {
-	patternJSON, _ := json.Marshal(w.URLPattern)
+	patternJSON, err := json.Marshal(w.URLPattern)
+	if err != nil {
+		return fmt.Errorf("failed to marshal url pattern: %w", err)
+	}
 	script := fmt.Sprintf(`
 		(function(pattern, timeout) {
 			return new Promise((resolve) => {
@@ -47,12 +53,14 @@ func (w *WaitForResponseStrategy) Wait(ctx context.Context) error {
 		})(%s, %d)
 	`, string(patternJSON), w.Timeout.Milliseconds())
 	var result map[string]interface{}
-	err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+	err = chromedp.Run(ctx, chromedp.Evaluate(script, &result))
 	return err
 }
 
+// Name returns the strategy name "response".
 func (w *WaitForResponseStrategy) Name() string { return "response" }
 
+// AdaptiveWaitStrategy waits for framework-specific readiness signals based on the detected framework.
 type AdaptiveWaitStrategy struct {
 	Framework    string
 	SelectorWait time.Duration
@@ -60,6 +68,7 @@ type AdaptiveWaitStrategy struct {
 	MaxWait      time.Duration
 }
 
+// Wait waits for the page to become ready using the strategy matching the configured framework.
 func (a *AdaptiveWaitStrategy) Wait(ctx context.Context) error {
 	switch a.Framework {
 	case "react", "nextjs":
@@ -170,4 +179,5 @@ func (a *AdaptiveWaitStrategy) waitGeneric(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(script, &result))
 }
 
+// Name returns the strategy name "adaptive".
 func (a *AdaptiveWaitStrategy) Name() string { return "adaptive" }

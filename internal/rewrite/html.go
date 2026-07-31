@@ -14,9 +14,9 @@ import (
 
 	stdhtml "html"
 
+	"go.uber.org/zap"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
-	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/util"
 )
@@ -31,10 +31,10 @@ var (
 )
 
 var urlAttrs = map[atom.Atom]bool{
-	atom.Href:       true,
-	atom.Src:        true,
-	atom.Action:     true,
-	atom.Poster:     true,
+	atom.Href:   true,
+	atom.Src:    true,
+	atom.Action: true,
+	atom.Poster: true,
 }
 
 var dataURLAttrs = map[string]bool{
@@ -55,14 +55,16 @@ var dataURLAttrs = map[string]bool{
 	"data-settings":    true,
 }
 
+// Rewriter rewrites HTML and CSS to replace remote URLs with local file paths.
 type Rewriter struct {
-	urlToLocal     map[string]string
-	absoluteToRel  map[string]string
-	cssFiles       map[string]bool
-	baseURL        string
-	mu             sync.RWMutex
+	urlToLocal    map[string]string
+	absoluteToRel map[string]string
+	cssFiles      map[string]bool
+	baseURL       string
+	mu            sync.RWMutex
 }
 
+// NewRewriter returns an empty Rewriter ready for URL mappings.
 func NewRewriter() *Rewriter {
 	return &Rewriter{
 		urlToLocal:    make(map[string]string),
@@ -71,12 +73,14 @@ func NewRewriter() *Rewriter {
 	}
 }
 
+// SetBaseURL sets the base URL used when resolving relative references.
 func (r *Rewriter) SetBaseURL(baseURL string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.baseURL = baseURL
 }
 
+// AddMapping records that an original URL maps to a local file path.
 func (r *Rewriter) AddMapping(originalURL, localPath string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -86,6 +90,7 @@ func (r *Rewriter) AddMapping(originalURL, localPath string) {
 	}
 }
 
+// GetCSSFiles returns a copy of the map of local CSS file paths.
 func (r *Rewriter) GetCSSFiles() map[string]bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -96,6 +101,7 @@ func (r *Rewriter) GetCSSFiles() map[string]bool {
 	return result
 }
 
+// GetMappings returns a copy of the URL-to-local-path mapping.
 func (r *Rewriter) GetMappings() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -106,6 +112,7 @@ func (r *Rewriter) GetMappings() map[string]string {
 	return result
 }
 
+// GetAbsoluteToRel returns a copy of the absolute-URL-to-relative-path mapping.
 func (r *Rewriter) GetAbsoluteToRel() map[string]string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -116,6 +123,7 @@ func (r *Rewriter) GetAbsoluteToRel() map[string]string {
 	return result
 }
 
+// AddAbsoluteToRelMapping records that an absolute URL should be rewritten to a relative path.
 func (r *Rewriter) AddAbsoluteToRelMapping(absoluteURL, relativePath string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -130,6 +138,7 @@ func isURLAttr(key []byte) bool {
 	return dataURLAttrs[string(key)]
 }
 
+// RewriteHTML rewrites URLs in the given HTML content to local relative paths.
 func (r *Rewriter) RewriteHTML(htmlContent []byte, htmlLocalPath string) []byte {
 	htmlDir := filepath.Dir(htmlLocalPath)
 
@@ -597,7 +606,11 @@ func rewriteInlineCSSURLs(styleVal []byte, htmlDir string, baseURL string, mappi
 			urlStr := string(matches[1])
 			urlStr = strings.Trim(urlStr, `"' `)
 			if localPath, ok := mappings[urlStr]; ok {
-				relPath, _ := filepath.Rel(htmlDir, localPath)
+				relPath, err := filepath.Rel(htmlDir, localPath)
+				if err != nil {
+					util.LogError("failed to compute relative path for import", err, zap.String("baseDir", htmlDir), zap.String("localPath", localPath))
+					relPath = localPath
+				}
 				relPath = filepath.ToSlash(relPath)
 				return bytes.Replace(match, matches[1], []byte(relPath), 1)
 			}
@@ -679,6 +692,7 @@ func replaceAbsoluteURLs(input []byte, absRelCache map[string]string) []byte {
 	return batchReplace(input, pairs)
 }
 
+// RewriteCSS rewrites URLs in the given CSS content to local relative paths.
 func (r *Rewriter) RewriteCSS(css []byte, cssLocalPath string) []byte {
 	result := css
 	cssDir := filepath.Dir(cssLocalPath)
@@ -761,7 +775,11 @@ func (r *Rewriter) RewriteCSS(css []byte, cssLocalPath string) []byte {
 			urlStr := string(matches[1])
 			urlStr = strings.Trim(urlStr, `"' `)
 			if localPath, ok := mappings[urlStr]; ok {
-				relPath, _ := filepath.Rel(cssDir, localPath)
+				relPath, err := filepath.Rel(cssDir, localPath)
+				if err != nil {
+					util.LogError("failed to compute relative path for CSS import", err, zap.String("baseDir", cssDir), zap.String("localPath", localPath))
+					relPath = localPath
+				}
 				relPath = filepath.ToSlash(relPath)
 				return bytes.Replace(match, matches[1], []byte(relPath), 1)
 			}
@@ -826,6 +844,7 @@ func (r *Rewriter) processCSSImportsForURL(cssLocalPath string) {
 	r.processCSSImportsRecursive(cssLocalPath, mappings)
 }
 
+// ProcessFiles rewrites each file in place based on its declared type ("html" or "css").
 func (r *Rewriter) ProcessFiles(files map[string]string) error {
 	util.LogDebug("=== DEBUG: ProcessFiles called ===")
 	for filePath, fileType := range files {
@@ -858,6 +877,7 @@ func (r *Rewriter) ProcessFiles(files map[string]string) error {
 	return nil
 }
 
+// ExtractLinks returns the same-host absolute URLs referenced by the HTML content.
 func (r *Rewriter) ExtractLinks(baseURL string, htmlContent []byte) []string {
 	var links []string
 	baseParsed, _ := url.Parse(baseURL)
@@ -948,6 +968,7 @@ func (r *Rewriter) ExtractLinks(baseURL string, htmlContent []byte) []string {
 	return links
 }
 
+// ExtractFontURLs returns the unique URLs referenced by @font-face src declarations.
 func (r *Rewriter) ExtractFontURLs(cssContent []byte) []string {
 	var urls []string
 	seen := make(map[string]bool)
@@ -969,6 +990,7 @@ func (r *Rewriter) ExtractFontURLs(cssContent []byte) []string {
 	return urls
 }
 
+// ExtractAllCSSURLs returns the unique URLs referenced in the CSS content, excluding data URIs.
 func (r *Rewriter) ExtractAllCSSURLs(cssContent []byte) []string {
 	var urls []string
 	seen := make(map[string]bool)
@@ -995,6 +1017,7 @@ func isSameHost(base *url.URL, rawURL string) bool {
 	return parsed.Hostname() == "" || parsed.Hostname() == base.Hostname()
 }
 
+// ResolveURL resolves href against base, returning it unchanged if already absolute.
 func ResolveURL(base, href string) string {
 	if href == "" {
 		return ""
@@ -1018,6 +1041,7 @@ func ResolveURL(base, href string) string {
 	return resolved.String()
 }
 
+// GenerateSingleFileHTML rewrites the HTML and inlines linked CSS, JS, and images into a single file.
 func (r *Rewriter) GenerateSingleFileHTML(htmlContent []byte, htmlLocalPath string) ([]byte, error) {
 	rewritten := r.RewriteHTML(htmlContent, htmlLocalPath)
 

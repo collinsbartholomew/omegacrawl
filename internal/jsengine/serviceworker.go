@@ -9,15 +9,18 @@ import (
 	"github.com/user/clone/internal/util"
 )
 
+// ServiceWorkerManager tracks and manages service worker registrations in a browser context.
 type ServiceWorkerManager struct {
 	initialState *ServiceWorkerInfo
 	mu           sync.RWMutex
 }
 
+// NewServiceWorkerManager returns an empty ServiceWorkerManager.
 func NewServiceWorkerManager() *ServiceWorkerManager {
 	return &ServiceWorkerManager{}
 }
 
+// Detect finds service worker registrations and records them as the manager's initial state.
 func (m *ServiceWorkerManager) Detect(ctx context.Context) (*ServiceWorkerInfo, error) {
 	info, err := DetectServiceWorkers(ctx)
 	if err != nil {
@@ -41,6 +44,7 @@ func (m *ServiceWorkerManager) Detect(ctx context.Context) (*ServiceWorkerInfo, 
 	return info, nil
 }
 
+// Unregister removes all service worker registrations and returns how many were removed.
 func (m *ServiceWorkerManager) Unregister(ctx context.Context) (int, error) {
 	count, err := UnregisterServiceWorkers(ctx)
 	if err != nil {
@@ -52,6 +56,7 @@ func (m *ServiceWorkerManager) Unregister(ctx context.Context) (int, error) {
 	return count, nil
 }
 
+// GetInitial returns the service worker state captured at detect time.
 func (m *ServiceWorkerManager) GetInitial() *ServiceWorkerInfo {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

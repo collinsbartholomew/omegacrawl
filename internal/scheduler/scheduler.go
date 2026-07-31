@@ -8,12 +8,14 @@ import (
 	"time"
 )
 
+// Config holds the scheduler settings for a single job.
 type Config struct {
 	Enabled  bool   `json:"enabled"`
 	CronExpr string `json:"cron_expr"`
 	Timezone string `json:"timezone"`
 }
 
+// Job describes a scheduled task with a cron expression and run function.
 type Job struct {
 	ID       string
 	Name     string
@@ -21,17 +23,20 @@ type Job struct {
 	RunFunc  func(context.Context) error
 }
 
+// Scheduler manages a set of cron jobs and runs them on schedule.
 type Scheduler struct {
-	mu       sync.Mutex
-	jobs     []*Job
-	timers   []*time.Timer
-	cancel   context.CancelFunc
+	mu     sync.Mutex
+	jobs   []*Job
+	timers []*time.Timer
+	cancel context.CancelFunc
 }
 
+// New returns an empty Scheduler.
 func New() *Scheduler {
 	return &Scheduler{}
 }
 
+// Add validates the job's cron expression and registers it with the scheduler.
 func (s *Scheduler) Add(job *Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -43,6 +48,7 @@ func (s *Scheduler) Add(job *Job) error {
 	return nil
 }
 
+// Start schedules all registered jobs to run according to their cron expressions.
 func (s *Scheduler) Start(ctx context.Context) {
 	ctx, s.cancel = context.WithCancel(ctx)
 	for _, job := range s.jobs {
@@ -51,6 +57,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}
 }
 
+// Stop cancels all running jobs and stops pending timers.
 func (s *Scheduler) Stop() {
 	if s.cancel != nil {
 		s.cancel()
@@ -185,5 +192,3 @@ func matchField(pattern string, value, min, max int) bool {
 	}
 	return false
 }
-
-

@@ -9,6 +9,7 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// RateLimiter manages per-host rate limits with adaptive delay adjustment.
 type RateLimiter struct {
 	limiters    map[string]*hostLimiter
 	mu          sync.RWMutex
@@ -28,6 +29,7 @@ type hostLimiter struct {
 	mu          sync.Mutex
 }
 
+// New creates a RateLimiter with the given default delay between requests and burst size.
 func New(ctx context.Context, defaultDelay time.Duration, burstSize int) *RateLimiter {
 	if burstSize < 1 {
 		burstSize = 1
@@ -84,16 +86,19 @@ func (rl *RateLimiter) get(host string, baseDelay time.Duration) *rate.Limiter {
 	return hl.limiter
 }
 
+// Wait blocks until a request is permitted for the given host at the given delay.
 func (rl *RateLimiter) Wait(ctx context.Context, host string, baseDelay time.Duration) error {
 	limiter := rl.get(host, baseDelay)
 	return limiter.Wait(ctx)
 }
 
+// Allow reports whether a request to the given host is permitted without blocking.
 func (rl *RateLimiter) Allow(host string, baseDelay time.Duration) bool {
 	limiter := rl.get(host, baseDelay)
 	return limiter.Allow()
 }
 
+// ObserveLatency feeds observed request latency back into the host limiter to adaptively adjust its rate.
 func (rl *RateLimiter) ObserveLatency(host string, latency time.Duration) {
 	rl.mu.RLock()
 	hl, ok := rl.limiters[host]
@@ -128,6 +133,7 @@ func (rl *RateLimiter) ObserveLatency(host string, latency time.Duration) {
 	}
 }
 
+// Cleanup removes limiters for hosts that have not been active recently.
 func (rl *RateLimiter) Cleanup() {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
@@ -156,12 +162,14 @@ func (rl *RateLimiter) periodicCleanup(ctx context.Context) {
 	}
 }
 
+// Stop halts the periodic cleanup goroutine.
 func (rl *RateLimiter) Stop() {
 	rl.stopOnce.Do(func() {
 		close(rl.cleanupDone)
 	})
 }
 
+// Len returns the number of tracked host limiters.
 func (rl *RateLimiter) Len() int {
 	rl.mu.RLock()
 	defer rl.mu.RUnlock()

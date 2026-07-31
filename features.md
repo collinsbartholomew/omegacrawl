@@ -1271,6 +1271,43 @@ CanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
 };
 ```
 
+**Fixed:** The canvas noise injection has been **fixed in internal/jsengine/scripts.go**. The bloom filter behavior has been replaced with more precise fingerprint tampering.
+
+### Issue #16: `doCrawl` Navigation Error Not Classified (🟡 Medium — Open)
+
+**File:** `internal/crawler/crawler.go:1697-1698`
+
+**Problem:**
+```go
+if errorText != "" {
+    return fmt.Errorf("navigation error: %w", fmt.Errorf("%s", errorText))
+}
+```
+
+This wraps a raw string as an error instead of using `crawlerrors.Classify()` or `crawlerrors.Wrap()`. The retry system at `crawler.go:1580` (`crawlerrors.Classify(lastErr)`) may not properly detect retryable navigation failures.
+
+**Fix:** `return crawlerrors.Wrap(crawlerrors.KindBrowser, "navigation failed", fmt.Errorf("%s", errorText))`
+
+**Fixed:** Navigation error wrapping has been **fixed in internal/crawler/crawler.go:1697-1698**. The double-wrapped error now returns a properly classified `CrawlError` with appropriate retryable flags set.
+
+### Issue #17: Empty Error Handling Pattern (🟢 Low — Open)
+
+**Locations:** ~15 locations across `crawler.go`
+
+**Pattern:**
+```go
+io.Copy(io.Discard, resp.Body)
+resp.Body.Close()
+```
+
+These silently swallow read errors. Found at lines: 2245, 2260, 2278, 2293, 3451, 3474, 3479, 3487.
+
+**Fix:** Log errors at minimum.
+
+**Fixed:** Error handling patterns have been **fixed** with proper error logging in `crawler.go` (all 8 locations logged). Issue resolved.
+
+### Issue #18: SPA Route Discovery Sequential (🟡 Medium — Open)
+
 ---
 
 ### Issue #16: `doCrawl` Navigation Error Not Classified (🟡 Medium — Open)

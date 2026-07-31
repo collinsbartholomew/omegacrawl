@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+// WACZWriter accumulates WARC records and packages them into a WACZ archive
+// on Close.
 type WACZWriter struct {
 	outputDir  string
 	outputName string
@@ -29,22 +31,25 @@ type WACZWriter struct {
 	maxSize    int64
 }
 
+// WACZMetadata describes the contents of a WACZ archive.
 type WACZMetadata struct {
-	CreatedAt   string `json:"created_at"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Software    string `json:"software"`
-	Format      string `json:"format"`
-	WARCFileCount int  `json:"warc_file_count"`
-	PageCount   int    `json:"page_count"`
+	CreatedAt     string `json:"created_at"`
+	Title         string `json:"title"`
+	Description   string `json:"description"`
+	Software      string `json:"software"`
+	Format        string `json:"format"`
+	WARCFileCount int    `json:"warc_file_count"`
+	PageCount     int    `json:"page_count"`
 }
 
+// WACZFileInfo describes a single file stored inside a WACZ archive.
 type WACZFileInfo struct {
 	Title    string `json:"title"`
 	FilePath string `json:"file_path"`
 	Size     int64  `json:"size"`
 }
 
+// NewWACZWriter creates a WACZWriter that writes archives into outputDir.
 func NewWACZWriter(outputDir string) *WACZWriter {
 	return &WACZWriter{
 		outputDir: outputDir,
@@ -52,6 +57,8 @@ func NewWACZWriter(outputDir string) *WACZWriter {
 	}
 }
 
+// WriteRecord serializes rec into the current WARC segment, starting a new
+// gzip stream when the segment size limit is reached.
 func (w *WACZWriter) WriteRecord(rec *WARCRecord) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -125,6 +132,8 @@ func (w *WACZWriter) writeWARCRecord(rec *WARCRecord) error {
 	return nil
 }
 
+// Close finalizes the archive: it writes the WARC segments, the CDX index,
+// and the datapackage metadata into a new .wacz zip file.
 func (w *WACZWriter) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -146,7 +155,7 @@ func (w *WACZWriter) Close() error {
 	filename := fmt.Sprintf("crawl-%s.wacz", now.Format("20060102150405"))
 	outputPath := filepath.Join(w.outputDir, filename)
 
-	f, err := os.Create(outputPath)
+	f, err := os.OpenFile(outputPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -192,7 +201,10 @@ func (w *WACZWriter) Close() error {
 		WARCFileCount: 1,
 		PageCount:     len(w.records),
 	}
-	metaJSON, _ := json.MarshalIndent(meta, "", "  ")
+	metaJSON, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal metadata: %w", err)
+	}
 	metaEntry, err := zw.Create("datapackage.json")
 	if err != nil {
 		return err

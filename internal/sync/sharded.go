@@ -22,17 +22,22 @@ func shardCount() uint32 {
 	return uint32(n + 1)
 }
 
+// Shard is a single map partition guarded by its own mutex.
 type Shard[K comparable, V any] struct {
 	mu    sync.RWMutex
 	items map[K]V
 }
 
+// ShardedMap is a concurrent map that distributes keys across many shards to
+// reduce lock contention.
 type ShardedMap[K comparable, V any] struct {
 	shards    []Shard[K, V]
 	hashFn    func(key K) uint32
 	shardMask uint32
 }
 
+// NewShardedMap creates a ShardedMap sized to the number of available CPU
+// cores, applying any option functions.
 func NewShardedMap[K comparable, V any](opts ...func(*ShardedMap[K, V])) *ShardedMap[K, V] {
 	count := shardCount()
 	mask := count - 1
@@ -59,6 +64,7 @@ func defaultHash[K comparable](key K) uint32 {
 	return uint32(h.Sum64())
 }
 
+// WithHashFn returns an option that overrides the default key hash function.
 func WithHashFn[K comparable, V any](fn func(K) uint32) func(*ShardedMap[K, V]) {
 	return func(sm *ShardedMap[K, V]) {
 		sm.hashFn = fn
@@ -69,6 +75,7 @@ func (sm *ShardedMap[K, V]) getShard(key K) *Shard[K, V] {
 	return &sm.shards[sm.hashFn(key)&sm.shardMask]
 }
 
+// Get returns the value stored for key, if present.
 func (sm *ShardedMap[K, V]) Get(key K) (V, bool) {
 	shard := sm.getShard(key)
 	shard.mu.RLock()
@@ -77,6 +84,7 @@ func (sm *ShardedMap[K, V]) Get(key K) (V, bool) {
 	return v, ok
 }
 
+// Set stores val under key.
 func (sm *ShardedMap[K, V]) Set(key K, val V) {
 	shard := sm.getShard(key)
 	shard.mu.Lock()
@@ -84,6 +92,7 @@ func (sm *ShardedMap[K, V]) Set(key K, val V) {
 	shard.mu.Unlock()
 }
 
+// Delete removes key from the map.
 func (sm *ShardedMap[K, V]) Delete(key K) {
 	shard := sm.getShard(key)
 	shard.mu.Lock()
@@ -91,6 +100,7 @@ func (sm *ShardedMap[K, V]) Delete(key K) {
 	shard.mu.Unlock()
 }
 
+// Has reports whether key is present in the map.
 func (sm *ShardedMap[K, V]) Has(key K) bool {
 	shard := sm.getShard(key)
 	shard.mu.RLock()
@@ -99,6 +109,8 @@ func (sm *ShardedMap[K, V]) Has(key K) bool {
 	return ok
 }
 
+// GetOrSet returns the existing value for key, or stores and returns val if
+// key is absent. loaded is true when the key already existed.
 func (sm *ShardedMap[K, V]) GetOrSet(key K, val V) (actual V, loaded bool) {
 	shard := sm.getShard(key)
 	shard.mu.Lock()
@@ -111,6 +123,7 @@ func (sm *ShardedMap[K, V]) GetOrSet(key K, val V) (actual V, loaded bool) {
 	return val, false
 }
 
+// Len returns the total number of entries across all shards.
 func (sm *ShardedMap[K, V]) Len() int {
 	total := 0
 	for i := range sm.shards {
@@ -121,6 +134,7 @@ func (sm *ShardedMap[K, V]) Len() int {
 	return total
 }
 
+// Range calls fn for each key/value pair until fn returns false.
 func (sm *ShardedMap[K, V]) Range(fn func(key K, val V) bool) {
 	for i := range sm.shards {
 		sm.shards[i].mu.RLock()
@@ -134,6 +148,7 @@ func (sm *ShardedMap[K, V]) Range(fn func(key K, val V) bool) {
 	}
 }
 
+// Clear removes all entries from the map.
 func (sm *ShardedMap[K, V]) Clear() {
 	for i := range sm.shards {
 		sm.shards[i].mu.Lock()

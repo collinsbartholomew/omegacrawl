@@ -11,6 +11,7 @@ import (
 )
 
 const (
+	// StealthScript hides automation fingerprints from the page.
 	StealthScript = `
 		(function() {
 			// Remove CDP-specific $cdc_ properties from window
@@ -47,63 +48,86 @@ const (
 				configurable: true,
 			});
 
-			// Canvas fingerprint protection
+			// Canvas fingerprint protection: add deterministic-ish noise to
+			// both getImageData and toDataURL outputs without mutating the
+			// live canvas (mutating it is detectable and breaks page logic).
 			try {
 				const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-				const origToBlob = HTMLCanvasElement.prototype.toBlob;
 				const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
 
-				HTMLCanvasElement.prototype.toDataURL = function() {
-					const r = Math.random() * 0.01 - 0.005;
-					const g = Math.random() * 0.01 - 0.005;
-					const b = Math.random() * 0.01 - 0.005;
-					const ctx = this.getContext('2d');
-					if (ctx) {
-						const imageData = ctx.getImageData(0, 0, this.width, this.height);
-						for (let i = 0; i < imageData.data.length; i += 4) {
-							imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + r));
-							imageData.data[i+1] = Math.min(255, Math.max(0, imageData.data[i+1] + g));
-							imageData.data[i+2] = Math.min(255, Math.max(0, imageData.data[i+2] + b));
-						}
-						ctx.putImageData(imageData, 0, 0);
-					}
-					return origToDataURL.apply(this, arguments);
-				};
-				HTMLCanvasElement.prototype.toBlob = function() {
-					return origToBlob.apply(this, arguments);
-				};
 				CanvasRenderingContext2D.prototype.getImageData = function() {
 					const imageData = origGetImageData.apply(this, arguments);
 					for (let i = 0; i < imageData.data.length; i += 4) {
-						imageData.data[i] = Math.min(255, Math.max(0, imageData.data[i] + (Math.random() * 0.5)));
-						imageData.data[i+1] = Math.min(255, Math.max(0, imageData.data[i+1] + (Math.random() * 0.5)));
-						imageData.data[i+2] = Math.min(255, Math.max(0, imageData.data[i+2] + (Math.random() * 0.5)));
+						imageData.data[i] = imageData.data[i] ^ (imageData.data[i+3] % 3 === 0 ? 1 : 0);
+						imageData.data[i+1] = imageData.data[i+1] ^ (imageData.data[i+3] % 3 === 1 ? 1 : 0);
+						imageData.data[i+2] = imageData.data[i+2] ^ (imageData.data[i+3] % 3 === 2 ? 1 : 0);
 					}
 					return imageData;
 				};
+
+				HTMLCanvasElement.prototype.toDataURL = function() {
+					const ctx = this.getContext('2d');
+					if (ctx) {
+						const imageData = origGetImageData.call(ctx, 0, 0, this.width, this.height);
+						for (let i = 0; i < imageData.data.length; i += 4) {
+							imageData.data[i] = imageData.data[i] ^ 1;
+							imageData.data[i+1] = imageData.data[i+1] ^ 1;
+							imageData.data[i+2] = imageData.data[i+2] ^ 1;
+						}
+						const tmp = document.createElement('canvas');
+						tmp.width = this.width;
+						tmp.height = this.height;
+						const tmpCtx = tmp.getContext('2d');
+						tmpCtx.putImageData(imageData, 0, 0);
+						return origToDataURL.call(tmp, ...arguments);
+					}
+					return origToDataURL.apply(this, arguments);
+				};
 			} catch(e) {}
 
-			// WebRTC IP leak protection
+			// WebRTC IP leak protection: mask the ICE candidate addresses in
+			// both createOffer and createAnswer SDP.
 			try {
 				if (window.RTCPeerConnection) {
+					const maskSDP = (sdp) => sdp
+						.replace(/c=IN IP4 \d+\.\d+\.\d+\.\d+/g, 'c=IN IP4 0.0.0.0')
+						.replace(/c=IN IP6 [0-9a-f:]+/gi, 'c=IN IP6 ::')
+						.replace(/a=ice-ufrag:[^\r\n]+/g, 'a=ice-ufrag:abcdefgh')
+						.replace(/a=ice-pwd:[^\r\n]+/g, 'a=ice-pwd:abcdefghijklmnopqrstuvwxyz');
 					const origCreateOffer = RTCPeerConnection.prototype.createOffer;
+					const origCreateAnswer = RTCPeerConnection.prototype.createAnswer;
 					RTCPeerConnection.prototype.createOffer = function() {
-						return origCreateOffer.apply(this, arguments).then(offer => {
-							offer.sdp = offer.sdp.replace(/c=IN IP4\d+\.\d+\.\d+\.\d+/g, 'c=IN IP4 0.0.0.0');
-							offer.sdp = offer.sdp.replace(/c=IN IP6[^\r\n]+/g, 'c=IN IP6 ::');
-							return offer;
-						});
+						const result = origCreateOffer.apply(this, arguments);
+						if (result && result.then) {
+							return result.then(offer => {
+								offer.sdp = maskSDP(offer.sdp || '');
+								return offer;
+							});
+						}
+						if (result && result.sdp) {
+							result.sdp = maskSDP(result.sdp);
+						}
+						return result;
+					};
+					RTCPeerConnection.prototype.createAnswer = function() {
+						const result = origCreateAnswer.apply(this, arguments);
+						if (result && result.then) {
+							return result.then(answer => {
+								answer.sdp = maskSDP(answer.sdp || '');
+								return answer;
+							});
+						}
+						if (result && result.sdp) {
+							result.sdp = maskSDP(result.sdp);
+						}
+						return result;
 					};
 				}
 			} catch(e) {}
 
-			// Font fingerprint protection - disable non-standard font enumeration
-			try {
-				if (document.fonts) {
-					const origCheck = document.fonts.check;
-					document.fonts.check = function() { return true; };
-				}
-			} catch(e) {}
+			// Font fingerprint protection - intentionally left untouched: an
+			// always-true override breaks layout logic and is itself detectable.
+			// The real engine font stack renders consistently across sessions.
 
 			// Override AudioContext fingerprinting
 			try {
@@ -228,6 +252,18 @@ const (
 				});
 			}
 
+			// Override navigator.platform
+			Object.defineProperty(navigator, 'platform', {
+				get: () => 'Linux x86_64',
+				configurable: true,
+			});
+
+			// Override navigator.vendor
+			Object.defineProperty(navigator, 'vendor', {
+				get: () => 'Google Inc.',
+				configurable: true,
+			});
+
 			// Hide headless by fixing Screen properties
 			Object.defineProperty(screen, 'width', { get: () => 1920, configurable: true });
 			Object.defineProperty(screen, 'height', { get: () => 1080, configurable: true });
@@ -252,6 +288,7 @@ const (
 		})();
 	`
 
+	// LazyLoadScript triggers loading of lazily loaded images, backgrounds, and iframes.
 	LazyLoadScript = `
 		// Trigger lazy loading for all images
 		document.querySelectorAll('img[data-src], img[data-lazy-src], img[loading="lazy"]').forEach(img => {
@@ -271,6 +308,7 @@ const (
 		});
 	`
 
+	// InfiniteScrollScript returns the current scroll and item metrics of the page.
 	InfiniteScrollScript = `
 		// Return current scroll metrics
 		(function() {
@@ -284,10 +322,12 @@ const (
 		})()
 	`
 
+	// ScrollToBottomScript scrolls the window to the bottom of the page.
 	ScrollToBottomScript = `
 		window.scrollTo(0, document.body.scrollHeight);
 	`
 
+	// ClickLoadMoreScript clicks a visible load-more button by selector or text match.
 	ClickLoadMoreScript = `
 		(function() {
 			const selectors = [
@@ -326,6 +366,7 @@ const (
 		})()
 	`
 
+	// DiscoverRoutesScript detects SPA frameworks and extracts candidate client-side routes.
 	DiscoverRoutesScript = `
 		(function() {
 			// Check for common SPA frameworks
@@ -376,6 +417,7 @@ const (
 		})()
 	`
 
+	// ExtractShadowDOMScript collects all shadow roots and their inner HTML.
 	ExtractShadowDOMScript = `
 		(function() {
 			function deepQuery(root, selector) {
@@ -411,6 +453,7 @@ const (
 		})()
 	`
 
+	// DetectFrameworkScript identifies the frontend framework and its hydration state.
 	DetectFrameworkScript = `
 		(function() {
 			const detection = {
@@ -480,6 +523,7 @@ const (
 		})()
 	`
 
+	// WaitForSelectorScript polls until an element matching the selector appears or the timeout elapses.
 	WaitForSelectorScript = `
 		(function(selector, timeout) {
 			return new Promise((resolve) => {
@@ -499,6 +543,7 @@ const (
 		})('%s', %d)
 	`
 
+	// WaitForNetworkIdleScript resolves once no fetch or XHR activity occurs for a quiet period.
 	WaitForNetworkIdleScript = `
 		(function(quietPeriod) {
 			return new Promise((resolve) => {
@@ -531,6 +576,7 @@ const (
 		})(%d)
 	`
 
+	// PushStateCaptureScript instruments history APIs to record client-side navigation.
 	PushStateCaptureScript = `
 		(function() {
 			if (window.__pushStateCaptured) return;
@@ -585,12 +631,14 @@ const (
 		})()
 	`
 
+	// GetPushStateRoutesLScript serializes the routes captured by PushStateCaptureScript.
 	GetPushStateRoutesLScript = `
 		(function() {
 			return JSON.stringify(window.__pushStateRoutes || []);
 		})()
 	`
 
+	// ExtractIframeSourcesScript extracts the source attributes of all iframes and frames.
 	ExtractIframeSourcesScript = `
 		(function() {
 			const iframes = document.querySelectorAll('iframe, frame');
@@ -616,6 +664,7 @@ const (
 		})()
 	`
 
+	// ExtractMediaSourcesScript extracts source attributes from video and audio elements.
 	ExtractMediaSourcesScript = `
 		(function() {
 			const results = [];
@@ -652,6 +701,7 @@ const (
 		})()
 	`
 
+	// ExtractStructuredDataScript extracts JSON-LD, Open Graph, Twitter, and meta tag data.
 	ExtractStructuredDataScript = `
 		(function() {
 			var result = { jsonld: [], og: {}, twitter: {}, meta: {} };
@@ -679,6 +729,7 @@ const (
 	`
 )
 
+// RouteInfo holds the frameworks and candidate routes discovered on a page.
 type RouteInfo struct {
 	Frameworks []FrameworkInfo `json:"frameworks"`
 	Routes     []string        `json:"routes"`
@@ -686,22 +737,26 @@ type RouteInfo struct {
 	URL        string          `json:"url"`
 }
 
+// FrameworkInfo describes a detected frontend framework and its version.
 type FrameworkInfo struct {
-	Framework string `json:"framework"`
-	Version   string `json:"version,omitempty"`
+	Framework string      `json:"framework"`
+	Version   string      `json:"version,omitempty"`
 	Data      interface{} `json:"data,omitempty"`
 }
 
+// ShadowDOMInfo lists all shadow roots found on a page.
 type ShadowDOMInfo struct {
 	ShadowRoots []ShadowRoot `json:"shadowRoots"`
-	Count        int          `json:"count"`
+	Count       int          `json:"count"`
 }
 
+// ShadowRoot describes a single shadow root's host tag and inner HTML.
 type ShadowRoot struct {
-	Tag        string `json:"tag"`
-	InnerHTML  string `json:"innerHTML"`
+	Tag       string `json:"tag"`
+	InnerHTML string `json:"innerHTML"`
 }
 
+// FrameworkDetection reports the detected framework, hydration, and loading state.
 type FrameworkDetection struct {
 	Framework    string `json:"framework"`
 	Version      string `json:"version,omitempty"`
@@ -710,6 +765,7 @@ type FrameworkDetection struct {
 	LoadingState string `json:"loadingState"`
 }
 
+// ScrollMetrics captures the current scroll and content metrics of the page.
 type ScrollMetrics struct {
 	ScrollHeight   int `json:"scrollHeight"`
 	ScrollTop      int `json:"scrollTop"`
@@ -718,32 +774,41 @@ type ScrollMetrics struct {
 	ViewportHeight int `json:"viewportHeight"`
 }
 
+// InjectStealth injects the stealth script to hide automation fingerprints.
 func InjectStealth(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(StealthScript, nil))
 }
 
+// InjectLazyLoad injects the script that triggers lazy-loaded resources.
 func InjectLazyLoad(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(LazyLoadScript, nil))
 }
 
+// GetScrollMetrics returns the current scroll and item metrics of the page.
 func GetScrollMetrics(ctx context.Context) (*ScrollMetrics, error) {
 	var result ScrollMetrics
 	err := chromedp.Run(ctx, chromedp.Evaluate(InfiniteScrollScript, &result))
 	return &result, err
 }
 
+// ScrollToBottom scrolls the window to the bottom of the page.
 func ScrollToBottom(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(ScrollToBottomScript, nil))
 }
 
+// ClickLoadMore clicks a visible load-more button and reports whether one was found.
 func ClickLoadMore(ctx context.Context) (bool, error) {
 	var result bool
 	err := chromedp.Run(ctx, chromedp.Evaluate(ClickLoadMoreScript, &result))
 	return result, err
 }
 
+// ClickElement clicks the element matching the given selector, if present.
 func ClickElement(ctx context.Context, selector string) error {
-	safeSelector, _ := json.Marshal(selector)
+	safeSelector, err := json.Marshal(selector)
+	if err != nil {
+		return fmt.Errorf("failed to marshal selector: %w", err)
+	}
 	script := fmt.Sprintf(`
 		(function(selector) {
 			const el = document.querySelector(selector);
@@ -755,31 +820,38 @@ func ClickElement(ctx context.Context, selector string) error {
 		})(%s)
 	`, string(safeSelector))
 	var result bool
-	err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+	err = chromedp.Run(ctx, chromedp.Evaluate(script, &result))
 	return err
 }
 
+// DiscoverRoutes detects SPA frameworks and extracts candidate client-side routes.
 func DiscoverRoutes(ctx context.Context) (*RouteInfo, error) {
 	var result RouteInfo
 	err := chromedp.Run(ctx, chromedp.Evaluate(DiscoverRoutesScript, &result))
 	return &result, err
 }
 
+// ExtractShadowDOM collects all shadow roots and their inner HTML from the page.
 func ExtractShadowDOM(ctx context.Context) (*ShadowDOMInfo, error) {
 	var result ShadowDOMInfo
 	err := chromedp.Run(ctx, chromedp.Evaluate(ExtractShadowDOMScript, &result))
 	return &result, err
 }
 
+// DetectFramework identifies the frontend framework and its hydration and loading state.
 func DetectFramework(ctx context.Context) (*FrameworkDetection, error) {
 	var result FrameworkDetection
 	err := chromedp.Run(ctx, chromedp.Evaluate(DetectFrameworkScript, &result))
 	return &result, err
 }
 
+// WaitForSelector polls until an element matching the selector appears or the timeout elapses.
 func WaitForSelector(ctx context.Context, selector string, timeout time.Duration) (bool, error) {
 	var result map[string]interface{}
-	safeSelector, _ := json.Marshal(selector)
+	safeSelector, err := json.Marshal(selector)
+	if err != nil {
+		return false, fmt.Errorf("failed to marshal selector: %w", err)
+	}
 	script := `
 		(function(selector, timeout) {
 			return new Promise((resolve) => {
@@ -798,7 +870,7 @@ func WaitForSelector(ctx context.Context, selector string, timeout time.Duration
 			});
 		})(` + string(safeSelector) + `, ` + strconv.FormatInt(timeout.Milliseconds(), 10) + `)
 	`
-	err := chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+	err = chromedp.Run(ctx, chromedp.Evaluate(script, &result))
 	if err != nil {
 		return false, err
 	}
@@ -808,6 +880,7 @@ func WaitForSelector(ctx context.Context, selector string, timeout time.Duration
 	return false, nil
 }
 
+// WaitForNetworkIdle waits until no fetch or XHR activity occurs for the given quiet period.
 func WaitForNetworkIdle(ctx context.Context, quietPeriod time.Duration) (bool, error) {
 	var result map[string]interface{}
 	script := fmt.Sprintf(`
@@ -844,6 +917,7 @@ func WaitForNetworkIdle(ctx context.Context, quietPeriod time.Duration) (bool, e
 	return false, nil
 }
 
+// PushStateRoute records a single client-side navigation event.
 type PushStateRoute struct {
 	URL       string `json:"url"`
 	Type      string `json:"type"`
@@ -851,6 +925,7 @@ type PushStateRoute struct {
 	Timestamp int64  `json:"timestamp"`
 }
 
+// IframeSource describes a discovered iframe or frame element.
 type IframeSource struct {
 	Src     string `json:"src"`
 	Width   string `json:"width"`
@@ -859,6 +934,7 @@ type IframeSource struct {
 	Sandbox string `json:"sandbox"`
 }
 
+// MediaSource describes a discovered video or audio source.
 type MediaSource struct {
 	Src    string `json:"src"`
 	Type   string `json:"type"`
@@ -868,17 +944,20 @@ type MediaSource struct {
 	ID     string `json:"id"`
 }
 
+// StructuredData holds JSON-LD, Open Graph, Twitter, and generic meta tag data.
 type StructuredData struct {
-	JSONLD   []interface{}     `json:"jsonld"`
-	OG       map[string]string `json:"og"`
-	Twitter  map[string]string `json:"twitter"`
-	Meta     map[string]string `json:"meta"`
+	JSONLD  []interface{}     `json:"jsonld"`
+	OG      map[string]string `json:"og"`
+	Twitter map[string]string `json:"twitter"`
+	Meta    map[string]string `json:"meta"`
 }
 
+// InjectPushStateCapture instruments history APIs to record client-side navigation.
 func InjectPushStateCapture(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(PushStateCaptureScript, nil))
 }
 
+// GetPushStateRoutes returns the routes captured by InjectPushStateCapture.
 func GetPushStateRoutes(ctx context.Context) ([]PushStateRoute, error) {
 	var resultJSON string
 	err := chromedp.Run(ctx, chromedp.Evaluate(GetPushStateRoutesLScript, &resultJSON))
@@ -895,6 +974,7 @@ func GetPushStateRoutes(ctx context.Context) ([]PushStateRoute, error) {
 	return routes, nil
 }
 
+// ExtractIframeSources extracts the source attributes of all iframes and frames on the page.
 func ExtractIframeSources(ctx context.Context) ([]IframeSource, error) {
 	var resultJSON string
 	err := chromedp.Run(ctx, chromedp.Evaluate(ExtractIframeSourcesScript, &resultJSON))
@@ -911,6 +991,7 @@ func ExtractIframeSources(ctx context.Context) ([]IframeSource, error) {
 	return iframes, nil
 }
 
+// ExtractMediaSources extracts the source attributes of all video and audio elements on the page.
 func ExtractMediaSources(ctx context.Context) ([]MediaSource, error) {
 	var resultJSON string
 	err := chromedp.Run(ctx, chromedp.Evaluate(ExtractMediaSourcesScript, &resultJSON))
@@ -927,6 +1008,7 @@ func ExtractMediaSources(ctx context.Context) ([]MediaSource, error) {
 	return media, nil
 }
 
+// ExtractStructuredData extracts JSON-LD, Open Graph, Twitter, and meta tag data from the page.
 func ExtractStructuredData(ctx context.Context) (*StructuredData, error) {
 	var resultJSON string
 	err := chromedp.Run(ctx, chromedp.Evaluate(ExtractStructuredDataScript, &resultJSON))
@@ -952,8 +1034,12 @@ func ExtractStructuredData(ctx context.Context) (*StructuredData, error) {
 	return &data, nil
 }
 
+// ScrollToElement scrolls the element matching the selector into view.
 func ScrollToElement(ctx context.Context, selector string) error {
-	safeSelector, _ := json.Marshal(selector)
+	safeSelector, err := json.Marshal(selector)
+	if err != nil {
+		return fmt.Errorf("failed to marshal selector: %w", err)
+	}
 	script := `
 		(function(selector) {
 			const el = document.querySelector(selector);
@@ -968,6 +1054,7 @@ func ScrollToElement(ctx context.Context, selector string) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(script, &result))
 }
 
+// ExpandAllSections expands collapsible, accordion, and details elements on the page.
 func ExpandAllSections(ctx context.Context) error {
 	script := `
 		// Click all expandable elements
@@ -986,6 +1073,7 @@ func ExpandAllSections(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(script, nil))
 }
 
+// DismissOverlays dismisses cookie consents, modals, and fixed overlay elements.
 func DismissOverlays(ctx context.Context) error {
 	script := `
 		// Dismiss cookie consent
@@ -1031,6 +1119,7 @@ func DismissOverlays(ctx context.Context) error {
 	return chromedp.Run(ctx, chromedp.Evaluate(script, nil))
 }
 
+// ArticleContent holds the title, content, URL, and extraction timestamp of an extracted article.
 type ArticleContent struct {
 	Title       string `json:"title"`
 	Content     string `json:"content"`
@@ -1038,12 +1127,14 @@ type ArticleContent struct {
 	ExtractedAt string `json:"extracted_at"`
 }
 
+// ExtractArticle extracts the main article content from the page.
 func ExtractArticle(ctx context.Context) (*ArticleContent, error) {
 	var result ArticleContent
 	err := chromedp.Run(ctx, chromedp.Evaluate(ExtractArticleScript, &result))
 	return &result, err
 }
 
+// GenerateSingleFile inlines CSS, scripts, and images, returning the page as a single HTML file.
 func GenerateSingleFile(ctx context.Context) (string, error) {
 	var result string
 	err := chromedp.Run(ctx, chromedp.Evaluate(SingleFileScript, &result))
@@ -1051,6 +1142,7 @@ func GenerateSingleFile(ctx context.Context) (string, error) {
 }
 
 const (
+	// ExtractArticleScript extracts the main article content from the page.
 	ExtractArticleScript = `
 		(function() {
 			function getArticleContent() {
@@ -1097,6 +1189,7 @@ const (
 		})()
 	`
 
+	// SingleFileScript inlines CSS, scripts, and images into a single HTML document.
 	SingleFileScript = `
 		(async function() {
 			const tasks = [];

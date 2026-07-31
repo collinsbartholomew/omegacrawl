@@ -12,6 +12,7 @@ import (
 	"github.com/user/clone/internal/util"
 )
 
+// InfiniteScrollConfig controls the behaviour of infinite scroll extraction.
 type InfiniteScrollConfig struct {
 	Enabled          bool
 	MaxScrolls       int
@@ -21,9 +22,10 @@ type InfiniteScrollConfig struct {
 	ScrollContainer  string
 	LoadMoreSelector string
 	ScrollDelay      time.Duration
-	ScrollDistance    int
+	ScrollDistance   int
 }
 
+// ScrollResult summarizes the outcome of an infinite scroll run.
 type ScrollResult struct {
 	TotalItems     int
 	TotalScrolls   int
@@ -33,6 +35,7 @@ type ScrollResult struct {
 	ItemsPerScroll []int
 }
 
+// InfiniteScroll repeatedly scrolls the page and clicks load-more buttons until items stabilize or limits are reached.
 func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResult, error) {
 	if !cfg.Enabled {
 		return &ScrollResult{}, nil
@@ -63,8 +66,12 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 		}
 
 		var currentCount int
-		selJSON, _ := json.Marshal(cfg.ItemSelector)
-		err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
+		selJSON, err := json.Marshal(cfg.ItemSelector)
+		if err != nil {
+			util.LogError("failed to marshal item selector", err)
+			break
+		}
+		err = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
 			(function(selector) {
 				const items = document.querySelectorAll(selector);
 				return items.length;
@@ -95,8 +102,12 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 
 		if cfg.LoadMoreSelector != "" {
 			var clicked bool
-			selJSON, _ := json.Marshal(cfg.LoadMoreSelector)
-			err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
+			selJSON, err := json.Marshal(cfg.LoadMoreSelector)
+			if err != nil {
+				util.LogError("failed to marshal load-more selector", err)
+				continue
+			}
+			err = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
 				(function(selector) {
 					const btn = document.querySelector(selector);
 					if (btn && btn.offsetParent !== null) {
@@ -107,21 +118,25 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 				})(%s)
 			`, string(selJSON)), &clicked))
 			if err == nil && clicked {
-			timer := time.NewTimer(cfg.ScrollDelay)
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				if !timer.Stop() {
-					<-timer.C
+				timer := time.NewTimer(cfg.ScrollDelay)
+				select {
+				case <-timer.C:
+				case <-ctx.Done():
+					if !timer.Stop() {
+						<-timer.C
+					}
+					result.Reason = "ctx_cancelled"
 				}
-				result.Reason = "ctx_cancelled"
-			}
-			continue
+				continue
 			}
 		}
 
 		if cfg.ScrollContainer != "" {
-			selJSON, _ := json.Marshal(cfg.ScrollContainer)
+			selJSON, err := json.Marshal(cfg.ScrollContainer)
+			if err != nil {
+				util.LogError("failed to marshal scroll container selector", err)
+				break
+			}
 			err = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
 				(function(container) {
 					const el = document.querySelector(container);
@@ -158,14 +173,18 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 	}
 
 	var finalCount int
-	itemJSON, _ := json.Marshal(cfg.ItemSelector)
-	err := chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
-		(function(selector) {
-			return document.querySelectorAll(selector).length;
-		})(%s)
-	`, string(itemJSON)), &finalCount))
-	if err == nil {
-		result.TotalItems = finalCount
+	itemJSON, err := json.Marshal(cfg.ItemSelector)
+	if err != nil {
+		util.LogError("failed to marshal item selector", err)
+	} else {
+		err = chromedp.Run(ctx, chromedp.Evaluate(fmt.Sprintf(`
+			(function(selector) {
+				return document.querySelectorAll(selector).length;
+			})(%s)
+		`, string(itemJSON)), &finalCount))
+		if err == nil {
+			result.TotalItems = finalCount
+		}
 	}
 
 	result.TotalScrolls = len(result.ItemsPerScroll)

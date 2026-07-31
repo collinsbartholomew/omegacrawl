@@ -18,45 +18,51 @@ import (
 	"github.com/user/clone/internal/util"
 )
 
+// RobotsEntry holds the parsed rules from a site's robots.txt file.
 type RobotsEntry struct {
-	Disallow    []string
-	Allow       []string
+	Disallow   []string
+	Allow      []string
 	CrawlDelay time.Duration
-	Sitemaps    []string
-	fetchedAt   time.Time
+	Sitemaps   []string
+	fetchedAt  time.Time
 }
 
+// RobotsParser fetches, caches, and evaluates robots.txt rules for hosts.
 type RobotsParser struct {
-	cache        map[string]*RobotsEntry
-	mu           sync.RWMutex
-	cacheTTL     time.Duration
-	userAgent    string
-	ruleCache    map[string]*regexp.Regexp
-	ruleCacheMu  sync.RWMutex
-	fetchGroup   singleflight.Group
-	parentCtx    context.Context
+	cache       map[string]*RobotsEntry
+	mu          sync.RWMutex
+	cacheTTL    time.Duration
+	userAgent   string
+	ruleCache   map[string]*regexp.Regexp
+	ruleCacheMu sync.RWMutex
+	fetchGroup  singleflight.Group
+	parentCtx   context.Context
 }
 
+// NewRobotsParser returns a RobotsParser with default caching and user-agent settings.
 func NewRobotsParser() *RobotsParser {
 	return &RobotsParser{
-		cache:      make(map[string]*RobotsEntry),
-		cacheTTL:   24 * time.Hour,
-		userAgent:  "*",
-		ruleCache:  make(map[string]*regexp.Regexp),
-		parentCtx:  context.Background(),
+		cache:     make(map[string]*RobotsEntry),
+		cacheTTL:  24 * time.Hour,
+		userAgent: "*",
+		ruleCache: make(map[string]*regexp.Regexp),
+		parentCtx: context.Background(),
 	}
 }
 
+// SetContext sets the parent context used for robots.txt fetches.
 func (rp *RobotsParser) SetContext(ctx context.Context) {
 	rp.parentCtx = ctx
 }
 
+// SetUserAgent sets the user agent used to match robots.txt rules.
 func (rp *RobotsParser) SetUserAgent(ua string) {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
 	rp.userAgent = ua
 }
 
+// CanCrawl reports whether the URL may be crawled, along with the applicable crawl delay.
 func (rp *RobotsParser) CanCrawl(rawURL string, userAgent string, cfg *config.Config) (bool, time.Duration) {
 	if !cfg.RespectRobots {
 		return true, cfg.CrawlDelay
@@ -77,13 +83,16 @@ func (rp *RobotsParser) CanCrawl(rawURL string, userAgent string, cfg *config.Co
 		return rp.evaluateRules(entry, u.Path, cfg)
 	}
 
-	res, _, _ := rp.fetchGroup.Do(robotsURL, func() (interface{}, error) {
+	res, err, _ := rp.fetchGroup.Do(robotsURL, func() (interface{}, error) {
 		entry := rp.fetchRobots(robotsURL)
 		rp.mu.Lock()
 		rp.cache[robotsURL] = entry
 		rp.mu.Unlock()
 		return entry, nil
 	})
+	if err != nil {
+		return false, 0
+	}
 	entry = res.(*RobotsEntry)
 
 	return rp.evaluateRules(entry, u.Path, cfg)
@@ -286,6 +295,7 @@ func (rp *RobotsParser) matchUserAgent(pattern string) bool {
 	return strings.Contains(lowerUA, lowerPattern)
 }
 
+// GetSitemaps returns the cached sitemap URLs declared by the host's robots.txt.
 func (rp *RobotsParser) GetSitemaps(rawURL string) []string {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -305,6 +315,7 @@ func (rp *RobotsParser) GetSitemaps(rawURL string) []string {
 	return entry.Sitemaps
 }
 
+// ClearExpired removes cached robots.txt entries that have exceeded the cache TTL.
 func (rp *RobotsParser) ClearExpired() {
 	rp.mu.Lock()
 	defer rp.mu.Unlock()
@@ -317,6 +328,7 @@ func (rp *RobotsParser) ClearExpired() {
 	}
 }
 
+// FetchSitemapURLs fetches the given sitemap and returns the URLs listed in it.
 func (rp *RobotsParser) FetchSitemapURLs(sitemapURL string) []string {
 	var urls []string
 
@@ -334,7 +346,7 @@ func (rp *RobotsParser) FetchSitemapURLs(sitemapURL string) []string {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		io.Copy(io.Discard, resp.Body)
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 
@@ -361,6 +373,7 @@ func (rp *RobotsParser) FetchSitemapURLs(sitemapURL string) []string {
 	return urls
 }
 
+// GetSitemapURLs returns all URLs from the host's declared sitemaps.
 func (rp *RobotsParser) GetSitemapURLs(rawURL string) []string {
 	sitemaps := rp.GetSitemaps(rawURL)
 	if len(sitemaps) == 0 {

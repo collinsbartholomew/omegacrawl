@@ -8,10 +8,12 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
 
 	"github.com/user/clone/internal/util"
 )
 
+// PostgresQueue is a PostgreSQL-backed queue storing items in the crawl_queue table.
 type PostgresQueue struct {
 	pool      *pgxpool.Pool
 	key       string
@@ -19,10 +21,13 @@ type PostgresQueue struct {
 	parentCtx context.Context
 }
 
+// NewPostgresQueue creates a PostgresQueue using the default max queue size.
 func NewPostgresQueue(ctx context.Context, pgDSN string) (*PostgresQueue, error) {
 	return NewPostgresQueueWithSize(ctx, pgDSN, DefaultMaxQueueSize)
 }
 
+// NewPostgresQueueWithSize connects to Postgres with the given maxSize and
+// ensures the queue table and index exist.
 func NewPostgresQueueWithSize(ctx context.Context, pgDSN string, maxSize int) (*PostgresQueue, error) {
 	pool, err := pgxpool.New(ctx, pgDSN)
 	if err != nil {
@@ -56,6 +61,7 @@ func NewPostgresQueueWithSize(ctx context.Context, pgDSN string, maxSize int) (*
 	}, nil
 }
 
+// PushURL inserts url at depth unless it already exists in the queue.
 func (q *PostgresQueue) PushURL(url string, depth int) bool {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -70,6 +76,7 @@ func (q *PostgresQueue) PushURL(url string, depth int) bool {
 	return err == nil && result.RowsAffected() > 0
 }
 
+// PopURL removes and returns the lowest-depth item from the queue.
 func (q *PostgresQueue) PopURL() (URLItem, bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -89,6 +96,7 @@ func (q *PostgresQueue) PopURL() (URLItem, bool) {
 	return item, true
 }
 
+// Size returns the number of items in the queue.
 func (q *PostgresQueue) Size() int {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -100,6 +108,7 @@ func (q *PostgresQueue) Size() int {
 	return int(count)
 }
 
+// HasSeen reports whether the URL has been marked as seen.
 func (q *PostgresQueue) HasSeen(url string) bool {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -111,12 +120,16 @@ func (q *PostgresQueue) HasSeen(url string) bool {
 	return exists
 }
 
+// MarkSeen records the URL as seen in the queue table.
 func (q *PostgresQueue) MarkSeen(url string) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
-	_, _ = q.pool.Exec(opCtx, `INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, 0, '{}', TRUE) ON CONFLICT (url) DO UPDATE SET seen = TRUE`, url)
+	if _, err := q.pool.Exec(opCtx, `INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, 0, '{}', TRUE) ON CONFLICT (url) DO UPDATE SET seen = TRUE`, url); err != nil {
+		util.LogError("failed to mark URL seen in postgres", err, zap.String("url", url))
+	}
 }
 
+// Items returns all queued items ordered by depth.
 func (q *PostgresQueue) Items() []URLItem {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -138,6 +151,7 @@ func (q *PostgresQueue) Items() []URLItem {
 	return items
 }
 
+// AllVisited returns the set of URLs marked as seen.
 func (q *PostgresQueue) AllVisited() map[string]bool {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -156,6 +170,47 @@ func (q *PostgresQueue) AllVisited() map[string]bool {
 	return result
 }
 
+// Snapshot returns a consistent snapshot of the queue contents and visited set.
+func (q *PostgresQueue) Snapshot() ([]URLItem, map[string]bool) {
+	opCtx, opCancel := context.WithTimeout(q.parentCtx, 10*time.Second)
+	defer opCancel()
+	tx, err := q.pool.Begin(opCtx)
+	if err != nil {
+		return q.Items(), q.AllVisited()
+	}
+	defer tx.Rollback(opCtx)
+
+	items := make([]URLItem, 0)
+	rows, err := tx.Query(opCtx, `SELECT item_data FROM crawl_queue ORDER BY depth ASC`)
+	if err == nil {
+		for rows.Next() {
+			var itemData []byte
+			if rows.Scan(&itemData) == nil {
+				var item URLItem
+				if json.Unmarshal(itemData, &item) == nil {
+					items = append(items, item)
+				}
+			}
+		}
+		rows.Close()
+	}
+
+	visited := make(map[string]bool)
+	rows, err = tx.Query(opCtx, `SELECT url FROM crawl_queue WHERE seen = TRUE`)
+	if err == nil {
+		for rows.Next() {
+			var url string
+			if rows.Scan(&url) == nil {
+				visited[url] = true
+			}
+		}
+		rows.Close()
+	}
+
+	return items, visited
+}
+
+// LoadFromCheckpoint replaces the queue contents with the given items and visited set.
 func (q *PostgresQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 10*time.Second)
 	defer opCancel()
@@ -194,6 +249,7 @@ func (q *PostgresQueue) LoadFromCheckpoint(items []URLItem, visited map[string]b
 	}
 }
 
+// Close releases the underlying Postgres connection pool.
 func (q *PostgresQueue) Close() error {
 	q.pool.Close()
 	return nil

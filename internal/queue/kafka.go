@@ -8,29 +8,36 @@ import (
 	"time"
 
 	"github.com/segmentio/kafka-go"
+	"go.uber.org/zap"
+
+	"github.com/user/clone/internal/util"
 )
 
+// KafkaQueue is a Kafka-backed queue with a local seen set for deduplication.
 type KafkaQueue struct {
-	writer    *kafka.Writer
-	reader    *kafka.Reader
-	key       string
-	maxSize   int
-	seenMu    sync.RWMutex
-	seenSet   map[string]bool
-	seenTopic string
-	brokers   []string
-	closeCh   chan struct{}
-	wg        sync.WaitGroup
-	pending   atomic.Int64
-	parentCtx context.Context
+	writer     *kafka.Writer
+	reader     *kafka.Reader
+	key        string
+	maxSize    int
+	seenMu     sync.RWMutex
+	seenSet    map[string]bool
+	seenTopic  string
+	brokers    []string
+	closeCh    chan struct{}
+	wg         sync.WaitGroup
+	pending    atomic.Int64
+	parentCtx  context.Context
 	seenCtx    context.Context
 	seenCancel context.CancelFunc
 }
 
+// NewKafkaQueue creates a KafkaQueue using the default max queue size.
 func NewKafkaQueue(ctx context.Context, kafkaURL string) (*KafkaQueue, error) {
 	return NewKafkaQueueWithSize(ctx, kafkaURL, DefaultMaxQueueSize)
 }
 
+// NewKafkaQueueWithSize creates a KafkaQueue with the given maxSize and starts
+// a background consumer of the seen topic.
 func NewKafkaQueueWithSize(ctx context.Context, kafkaURL string, maxSize int) (*KafkaQueue, error) {
 	writer := &kafka.Writer{
 		Addr:     kafka.TCP(kafkaURL),
@@ -105,11 +112,14 @@ func (q *KafkaQueue) consumeSeenTopic() {
 			}
 		}
 		commitCtx, commitCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
-		_ = seenReader.CommitMessages(commitCtx, msg)
+		if err := seenReader.CommitMessages(commitCtx, msg); err != nil {
+			util.LogError("failed to commit seen message in kafka", err)
+		}
 		commitCancel()
 	}
 }
 
+// Close stops the seen topic consumer and closes the Kafka writer and reader.
 func (q *KafkaQueue) Close() error {
 	q.seenCancel()
 	close(q.closeCh)
@@ -119,6 +129,7 @@ func (q *KafkaQueue) Close() error {
 	return nil
 }
 
+// PushURL enqueues url at depth unless it was already seen or the queue is full.
 func (q *KafkaQueue) PushURL(url string, depth int) bool {
 	if q.HasSeen(url) {
 		return false
@@ -155,7 +166,11 @@ func (q *KafkaQueue) markSeen(url string) {
 	q.seenMu.Unlock()
 
 	item := URLItem{URL: url, Depth: 0}
-	data, _ := json.Marshal(item)
+	data, err := json.Marshal(item)
+	if err != nil {
+		util.LogError("failed to marshal seen URL item", err, zap.String("url", url))
+		data = []byte("null")
+	}
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
 	q.writer.WriteMessages(opCtx, kafka.Message{
@@ -165,6 +180,7 @@ func (q *KafkaQueue) markSeen(url string) {
 	})
 }
 
+// PopURL fetches and commits the next message from the queue.
 func (q *KafkaQueue) PopURL() (URLItem, bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -185,6 +201,7 @@ func (q *KafkaQueue) PopURL() (URLItem, bool) {
 	return item, true
 }
 
+// Size returns the number of pending items in the queue.
 func (q *KafkaQueue) Size() int {
 	n := q.pending.Load()
 	if n < 0 {
@@ -193,16 +210,19 @@ func (q *KafkaQueue) Size() int {
 	return int(n)
 }
 
+// HasSeen reports whether the URL has been marked as seen.
 func (q *KafkaQueue) HasSeen(url string) bool {
 	q.seenMu.RLock()
 	defer q.seenMu.RUnlock()
 	return q.seenSet[url]
 }
 
+// MarkSeen records the URL as seen locally and publishes it to the seen topic.
 func (q *KafkaQueue) MarkSeen(url string) {
 	q.markSeen(url)
 }
 
+// Items returns the seen URLs as URLItems.
 func (q *KafkaQueue) Items() []URLItem {
 	q.seenMu.RLock()
 	defer q.seenMu.RUnlock()
@@ -213,6 +233,7 @@ func (q *KafkaQueue) Items() []URLItem {
 	return items
 }
 
+// AllVisited returns a copy of the seen URL set.
 func (q *KafkaQueue) AllVisited() map[string]bool {
 	q.seenMu.RLock()
 	defer q.seenMu.RUnlock()
@@ -223,12 +244,32 @@ func (q *KafkaQueue) AllVisited() map[string]bool {
 	return result
 }
 
+// Snapshot returns a consistent snapshot of the queue contents and visited set.
+func (q *KafkaQueue) Snapshot() ([]URLItem, map[string]bool) {
+	q.seenMu.RLock()
+	defer q.seenMu.RUnlock()
+	items := make([]URLItem, 0, len(q.seenSet))
+	for url := range q.seenSet {
+		items = append(items, URLItem{URL: url})
+	}
+	result := make(map[string]bool, len(q.seenSet))
+	for k, v := range q.seenSet {
+		result[k] = v
+	}
+	return items, result
+}
+
+// LoadFromCheckpoint enqueues the given items and marks the visited URLs as seen.
 func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 30*time.Second)
 	defer opCancel()
 
 	for _, item := range items {
-		data, _ := json.Marshal(item)
+		data, err := json.Marshal(item)
+		if err != nil {
+			util.LogError("failed to marshal checkpoint item", err, zap.String("url", item.URL))
+			data = []byte("null")
+		}
 		q.writer.WriteMessages(opCtx, kafka.Message{
 			Key:   []byte(item.URL),
 			Value: data,

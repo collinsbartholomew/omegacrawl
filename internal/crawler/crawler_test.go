@@ -58,24 +58,24 @@ func TestExtractGraphQLOp(t *testing.T) {
 
 func TestBase64EncodePayload(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
+		name  string
+		input string
 	}{
 		{
-			name:     "simple text",
-			input:    "hello world",
+			name:  "simple text",
+			input: "hello world",
 		},
 		{
-			name:     "binary-like data",
-			input:    "\x00\x01\x02\xff\xfe",
+			name:  "binary-like data",
+			input: "\x00\x01\x02\xff\xfe",
 		},
 		{
-			name:     "empty",
-			input:    "",
+			name:  "empty",
+			input: "",
 		},
 		{
-			name:     "JSON message",
-			input:    `{"type":"message","text":"hello"}`,
+			name:  "JSON message",
+			input: `{"type":"message","text":"hello"}`,
 		},
 	}
 
@@ -104,8 +104,8 @@ func TestWriteSitemap(t *testing.T) {
 	}
 	c.routeMu.Lock()
 	c.discoveredRoutes = map[string]bool{
-		"https://example.com/":      true,
-		"https://example.com/about": true,
+		"https://example.com/":        true,
+		"https://example.com/about":   true,
 		"https://example.com/contact": true,
 	}
 	c.routeMu.Unlock()

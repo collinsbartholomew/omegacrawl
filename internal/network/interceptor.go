@@ -21,13 +21,15 @@ import (
 )
 
 const (
+	// MaxResponseBodySize is the maximum size of a captured response body in bytes.
 	MaxResponseBodySize = 50 * 1024 * 1024
 	maxRetries          = 3
-	maxSeenURLs        = 200000
-	maxResources       = 50000
-	maxAPIResponses    = 10000
+	maxSeenURLs         = 200000
+	maxResources        = 50000
+	maxAPIResponses     = 10000
 )
 
+// CapturedResource is a captured network response for a single URL.
 type CapturedResource struct {
 	URL        string
 	Body       []byte
@@ -37,14 +39,16 @@ type CapturedResource struct {
 	Headers    map[string]string
 }
 
+// APIRequest is a captured outbound API request.
 type APIRequest struct {
-	URL        string            `json:"url"`
-	Method     string            `json:"method"`
-	Body       []byte            `json:"body,omitempty"`
-	Headers    map[string]string `json:"headers"`
-	Timestamp  time.Time         `json:"timestamp"`
+	URL       string            `json:"url"`
+	Method    string            `json:"method"`
+	Body      []byte            `json:"body,omitempty"`
+	Headers   map[string]string `json:"headers"`
+	Timestamp time.Time         `json:"timestamp"`
 }
 
+// APIResponse is a captured API response with its metadata.
 type APIResponse struct {
 	URL        string            `json:"url"`
 	Method     string            `json:"method"`
@@ -67,6 +71,7 @@ type pendingResource struct {
 	request   *APIRequest
 }
 
+// Interceptor captures network traffic from a Chromium session via CDP.
 type Interceptor struct {
 	mu              sync.RWMutex
 	resources       map[string]*CapturedResource
@@ -83,10 +88,12 @@ type Interceptor struct {
 	fetchCancel     context.CancelFunc
 }
 
+// NewInterceptor creates an Interceptor with 10 worker goroutines.
 func NewInterceptor() *Interceptor {
 	return NewInterceptorWithWorkers(10)
 }
 
+// NewInterceptorWithWorkers creates an Interceptor with the given number of worker goroutines.
 func NewInterceptorWithWorkers(workerCount int) *Interceptor {
 	if workerCount < 1 {
 		workerCount = 1
@@ -102,12 +109,14 @@ func NewInterceptorWithWorkers(workerCount int) *Interceptor {
 	}
 }
 
+// SetAPICallback sets the callback invoked when an API response is captured.
 func (i *Interceptor) SetAPICallback(fn func(APIResponse)) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.apiCallback = fn
 }
 
+// Start attaches the interceptor to the Chromium session for the given targetURL.
 func (i *Interceptor) Start(ctx context.Context, targetURL string) {
 	i.mu.Lock()
 	i.baseURL = targetURL
@@ -279,7 +288,7 @@ func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestI
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		if attempt > 0 {
 			base := time.Duration(attempt*300) * time.Millisecond
-			jitter := time.Duration(rand.Int63n(int64(base / 2 + 1)))
+			jitter := time.Duration(rand.Int63n(int64(base/2 + 1)))
 			retryTimer := time.NewTimer(base + jitter)
 			select {
 			case <-retryTimer.C:
@@ -304,6 +313,7 @@ func (i *Interceptor) fetchWithRetry(ctx context.Context, reqID network.RequestI
 	return nil
 }
 
+// FetchBodies fetches the remaining response bodies via CDP.
 func (i *Interceptor) FetchBodies(ctx context.Context) {
 	i.fetchWg.Wait()
 
@@ -388,6 +398,7 @@ func (i *Interceptor) FetchBodies(ctx context.Context) {
 	wg.Wait()
 }
 
+// GetResources returns a copy of the captured resources keyed by URL.
 func (i *Interceptor) GetResources() map[string]*CapturedResource {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -398,6 +409,7 @@ func (i *Interceptor) GetResources() map[string]*CapturedResource {
 	return result
 }
 
+// GetResource returns the captured resource for the given URL, if any.
 func (i *Interceptor) GetResource(url string) (*CapturedResource, bool) {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -405,6 +417,7 @@ func (i *Interceptor) GetResource(url string) (*CapturedResource, bool) {
 	return r, ok
 }
 
+// GetAPIResponses returns a copy of the captured API responses.
 func (i *Interceptor) GetAPIResponses() []APIResponse {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -413,12 +426,14 @@ func (i *Interceptor) GetAPIResponses() []APIResponse {
 	return result
 }
 
+// IsCaptured reports whether the URL was seen during the session.
 func (i *Interceptor) IsCaptured(url string) bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.seen.Contains(url)
 }
 
+// DownloadResourceViaHTTP fetches rawURL over HTTP and returns it as a CapturedResource.
 func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource, error) {
 	i.mu.RLock()
 	baseURL := i.baseURL
@@ -442,7 +457,7 @@ func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
+		_, _ = io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
 		return nil, nil
 	}
 
@@ -476,6 +491,7 @@ func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource,
 	}, nil
 }
 
+// AssetPath maps a URL and MIME type to a local filesystem path for the asset.
 func AssetPath(urlStr string, mimeType string) string {
 	u, err := url.Parse(urlStr)
 	if err != nil {
@@ -569,6 +585,7 @@ func isAPIContentType(urlStr, mime string) bool {
 	return false
 }
 
+// HasURL reports whether a resource was captured for rawURL.
 func (i *Interceptor) HasURL(rawURL string) bool {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -576,6 +593,7 @@ func (i *Interceptor) HasURL(rawURL string) bool {
 	return ok
 }
 
+// GetMissingResources returns seen URLs that have no captured resource.
 func (i *Interceptor) GetMissingResources() []string {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
@@ -588,12 +606,14 @@ func (i *Interceptor) GetMissingResources() []string {
 	return missing
 }
 
+// GetAllSeenURLs returns all URLs seen during the session.
 func (i *Interceptor) GetAllSeenURLs() []string {
 	i.mu.RLock()
 	defer i.mu.RUnlock()
 	return i.seen.Keys()
 }
 
+// Close cancels in-flight fetches and waits for them to finish.
 func (i *Interceptor) Close() {
 	i.mu.Lock()
 	if i.fetchCancel != nil {
@@ -602,5 +622,3 @@ func (i *Interceptor) Close() {
 	i.mu.Unlock()
 	i.fetchWg.Wait()
 }
-
-

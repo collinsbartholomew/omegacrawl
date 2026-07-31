@@ -9,6 +9,7 @@ import (
 	"github.com/user/clone/internal/queue"
 )
 
+// CheckpointData is the serialized state of a crawl saved to disk for resuming.
 type CheckpointData struct {
 	Queue         []queue.URLItem
 	Visited       map[string]bool
@@ -17,14 +18,17 @@ type CheckpointData struct {
 	Timestamp     time.Time
 }
 
+// QueueItem is a URL queue item used within checkpoint data.
 type QueueItem = queue.URLItem
 
+// Checkpoint persists and restores crawl state to support resuming interrupted crawls.
 type Checkpoint struct {
 	data     *CheckpointData
 	filePath string
 	mu       sync.RWMutex
 }
 
+// NewCheckpoint creates a new Checkpoint backed by the given file path.
 func NewCheckpoint(filePath string) *Checkpoint {
 	return &Checkpoint{
 		filePath: filePath,
@@ -36,12 +40,13 @@ func NewCheckpoint(filePath string) *Checkpoint {
 	}
 }
 
-func (c *Checkpoint) Save(q queue.Queue, hostLastCrawl map[string]time.Time, hostURLCount map[string]int) error {
+// Save writes the current queue and crawl state to the checkpoint file atomically.
+func (c *Checkpoint) Save(items []queue.URLItem, visited map[string]bool, hostLastCrawl map[string]time.Time, hostURLCount map[string]int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.data.Queue = q.Items()
-	c.data.Visited = q.AllVisited()
+	c.data.Queue = items
+	c.data.Visited = visited
 	c.data.HostLastCrawl = make(map[string]time.Time)
 	for k, v := range hostLastCrawl {
 		c.data.HostLastCrawl[k] = v
@@ -54,7 +59,7 @@ func (c *Checkpoint) Save(q queue.Queue, hostLastCrawl map[string]time.Time, hos
 
 	// Write to temp file first, then atomic rename
 	tmpPath := c.filePath + ".tmp"
-	file, err := os.Create(tmpPath)
+	file, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
@@ -74,6 +79,7 @@ func (c *Checkpoint) Save(q queue.Queue, hostLastCrawl map[string]time.Time, hos
 	return os.Rename(tmpPath, c.filePath)
 }
 
+// Load reads the checkpoint file and returns the stored CheckpointData.
 func (c *Checkpoint) Load() (*CheckpointData, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -99,11 +105,13 @@ func (c *Checkpoint) Load() (*CheckpointData, error) {
 	return c.data, nil
 }
 
+// Exists reports whether the checkpoint file already exists.
 func (c *Checkpoint) Exists() bool {
 	_, err := os.Stat(c.filePath)
 	return err == nil
 }
 
+// Remove deletes the checkpoint file.
 func (c *Checkpoint) Remove() error {
 	return os.Remove(c.filePath)
 }

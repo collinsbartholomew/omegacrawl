@@ -6,16 +6,19 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
+// ServiceWorkerInfo summarizes the service worker registrations found in a page.
 type ServiceWorkerInfo struct {
 	Count         int
 	Registrations []ServiceWorkerRegistration
 }
 
+// ServiceWorkerRegistration describes a single service worker registration.
 type ServiceWorkerRegistration struct {
 	Scope  string
 	Active *string
 }
 
+// DetectServiceWorkers queries the page for all service worker registrations.
 func DetectServiceWorkers(ctx context.Context) (*ServiceWorkerInfo, error) {
 	script := `
 		(async () => {
@@ -38,6 +41,7 @@ func DetectServiceWorkers(ctx context.Context) (*ServiceWorkerInfo, error) {
 	return &info, nil
 }
 
+// UnregisterServiceWorkers unregisters all service workers in the page and returns the count removed.
 func UnregisterServiceWorkers(ctx context.Context) (int, error) {
 	script := `
 		(async () => {
@@ -55,5 +59,3 @@ func UnregisterServiceWorkers(ctx context.Context) (int, error) {
 	err := chromedp.Run(ctx, chromedp.Evaluate(script, &count))
 	return count, err
 }
-
-
