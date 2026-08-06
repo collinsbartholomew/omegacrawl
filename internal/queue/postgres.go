@@ -38,13 +38,22 @@ func NewPostgresQueueWithSize(ctx context.Context, pgDSN string, maxSize int) (*
 			url TEXT PRIMARY KEY,
 			depth INTEGER NOT NULL DEFAULT 0,
 			item_data JSONB NOT NULL,
-			seen BOOLEAN NOT NULL DEFAULT TRUE,
 			created_at TIMESTAMPTZ DEFAULT NOW()
 		)
 	`)
 	if err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("failed to create queue table: %w", err)
+	}
+	_, err = pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS crawl_visited (
+			url TEXT PRIMARY KEY,
+			created_at TIMESTAMPTZ DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("failed to create visited table: %w", err)
 	}
 	_, err = pool.Exec(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_crawl_queue_depth ON crawl_queue(depth)
@@ -71,12 +80,13 @@ func (q *PostgresQueue) PushURL(url string, depth int) bool {
 		return false
 	}
 	result, err := q.pool.Exec(opCtx,
-		`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, $2, $3, TRUE)
+		`INSERT INTO crawl_queue (url, depth, item_data) VALUES ($1, $2, $3)
 		 ON CONFLICT (url) DO NOTHING`, url, depth, itemData)
 	return err == nil && result.RowsAffected() > 0
 }
 
-// PopURL removes and returns the lowest-depth item from the queue.
+// PopURL removes and returns the lowest-depth item from the queue and records
+// it as visited.
 func (q *PostgresQueue) PopURL() (URLItem, bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
@@ -93,7 +103,16 @@ func (q *PostgresQueue) PopURL() (URLItem, bool) {
 	if itemData != nil {
 		json.Unmarshal(itemData, &item)
 	}
+	q.markVisited(item.URL)
 	return item, true
+}
+
+func (q *PostgresQueue) markVisited(url string) {
+	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
+	defer opCancel()
+	if _, err := q.pool.Exec(opCtx, `INSERT INTO crawl_visited (url) VALUES ($1) ON CONFLICT (url) DO NOTHING`, url); err != nil {
+		util.LogError("failed to mark URL visited in postgres", err, zap.String("url", url))
+	}
 }
 
 // Size returns the number of items in the queue.
@@ -113,20 +132,16 @@ func (q *PostgresQueue) HasSeen(url string) bool {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
 	var exists bool
-	err := q.pool.QueryRow(opCtx, `SELECT seen FROM crawl_queue WHERE url = $1`, url).Scan(&exists)
+	err := q.pool.QueryRow(opCtx, `SELECT EXISTS(SELECT 1 FROM crawl_visited WHERE url = $1)`, url).Scan(&exists)
 	if err != nil {
 		return false
 	}
 	return exists
 }
 
-// MarkSeen records the URL as seen in the queue table.
+// MarkSeen records the URL as seen without adding it to the queue.
 func (q *PostgresQueue) MarkSeen(url string) {
-	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
-	defer opCancel()
-	if _, err := q.pool.Exec(opCtx, `INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, 0, '{}', TRUE) ON CONFLICT (url) DO UPDATE SET seen = TRUE`, url); err != nil {
-		util.LogError("failed to mark URL seen in postgres", err, zap.String("url", url))
-	}
+	q.markVisited(url)
 }
 
 // Items returns all queued items ordered by depth.
@@ -155,7 +170,7 @@ func (q *PostgresQueue) Items() []URLItem {
 func (q *PostgresQueue) AllVisited() map[string]bool {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 5*time.Second)
 	defer opCancel()
-	rows, err := q.pool.Query(opCtx, `SELECT url FROM crawl_queue WHERE seen = TRUE`)
+	rows, err := q.pool.Query(opCtx, `SELECT url FROM crawl_visited`)
 	if err != nil {
 		return nil
 	}
@@ -196,7 +211,7 @@ func (q *PostgresQueue) Snapshot() ([]URLItem, map[string]bool) {
 	}
 
 	visited := make(map[string]bool)
-	rows, err = tx.Query(opCtx, `SELECT url FROM crawl_queue WHERE seen = TRUE`)
+	rows, err = tx.Query(opCtx, `SELECT url FROM crawl_visited`)
 	if err == nil {
 		for rows.Next() {
 			var url string
@@ -222,7 +237,11 @@ func (q *PostgresQueue) LoadFromCheckpoint(items []URLItem, visited map[string]b
 	defer tx.Rollback(opCtx)
 
 	if _, err := tx.Exec(opCtx, `DELETE FROM crawl_queue`); err != nil {
-		util.LogError("postgres checkpoint load: delete failed", err)
+		util.LogError("postgres checkpoint load: delete queue failed", err)
+		return
+	}
+	if _, err := tx.Exec(opCtx, `DELETE FROM crawl_visited`); err != nil {
+		util.LogError("postgres checkpoint load: delete visited failed", err)
 		return
 	}
 
@@ -232,10 +251,10 @@ func (q *PostgresQueue) LoadFromCheckpoint(items []URLItem, visited map[string]b
 		if err != nil {
 			continue
 		}
-		batch.Queue(`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, $2, $3, TRUE)`, item.URL, item.Depth, itemData)
+		batch.Queue(`INSERT INTO crawl_queue (url, depth, item_data) VALUES ($1, $2, $3)`, item.URL, item.Depth, itemData)
 	}
 	for url := range visited {
-		batch.Queue(`INSERT INTO crawl_queue (url, depth, item_data, seen) VALUES ($1, 0, '{}', TRUE) ON CONFLICT (url) DO NOTHING`, url)
+		batch.Queue(`INSERT INTO crawl_visited (url) VALUES ($1) ON CONFLICT (url) DO NOTHING`, url)
 	}
 
 	br := tx.SendBatch(opCtx, batch)

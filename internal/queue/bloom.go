@@ -63,13 +63,6 @@ func (b *BloomDedup) SaveToFile(path string) error {
 
 // LoadFromFile replaces the filter contents with the encoded filter read from path.
 func (b *BloomDedup) LoadFromFile(path string) error {
-	file, err := os.Open(path)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-
-	// Read all data
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err

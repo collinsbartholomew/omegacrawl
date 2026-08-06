@@ -1,6 +1,7 @@
 package util
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
@@ -39,21 +40,37 @@ func (mb *MemoryBudget) Reserve(n int64) bool {
 }
 
 // ReserveBlocking reserves n bytes, blocking until enough budget is
-// available.
-func (mb *MemoryBudget) ReserveBlocking(n int64) {
+// available or ctx is cancelled.
+func (mb *MemoryBudget) ReserveBlocking(ctx context.Context, n int64) error {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
 	for mb.usedBytes.Load()+n > mb.maxBytes {
-		mb.cond.Wait()
+		// Wait with context cancellation support
+		waitCh := make(chan struct{}, 1)
+		go func() {
+			mb.cond.Wait()
+			waitCh <- struct{}{}
+		}()
+		select {
+		case <-waitCh:
+			// Continue loop to re-check condition
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	mb.usedBytes.Add(n)
+	return nil
 }
 
 // Release returns n bytes to the budget and wakes any blocked waiters.
 func (mb *MemoryBudget) Release(n int64) {
 	mb.mu.Lock()
 	defer mb.mu.Unlock()
-	mb.usedBytes.Add(-n)
+	newVal := mb.usedBytes.Add(-n)
+	if newVal < 0 {
+		// Should not happen, but guard against underflow
+		mb.usedBytes.Store(0)
+	}
 	mb.cond.Broadcast()
 }
 

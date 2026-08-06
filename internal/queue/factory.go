@@ -37,3 +37,20 @@ func NewQueueFromConfig(ctx context.Context, cfg *config.QueueConfig) (Queue, er
 		return nil, fmt.Errorf("unknown queue backend: %s", cfg.Backend)
 	}
 }
+
+// NewQueue builds a Queue for the given backend using the supplied connection
+// strings and maxSize. Unknown backends fall back to an in-memory queue.
+func NewQueue(ctx context.Context, backend, redisURL, pgDSN, kafkaURL string, maxSize int) (Queue, error) {
+	switch backend {
+	case "local":
+		return NewPriorityQueueWithMaxSize(maxSize), nil
+	case "redis":
+		return NewRedisQueueWithSize(ctx, redisURL, maxSize)
+	case "postgres":
+		return NewPostgresQueueWithSize(ctx, pgDSN, maxSize)
+	case "kafka":
+		return NewKafkaQueueWithSize(ctx, kafkaURL, maxSize)
+	default:
+		return NewPriorityQueueWithMaxSize(maxSize), nil
+	}
+}

@@ -133,16 +133,16 @@ func TestExtractFromHTML(t *testing.T) {
 		expected []AnalyzedURL
 	}{
 		{
-			name: "importmap",
-			html: `<script type="importmap">{"imports": {"react": "https://cdn.example.com/react.js"}}</script>`,
+			name:    "importmap",
+			html:    `<script type="importmap">{"imports": {"react": "https://cdn.example.com/react.js"}}</script>`,
 			baseURL: "https://example.com/index.html",
 			expected: []AnalyzedURL{
 				{URL: "https://cdn.example.com/react.js", Type: "importmap"},
 			},
 		},
 		{
-			name: "module script",
-			html: `<script type="module" src="/app.js"></script>`,
+			name:    "module script",
+			html:    `<script type="module" src="/app.js"></script>`,
 			baseURL: "https://example.com/index.html",
 			expected: []AnalyzedURL{
 				{URL: "https://example.com/app.js", Type: "module-script"},

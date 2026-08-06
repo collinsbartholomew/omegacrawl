@@ -1,0 +1,512 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://clone.example.com/config.schema.json",
+  "title": "Web Cloner Configuration",
+  "type": "object",
+  "properties": {
+    "seeds": {
+      "type": "array",
+      "items": { "type": "string", "format": "uri" },
+      "description": "Seed URLs to start crawling from"
+    },
+    "max_depth": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 10,
+      "description": "Maximum crawl depth"
+    },
+    "max_concurrent_pages": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 5,
+      "description": "Maximum concurrent page crawls"
+    },
+    "asset_concurrency": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 16,
+      "description": "Maximum concurrent asset downloads"
+    },
+    "page_timeout": {
+      "type": "string",
+      "format": "duration",
+      "default": "120s",
+      "description": "Page load timeout"
+    },
+    "user_agent": {
+      "type": "string",
+      "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "description": "User agent string"
+    },
+    "output_dir": {
+      "type": "string",
+      "default": "output",
+      "description": "Output directory"
+    },
+    "crawl_delay": {
+      "type": "string",
+      "format": "duration",
+      "default": "1s",
+      "description": "Delay between requests"
+    },
+    "respect_robots": {
+      "type": "boolean",
+      "default": true,
+      "description": "Respect robots.txt"
+    },
+    "enable_screenshot": {
+      "type": "boolean",
+      "default": true,
+      "description": "Take screenshots"
+    },
+    "enable_pdf": {
+      "type": "boolean",
+      "default": false,
+      "description": "Generate PDFs"
+    },
+    "enable_warc": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable WARC output"
+    },
+    "enable_wacz": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable WACZ output"
+    },
+    "enable_singlefile": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable SingleFile output"
+    },
+    "enable_article_extract": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable article extraction"
+    },
+    "proxy": {
+      "type": "string",
+      "description": "Proxy URL"
+    },
+    "proxies": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Proxy rotation list"
+    },
+    "cookies": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string" },
+          "value": { "type": "string" },
+          "domain": { "type": "string" },
+          "path": { "type": "string" },
+          "http_only": { "type": "boolean" },
+          "secure": { "type": "boolean" },
+          "same_site": { "type": "string", "enum": ["Strict", "Lax", "None"] }
+        },
+        "required": ["name", "value", "domain"]
+      }
+    },
+    "allowed_domains": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Allowed domains for crawling"
+    },
+    "exclude_patterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "URL patterns to exclude"
+    },
+    "scroll_height": {
+      "type": "integer",
+      "default": 5000,
+      "description": "Infinite scroll height"
+    },
+    "max_retries": {
+      "type": "integer",
+      "default": 3,
+      "description": "Maximum retry attempts"
+    },
+    "max_urls_per_host": {
+      "type": "integer",
+      "default": 10000,
+      "description": "Maximum URLs per host"
+    },
+    "max_total_urls": {
+      "type": "integer",
+      "default": 100000,
+      "description": "Maximum total URLs"
+    },
+    "checkpoint_interval": {
+      "type": "string",
+      "format": "duration",
+      "default": "5m",
+      "description": "Checkpoint interval"
+    },
+    "checkpoint_file": {
+      "type": "string",
+      "description": "Checkpoint file path"
+    },
+    "bloom_filter_path": {
+      "type": "string",
+      "description": "Bloom filter file path"
+    },
+    "rotate_user_agents": {
+      "type": "boolean",
+      "default": false,
+      "description": "Rotate user agents"
+    },
+    "user_agents": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+      ],
+      "description": "User agent rotation pool"
+    },
+    "wait_strategy": {
+      "type": "string",
+      "enum": ["adaptive", "networkidle", "selector", "timeout"],
+      "default": "adaptive",
+      "description": "Wait strategy"
+    },
+    "wait_selector": {
+      "type": "string",
+      "description": "CSS selector to wait for"
+    },
+    "wait_timeout": {
+      "type": "string",
+      "format": "duration",
+      "default": "60s",
+      "description": "Wait timeout"
+    },
+    "network_idle_quiet": {
+      "type": "string",
+      "format": "duration",
+      "default": "1s",
+      "description": "Network idle quiet time"
+    },
+    "wait_for_response": {
+      "type": "string",
+      "description": "Wait for specific response"
+    },
+    "wait_for_page_timeout": {
+      "type": "string",
+      "format": "duration",
+      "default": "30s",
+      "description": "Wait for page timeout"
+    },
+    "wait_strategy_timeout": {
+      "type": "string",
+      "format": "duration",
+      "default": "60s",
+      "description": "Wait strategy timeout"
+    },
+    "infinite_scroll": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "max_scrolls": { "type": "integer", "default": 20 },
+        "max_duration": { "type": "string", "format": "duration", "default": "10s" },
+        "stable_passes": { "type": "integer", "default": 3 },
+        "item_selector": { "type": "string", "default": "article, .card, .list-item, [data-infinite-scroll-item], .feed-item" },
+        "scroll_container": { "type": "string", "default": "" },
+        "load_more_selector": { "type": "string", "default": "" },
+        "scroll_delay": { "type": "string", "format": "duration", "default": "2s" },
+        "scroll_distance": { "type": "integer", "default": 500 }
+      },
+      "required": ["enabled"]
+    },
+    "intercept_apis": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "API patterns to intercept"
+    },
+    "click_selectors": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Selectors to click"
+    },
+    "js_before_load": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "JavaScript to execute before load"
+    },
+    "js_after_load": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "JavaScript to execute after load"
+    },
+    "expand_sections": {
+      "type": "boolean",
+      "default": true,
+      "description": "Expand collapsible sections"
+    },
+    "dismiss_overlays": {
+      "type": "boolean",
+      "default": true,
+      "description": "Dismiss overlays/popups"
+    },
+    "enable_stealth": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable stealth mode"
+    },
+    "enable_lazy_load": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable lazy load triggering"
+    },
+    "enable_shadow_dom": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable Shadow DOM extraction"
+    },
+    "enable_iframes": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable iframe crawling"
+    },
+    "enable_route_discovery": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable SPA route discovery"
+    },
+    "enable_media_capture": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable media capture"
+    },
+    "enable_structured_data": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable structured data extraction"
+    },
+    "max_spa_routes": {
+      "type": "integer",
+      "default": 50,
+      "description": "Maximum SPA routes"
+    },
+    "enable_interaction_engine": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable interaction engine"
+    },
+    "max_interactions_per_page": {
+      "type": "integer",
+      "default": 50,
+      "description": "Maximum interactions per page"
+    },
+    "viewport_width": {
+      "type": "integer",
+      "default": 1920,
+      "description": "Viewport width"
+    },
+    "viewport_height": {
+      "type": "integer",
+      "default": 1080,
+      "description": "Viewport height"
+    },
+    "mobile_emulation": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable mobile emulation"
+    },
+    "mobile_device": {
+      "type": "string",
+      "description": "Mobile device to emulate (e.g., iPhone 12, Pixel 5)"
+    },
+    "mobile_user_agent": {
+      "type": "string",
+      "description": "Custom mobile user agent"
+    },
+    "normalize_urls": {
+      "type": "boolean",
+      "default": true,
+      "description": "Normalize URLs"
+    },
+    "max_iframe_depth": {
+      "type": "integer",
+      "default": 2,
+      "description": "Maximum iframe depth"
+    },
+    "iframe_skip_patterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": ["googleads", "doubleclick", "facebook.com/tr"],
+      "description": "iframe patterns to skip"
+    },
+    "blocked_url_patterns": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "URL patterns to block (e.g., *doubleclick*, *ads*)"
+    },
+    "api_port": {
+      "type": "integer",
+      "default": 0,
+      "description": "REST API port (0 = disabled)"
+    },
+    "webhook_url": {
+      "type": "string",
+      "description": "Notification webhook URL"
+    },
+    "slack_url": {
+      "type": "string",
+      "description": "Slack webhook URL"
+    },
+    "smtp": {
+      "type": "object",
+      "properties": {
+        "host": { "type": "string" },
+        "port": { "type": "integer" },
+        "user": { "type": "string" },
+        "pass": { "type": "string" },
+        "from": { "type": "string" },
+        "to": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "schedule_cron": {
+      "type": "string",
+      "description": "Cron expression for scheduled crawls"
+    },
+    "schedule_timezone": {
+      "type": "string",
+      "default": "UTC",
+      "description": "Timezone for scheduler"
+    },
+    "enable_api_capture": {
+      "type": "boolean",
+      "default": true,
+      "description": "Enable API capture"
+    },
+    "disable_tls_verify": {
+      "type": "boolean",
+      "default": false,
+      "description": "Disable TLS verification"
+    },
+    "incremental": {
+      "type": "boolean",
+      "default": false,
+      "description": "Enable incremental crawling"
+    },
+    "inc_cache_file": {
+      "type": "string",
+      "description": "Incremental cache file"
+    },
+    "interactive": {
+      "type": "boolean",
+      "default": false,
+      "description": "Interactive mode"
+    },
+    "manual_capture": {
+      "type": "boolean",
+      "default": false,
+      "description": "Manual capture mode"
+    },
+    "min_disk_space": {
+      "type": "integer",
+      "default": 1073741824,
+      "minimum": 0,
+      "description": "Minimum free disk space in bytes (default 1GB)"
+    },
+    "browser_pool_size": {
+      "type": "integer",
+      "default": 1,
+      "minimum": 1,
+      "description": "Number of concurrent browser processes"
+    },
+    "user_data_dir": {
+      "type": "string",
+      "description": "Chrome user data directory"
+    },
+    "chrome_flags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Additional Chrome CLI flags"
+    },
+    "remote_chrome_url": {
+      "type": "string",
+      "description": "Remote Chrome WebSocket URL"
+    },
+    "auth": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "type": { "type": "string", "enum": ["form", "basic", "header", "oauth"] },
+        "login_url": { "type": "string" },
+        "form_fields": { "type": "object", "additionalProperties": { "type": "string" } },
+        "username": { "type": "string" },
+        "password": { "type": "string" },
+        "submit_selector": { "type": "string" },
+        "wait_after_login": { "type": "string", "format": "duration" },
+        "basic_auth": {
+          "type": "object",
+          "properties": {
+            "username": { "type": "string" },
+            "password": { "type": "string" }
+          }
+        },
+        "header_auth": {
+          "type": "object",
+          "properties": {
+            "headers": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        "oauth": {
+          "type": "object",
+          "properties": {
+            "client_id": { "type": "string" },
+            "client_secret": { "type": "string" },
+            "auth_url": { "type": "string" },
+            "token_url": { "type": "string" },
+            "refresh_url": { "type": "string" },
+            "scopes": { "type": "array", "items": { "type": "string" } },
+            "redirect_url": { "type": "string" },
+            "state": { "type": "string" }
+          }
+        }
+      }
+    },
+    "captcha": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "provider": { "type": "string", "enum": ["2captcha", "anticaptcha", "capmonster"] },
+        "api_key": { "type": "string" },
+        "timeout": { "type": "string", "format": "duration" },
+        "retry_count": { "type": "integer", "default": 3 }
+      }
+    },
+    "queue": {
+      "type": "object",
+      "properties": {
+        "backend": { "type": "string", "enum": ["local", "redis", "postgres", "kafka"] },
+        "redis_url": { "type": "string" },
+        "pg_dsn": { "type": "string" },
+        "kafka_url": { "type": "string" }
+      }
+    },
+    "change_detection": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "snapshot_dir": { "type": "string" },
+        "max_snapshots": { "type": "integer", "default": 10 },
+        "report_dir": { "type": "string" }
+      }
+    },
+    "dedupe": {
+      "type": "object",
+      "properties": {
+        "preserve_query_params": { "type": "array", "items": { "type": "string" } },
+        "preserve_path_segments": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+  "additionalProperties": false,
+  "required": []
+}

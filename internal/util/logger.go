@@ -47,6 +47,14 @@ func InitLogger(level string) {
 	Log = zap.New(core, zap.AddCallerSkip(1))
 }
 
+// WithModule returns a child logger with a module field for structured logging.
+func WithModule(module string) *zap.Logger {
+	if Log == nil {
+		return zap.NewNop()
+	}
+	return Log.With(zap.String("module", module))
+}
+
 // LogError logs an error message with the given error and fields, if Log has
 // been initialized.
 func LogError(msg string, err error, fields ...zap.Field) {

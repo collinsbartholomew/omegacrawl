@@ -1,0 +1,11 @@
+{
+  "name": "word-count-extractor",
+  "version": "1.0.0",
+  "type": "extractor",
+  "description": "Extracts word count and character count from HTML pages",
+  "author": "Web Cloner Team",
+  "entry_point": "extract",
+  "config": {
+    "min_word_length": "3"
+  }
+}

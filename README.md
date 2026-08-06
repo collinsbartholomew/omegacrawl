@@ -164,7 +164,10 @@ Flags:
       --schedule string         cron expression (e.g. "0 6 * * *" or "@every 24h")
 
 Subcommands:
-  serve [directory]    Serve cloned output for local replay
+  serve [directory]     Serve cloned output for local replay
+  repair [directory]    Download missing assets in an existing clone and re-rewrite pages
+  localize [directory]  Copy a clone into <dir>/localized with all refs rewritten to local files
+  dedupe [directory]    Export unique pages/assets, collapsing duplicate/permutation pages
 ```
 
 ---
@@ -286,24 +289,28 @@ See [internal/config/config.go](internal/config/config.go) for the complete stru
 ### Project Layout
 
 ```
-cmd/clone/           CLI entrypoint, cobra commands
+cmd/clone/           CLI entrypoint (clone, serve, repair, localize, dedupe)
 internal/
-  api/               REST API server (start, stop, status, pause, resume)
+  api/               REST API server (start, stop, status, pause, resume, metrics)
   auth/              Form login, HTTP Basic, custom headers, OAuth 2.0
-  browserpool/       Multi-browser process pool with health checks
+  browserpool/       Multi-browser process pool with health checks + auto-restart
   captcha/           2Captcha, AntiCaptcha, CapMonster integration
   changedetection/   Snapshot diffing across crawls
   config/            Configuration schema, defaults, validation
-  crawler/           Core crawl loop, browser management, page pipeline (~3850 lines)
+  crawler/           Core crawl loop split into focused files (page pipeline, capture,
+                     interaction, output writers, resume, checkpoint, ...)
   errors/            Error classification (14 retryable/non-retryable types)
   httpclient/        Shared HTTP client pool
   jsanalyzer/        JavaScript dependency URL analysis
-  jsengine/          Stealth, scroll, wait strategies, framework detection, WebSocket capture
+  jsengine/          Stealth, scroll, wait strategies, framework detection, SPA routes,
+                     single-file, structured data, WebSocket capture
+  localize/          Offline-localization pass + dedupe exporter (clone localize/dedupe)
   network/           CDP network interception (XHR/fetch/WebSocket)
   notify/            Notifications (webhook, Slack, SMTP email)
   pool/              Buffer pool for panic recovery
   queue/             URL queue backends (local, Redis, PostgreSQL, Kafka)
   ratelimit/         Token-bucket per-host rate limiter
+  repair/            Missing-asset repair pass (clone repair)
   resilience/        Per-host circuit breaker (3-state)
   rewrite/           HTML/CSS/JS asset URL rewriting for offline replay
   robots/            robots.txt parser and sitemap crawler
@@ -370,19 +377,18 @@ The `docker-compose.yml` pre-configures:
 
 ```
 output/
-├── html/             # Stored per-path: example.com/path/to/page.html
-├── css/              # Stylesheets (inlined + external)
-├── js/               # JavaScript files
-├── images/           # Images, favicons
-├── fonts/            # Web fonts
-├── api/              # Captured API responses (XHR/fetch/WS)
-├── screenshots/      # Full-page screenshots (if enabled)
-├── pdf/              # PDF exports (if enabled)
-├── singlefile/       # SingleFile snapshots (if enabled)
-├── warc/             # WARC archives (if enabled)
-├── *.wacz            # Packaged WACZ archives (if enabled)
-└── snapshots/        # Change detection snapshots (if enabled)
+├── clone/            # Raw crawl: host-mirrored pages, assets, and captures
+│   ├── example.com/  #   HTML per page, CSS/JS/images/fonts, per-page article/structured data
+│   ├── .mapping.json #   URL -> local-path mapping for the localize pass
+│   └── index.json    #   URL -> path -> sha256 -> mime index
+├── localized/        # Offline copy: every page/CSS rewritten to local files
+├── dedup/            # Deduplicated export (clone dedupe) of unique pages + assets
+└── .clone-state/     # checkpoint.bin + bloom.bin for resume
 ```
+
+Per-page artifacts (article.json, structured-data.json, singlefile.html, shadowdom.json)
+are stored next to each page's HTML file; the seed page also gets site-root copies for
+downstream importers (e.g. the Next.js pipeline).
 
 To replay locally:
 ```bash
@@ -398,11 +404,12 @@ When `--api-port` is set, a REST API is available:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/status` | GET | Current crawl status (pages, errors, queue, elapsed) |
+| `/api/status` | GET | Current crawl status (pages, errors, queue, elapsed, paused) |
 | `/api/start` | POST | Start a new crawl (body: `{"seeds": ["..."]}`) |
 | `/api/stop` | POST | Stop the current crawl |
 | `/api/pause` | POST | Pause crawl (no new pages, finish active) |
 | `/api/resume` | POST | Resume paused crawl |
+| `/metrics` | GET | Prometheus metrics (if enabled) |
 
 All endpoints return JSON. CORS headers are set for cross-origin access.
 

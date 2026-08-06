@@ -6,9 +6,6 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
-	"net/url"
-	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -19,74 +16,6 @@ import (
 	"github.com/user/clone/internal/httpclient"
 	"github.com/user/clone/internal/util"
 )
-
-const (
-	// MaxResponseBodySize is the maximum size of a captured response body in bytes.
-	MaxResponseBodySize = 50 * 1024 * 1024
-	maxRetries          = 3
-	maxSeenURLs         = 200000
-	maxResources        = 50000
-	maxAPIResponses     = 10000
-)
-
-// CapturedResource is a captured network response for a single URL.
-type CapturedResource struct {
-	URL        string
-	Body       []byte
-	MimeType   string
-	StatusCode int64
-	Timestamp  time.Time
-	Headers    map[string]string
-}
-
-// APIRequest is a captured outbound API request.
-type APIRequest struct {
-	URL       string            `json:"url"`
-	Method    string            `json:"method"`
-	Body      []byte            `json:"body,omitempty"`
-	Headers   map[string]string `json:"headers"`
-	Timestamp time.Time         `json:"timestamp"`
-}
-
-// APIResponse is a captured API response with its metadata.
-type APIResponse struct {
-	URL        string            `json:"url"`
-	Method     string            `json:"method"`
-	Body       []byte            `json:"body"`
-	MimeType   string            `json:"mime_type"`
-	StatusCode int               `json:"status_code"`
-	Headers    map[string]string `json:"headers"`
-	Timestamp  time.Time         `json:"timestamp"`
-	Size       int               `json:"size"`
-	Request    *APIRequest       `json:"request,omitempty"`
-}
-
-type pendingResource struct {
-	requestID network.RequestID
-	url       string
-	mimeType  string
-	status    int64
-	headers   map[string]string
-	method    string
-	request   *APIRequest
-}
-
-// Interceptor captures network traffic from a Chromium session via CDP.
-type Interceptor struct {
-	mu              sync.RWMutex
-	resources       map[string]*CapturedResource
-	apiResponses    []APIResponse
-	apiCallback     func(APIResponse)
-	seen            *util.LRUSet
-	pending         map[network.RequestID]*pendingResource
-	pendingMethods  map[network.RequestID]string
-	pendingRequests map[network.RequestID]*APIRequest
-	workerSem       chan struct{}
-	baseURL         string
-	fetchWg         sync.WaitGroup
-	fetchCtx        context.Context
-	fetchCancel     context.CancelFunc
-}
 
 // NewInterceptor creates an Interceptor with 10 worker goroutines.
 func NewInterceptor() *Interceptor {
@@ -159,11 +88,12 @@ func (i *Interceptor) onRequest(ev *network.EventRequestWillBeSent) {
 
 	i.pendingMethods[ev.RequestID] = ev.Request.Method
 
-	if ev.Request.Method != "GET" && ev.Request.PostData != "" {
+	if ev.Request.Method != "GET" {
+		// Post data is no longer directly available in Request; fetch it via CDP
 		i.pendingRequests[ev.RequestID] = &APIRequest{
 			URL:    ev.Request.URL,
 			Method: ev.Request.Method,
-			Body:   []byte(ev.Request.PostData),
+			Body:   nil, // Will be populated in onLoadingFinished via GetRequestPostData
 			Headers: func() map[string]string {
 				h := make(map[string]string)
 				for k, v := range ev.Request.Headers {
@@ -245,6 +175,14 @@ func (i *Interceptor) fetchAndProcess(ctx context.Context, p *pendingResource) {
 		body = body[:MaxResponseBodySize]
 	}
 
+	// Fetch request post data if available (for non-GET requests)
+	var reqBody []byte
+	if p.request != nil && p.request.Method != "GET" {
+		if postData, err := network.GetRequestPostData(p.requestID).Do(ctx); err == nil {
+			reqBody = []byte(postData)
+		}
+	}
+
 	resource := &CapturedResource{
 		URL:        p.url,
 		Body:       body,
@@ -264,15 +202,16 @@ func (i *Interceptor) fetchAndProcess(ctx context.Context, p *pendingResource) {
 
 	if isJSON {
 		ar = APIResponse{
-			URL:        p.url,
-			Body:       body,
-			MimeType:   p.mimeType,
-			StatusCode: int(p.status),
-			Headers:    p.headers,
-			Method:     p.method,
-			Timestamp:  time.Now(),
-			Size:       len(body),
-			Request:    p.request,
+			URL:         p.url,
+			Body:        body,
+			MimeType:    p.mimeType,
+			StatusCode:  int(p.status),
+			Headers:     p.headers,
+			Method:      p.method,
+			Timestamp:   time.Now(),
+			Size:        len(body),
+			Request:     p.request,
+			RequestBody: reqBody,
 		}
 		if len(i.apiResponses) < maxAPIResponses {
 			i.apiResponses = append(i.apiResponses, ar)
@@ -457,7 +396,9 @@ func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, resp.Body) // drain to allow connection reuse
+		if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+			util.LogDebug("failed to discard interceptor response body", zap.Error(copyErr), zap.String("url", rawURL))
+		}
 		return nil, nil
 	}
 
@@ -489,100 +430,6 @@ func (i *Interceptor) DownloadResourceViaHTTP(rawURL string) (*CapturedResource,
 		Timestamp:  time.Now(),
 		Headers:    headers,
 	}, nil
-}
-
-// AssetPath maps a URL and MIME type to a local filesystem path for the asset.
-func AssetPath(urlStr string, mimeType string) string {
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return ""
-	}
-
-	ext := path.Ext(u.Path)
-	if ext == "" {
-		ext = extensionForMime(mimeType)
-	}
-
-	host := u.Hostname()
-	cleanPath := u.Path
-	if cleanPath == "" {
-		cleanPath = "/index"
-	}
-
-	return path.Join(host, cleanPath)
-}
-
-func extensionForMime(mime string) string {
-	switch {
-	case strings.Contains(mime, "text/html"):
-		return ".html"
-	case strings.Contains(mime, "text/css"):
-		return ".css"
-	case strings.Contains(mime, "javascript"):
-		return ".js"
-	case strings.Contains(mime, "image/png"):
-		return ".png"
-	case strings.Contains(mime, "image/jpeg"):
-		return ".jpg"
-	case strings.Contains(mime, "image/gif"):
-		return ".gif"
-	case strings.Contains(mime, "image/svg"):
-		return ".svg"
-	case strings.Contains(mime, "image/webp"):
-		return ".webp"
-	case strings.Contains(mime, "image/x-icon"):
-		return ".ico"
-	case strings.Contains(mime, "font/woff2"):
-		return ".woff2"
-	case strings.Contains(mime, "font/woff"):
-		return ".woff"
-	case strings.Contains(mime, "font/ttf"):
-		return ".ttf"
-	case strings.Contains(mime, "font/eot"):
-		return ".eot"
-	case strings.Contains(mime, "application/json"):
-		return ".json"
-	case strings.Contains(mime, "application/pdf"):
-		return ".pdf"
-	default:
-		return ""
-	}
-}
-
-func baseMimeType(mime string) string {
-	if idx := strings.IndexByte(mime, ';'); idx != -1 {
-		return strings.TrimSpace(mime[:idx])
-	}
-	return strings.TrimSpace(mime)
-}
-
-func isJSONContentType(mime string) bool {
-	base := baseMimeType(mime)
-	switch base {
-	case "application/json", "text/json",
-		"application/vnd.api+json", "application/problem+json",
-		"application/hal+json", "application/ld+json":
-		return true
-	}
-	return false
-}
-
-func isAPIContentType(urlStr, mime string) bool {
-	base := baseMimeType(mime)
-	if strings.Contains(base, "xml") || strings.Contains(base, "protobuf") || strings.Contains(base, "grpc") {
-		return true
-	}
-	u, err := url.Parse(urlStr)
-	if err != nil {
-		return false
-	}
-	lowPath := strings.ToLower(u.Path)
-	if strings.Contains(lowPath, "/api/") || strings.Contains(lowPath, "/graphql") || strings.Contains(lowPath, "/gql") ||
-		strings.Contains(lowPath, "/rest/") || strings.Contains(lowPath, "/v1/") || strings.Contains(lowPath, "/v2/") ||
-		strings.Contains(lowPath, "/rpc") || strings.Contains(lowPath, "jsonrpc") {
-		return true
-	}
-	return false
 }
 
 // HasURL reports whether a resource was captured for rawURL.
@@ -621,4 +468,159 @@ func (i *Interceptor) Close() {
 	}
 	i.mu.Unlock()
 	i.fetchWg.Wait()
+}
+
+// Reset clears the interceptor state for reuse.
+func (i *Interceptor) Reset() {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+
+	// Clear resources but keep the maps (to avoid reallocation)
+	for k := range i.resources {
+		delete(i.resources, k)
+	}
+	for k := range i.apiResponses {
+		i.apiResponses[k] = APIResponse{}
+	}
+	i.apiResponses = i.apiResponses[:0]
+	i.seen.Clear()
+	for k := range i.pending {
+		delete(i.pending, k)
+	}
+	for k := range i.pendingMethods {
+		delete(i.pendingMethods, k)
+	}
+	for k := range i.pendingRequests {
+		delete(i.pendingRequests, k)
+	}
+	i.baseURL = ""
+	if i.fetchCancel != nil {
+		i.fetchCancel()
+		i.fetchCancel = nil
+	}
+	i.fetchCtx = nil
+}
+
+// InterceptorPool manages a pool of Interceptor instances for reuse across pages.
+type InterceptorPool struct {
+	mu          sync.Mutex
+	available   []*Interceptor
+	inUse       map[*Interceptor]bool
+	maxSize     int
+	workerCount int
+	factory     func() *Interceptor
+}
+
+// NewInterceptorPool creates a new Interceptor pool.
+func NewInterceptorPool(maxSize, workerCount int) *InterceptorPool {
+	if maxSize < 1 {
+		maxSize = 4
+	}
+	if workerCount < 1 {
+		workerCount = 10
+	}
+
+	p := &InterceptorPool{
+		available:   make([]*Interceptor, 0, maxSize),
+		inUse:       make(map[*Interceptor]bool),
+		maxSize:     maxSize,
+		workerCount: workerCount,
+	}
+
+	// Pre-populate with one interceptor
+	p.factory = func() *Interceptor {
+		return NewInterceptorWithWorkers(workerCount)
+	}
+	p.available = append(p.available, p.factory())
+
+	return p
+}
+
+// Acquire gets an Interceptor from the pool, blocking until one is available or ctx is cancelled.
+func (p *InterceptorPool) Acquire(ctx context.Context) (*Interceptor, error) {
+	// Fast path: try to acquire without blocking
+	p.mu.Lock()
+	if len(p.available) > 0 {
+		// Reuse existing interceptor - reset its state
+		i := p.available[len(p.available)-1]
+		p.available = p.available[:len(p.available)-1]
+		p.inUse[i] = true
+		p.mu.Unlock()
+		i.Reset()
+		return i, nil
+	}
+
+	// Create new if under max size
+	if len(p.inUse) < p.maxSize {
+		i := p.factory()
+		p.inUse[i] = true
+		p.mu.Unlock()
+		return i, nil
+	}
+	p.mu.Unlock()
+
+	// Pool exhausted, wait for a release
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+			p.mu.Lock()
+			if len(p.available) > 0 {
+				i := p.available[len(p.available)-1]
+				p.available = p.available[:len(p.available)-1]
+				p.inUse[i] = true
+				p.mu.Unlock()
+				i.Reset()
+				return i, nil
+			}
+			p.mu.Unlock()
+		}
+	}
+}
+
+// Release returns an Interceptor to the pool.
+func (p *InterceptorPool) Release(i *Interceptor) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, ok := p.inUse[i]; !ok {
+		// Not from our pool, just close it
+		i.Close()
+		return
+	}
+
+	delete(p.inUse, i)
+
+	if len(p.available) < p.maxSize {
+		i.Reset()
+		p.available = append(p.available, i)
+	} else {
+		// Pool full, close it
+		i.Close()
+	}
+}
+
+// Close closes all interceptors in the pool.
+func (p *InterceptorPool) Close() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	for _, i := range p.available {
+		i.Close()
+	}
+	for i := range p.inUse {
+		i.Close()
+	}
+	p.available = nil
+	p.inUse = nil
+}
+
+// Stats returns pool statistics.
+func (p *InterceptorPool) Stats() (available, inUse int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.available), len(p.inUse)
 }

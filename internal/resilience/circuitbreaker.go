@@ -44,6 +44,7 @@ type CircuitBreaker struct {
 	successThreshold  int
 	timeout           time.Duration
 	lastFailure       time.Time
+	halfOpenSince     time.Time
 	halfOpenProbes    int32
 	maxHalfOpenProbes int32
 }
@@ -128,18 +129,24 @@ func (hcb *HostCircuitBreaker) Reset(host string) {
 	cb.Reset()
 }
 
-// Cleanup removes circuit breakers that are idle or already tripped.
+// Cleanup removes circuit breakers that are idle (closed with zero failures).
+// Breakers in open/half-open state are left in place so active outage
+// protection is not silently reset.
 func (hcb *HostCircuitBreaker) Cleanup() {
+	var toDelete []string
 	hcb.breakers.Range(func(key string, val *CircuitBreaker) bool {
 		val.mu.Lock()
 		state := State(atomic.LoadInt32((*int32)(&val.state)))
 		fc := val.failureCount
 		val.mu.Unlock()
-		if (state == StateClosed && fc == 0) || state == StateOpen || state == StateHalfOpen {
-			hcb.breakers.Delete(key)
+		if state == StateClosed && fc == 0 {
+			toDelete = append(toDelete, key)
 		}
 		return true
 	})
+	for _, key := range toDelete {
+		hcb.breakers.Delete(key)
+	}
 }
 
 // RangeStates calls f for each circuit breaker state.
@@ -173,8 +180,16 @@ func (cb *CircuitBreaker) Allow() bool {
 	case StateClosed:
 		return true
 	case StateOpen:
-		if time.Since(cb.lastFailure) > cb.timeout {
+		cb.mu.Lock()
+		elapsed := time.Since(cb.lastFailure)
+		cb.mu.Unlock()
+		if elapsed > cb.timeout {
 			if atomic.CompareAndSwapInt32((*int32)(&cb.state), int32(StateOpen), int32(StateHalfOpen)) {
+				cb.mu.Lock()
+				cb.successCount = 0
+				cb.failureCount = 0
+				cb.halfOpenSince = time.Now()
+				cb.mu.Unlock()
 				atomic.StoreInt32(&cb.halfOpenProbes, int32(cb.maxHalfOpenProbes))
 				return true
 			}
@@ -183,19 +198,33 @@ func (cb *CircuitBreaker) Allow() bool {
 		}
 		return false
 	case StateHalfOpen:
+		// Guard against a probe that never completes: if no probe has settled
+		// within the full timeout, reopen so the recovery timer restarts.
+		cb.mu.Lock()
+		stuck := time.Since(cb.halfOpenSince) > cb.timeout
+		cb.mu.Unlock()
+		if stuck {
+			if atomic.CompareAndSwapInt32((*int32)(&cb.state), int32(StateHalfOpen), int32(StateOpen)) {
+				cb.mu.Lock()
+				cb.lastFailure = time.Now()
+				cb.mu.Unlock()
+			}
+			return false
+		}
 		return atomic.AddInt32(&cb.halfOpenProbes, -1) >= 0
 	default:
 		return false
 	}
 }
 
-// Success records a successful request and resets failure counts.
+// Success records a successful request. In half-open a single success no longer
+// guarantees closure; the breaker closes after successThreshold consecutive
+// half-open successes, allowing a fresh probe toward the threshold between them.
 func (cb *CircuitBreaker) Success() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
-	state := State(atomic.LoadInt32((*int32)(&cb.state)))
-	switch state {
+	switch cb.State() {
 	case StateHalfOpen:
 		cb.successCount++
 		if cb.successCount >= cb.successThreshold {
@@ -203,13 +232,17 @@ func (cb *CircuitBreaker) Success() {
 			cb.failureCount = 0
 			cb.successCount = 0
 			atomic.StoreInt32(&cb.halfOpenProbes, cb.maxHalfOpenProbes)
+		} else {
+			// Need more consecutive successes to close; admit the next probe.
+			atomic.StoreInt32(&cb.halfOpenProbes, int32(cb.maxHalfOpenProbes))
 		}
 	case StateClosed:
 		cb.failureCount = 0
 	}
 }
 
-// Failure records a failed request and may trip the breaker open.
+// Failure records a failed request and may trip the breaker open. In half-open, a
+// single failure trips the breaker back to open immediately (fail-fast).
 func (cb *CircuitBreaker) Failure() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -217,8 +250,14 @@ func (cb *CircuitBreaker) Failure() {
 	cb.failureCount++
 	cb.lastFailure = time.Now()
 
-	if cb.failureCount >= cb.failureThreshold {
+	switch cb.State() {
+	case StateHalfOpen:
 		atomic.StoreInt32((*int32)(&cb.state), int32(StateOpen))
+		cb.successCount = 0
+	case StateClosed, StateOpen:
+		if cb.failureCount >= cb.failureThreshold {
+			atomic.StoreInt32((*int32)(&cb.state), int32(StateOpen))
+		}
 	}
 }
 

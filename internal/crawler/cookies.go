@@ -52,7 +52,7 @@ func (c *Crawler) saveCookieJar() {
 	}
 	path := filepath.Join(c.cfg.OutputDir, cookieJarFile)
 	os.MkdirAll(c.cfg.OutputDir, 0755)
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		util.LogError("failed to save cookie jar", err)
 	}
 }

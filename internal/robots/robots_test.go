@@ -17,8 +17,8 @@ func TestRobotsParser_AllowDisallow(t *testing.T) {
 	}
 
 	tests := []struct {
-		path      string
-		expectOK  bool
+		path     string
+		expectOK bool
 	}{
 		{"/page", true},
 		{"/admin/", false},
@@ -46,9 +46,9 @@ func TestRobotsParser_WildcardMatch(t *testing.T) {
 	parser := NewRobotsParser()
 
 	tests := []struct {
-		rule    string
-		path    string
-		expect  bool
+		rule   string
+		path   string
+		expect bool
 	}{
 		{"/*.jpg", "/image.jpg", true},
 		{"/*.jpg", "/dir/image.jpg", true},
@@ -85,7 +85,7 @@ func TestRobotsParser_UserAgentMatch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.pattern+"_"+tt.ua, func(t *testing.T) {
 			parser.userAgent = tt.ua
-			result := parser.matchUserAgent(tt.pattern)
+			result := parser.matchUserAgent(tt.pattern, tt.ua)
 			if result != tt.expect {
 				t.Errorf("matchUserAgent(%s, %s) = %v, want %v", tt.pattern, tt.ua, result, tt.expect)
 			}

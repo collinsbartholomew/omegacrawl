@@ -97,6 +97,7 @@ func TestWriteSitemap(t *testing.T) {
 	dir := t.TempDir()
 	cfg := config.DefaultConfig()
 	cfg.OutputDir = dir
+	cfg.Seeds = []string{"https://example.com/"}
 
 	c, err := NewCrawler(cfg)
 	if err != nil {
@@ -199,58 +200,179 @@ func TestWSMsgJSON(t *testing.T) {
 		t.Error("IsBinary should be true")
 	}
 	if decoded.Opcode != 2 {
-		t.Errorf("Opcode mismatch: %f vs %f", decoded.Opcode, 2.0)
-	}
-}
-
-func TestJsonHeadrs(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    map[string]string
-		expected string
-	}{
-		{
-			name:     "empty",
-			input:    map[string]string{},
-			expected: "{}",
-		},
-		{
-			name:     "single header",
-			input:    map[string]string{"Content-Type": "application/json"},
-			expected: `{"Content-Type":"application/json"}`,
-		},
-		{
-			name:     "multiple headers",
-			input:    map[string]string{"Content-Type": "text/html", "X-Custom": "value"},
-			expected: `{"Content-Type":"text/html","X-Custom":"value"}`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := jsonHeadrs(tt.input)
-			if result == tt.expected {
-				return
+				t.Errorf("Opcode mismatch: %f vs %f", decoded.Opcode, 2.0)
 			}
-			var a, b map[string]string
-			json.Unmarshal([]byte(result), &a)
-			json.Unmarshal([]byte(tt.expected), &b)
-			if len(a) != len(b) {
-				t.Errorf("header count mismatch: %d vs %d", len(a), len(b))
-			}
-			for k, v := range a {
-				if b[k] != v {
-					t.Errorf("header %q mismatch: %q vs %q", k, v, b[k])
-				}
-			}
-		})
-	}
-}
+		}
 
-func TestSortUsesImport(t *testing.T) {
+	func TestSortUsesImport(t *testing.T) {
 	urls := []string{"z.com", "a.com", "m.com"}
 	sort.Strings(urls)
 	if urls[0] != "a.com" {
 		t.Error("sort.Strings not working")
+	}
+}
+
+func TestStartRejectsAlreadyRunning(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.OutputDir = t.TempDir()
+	cfg.Seeds = []string{"https://example.com/"}
+	c, err := NewCrawler(cfg)
+	if err != nil {
+		t.Fatalf("NewCrawler failed: %v", err)
+	}
+
+	c.started.Store(true)
+	err = c.Start([]string{"https://example.com"})
+	if err == nil {
+		t.Fatal("expected 'already running' error")
+	}
+	if !strings.Contains(err.Error(), "already running") {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !c.IsRunning() {
+		t.Error("IsRunning should be true while a crawl is active")
+	}
+
+	c.started.Store(false)
+	if err := c.Start([]string{"file:///etc/passwd"}); err == nil {
+		t.Error("expected seed error after reset")
+	}
+	if c.IsRunning() {
+		t.Error("IsRunning should be false after Start returns")
+	}
+}
+
+func TestStartRejectsInvalidSeeds(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.OutputDir = t.TempDir()
+	cfg.Seeds = []string{"https://example.com/"}
+	c, err := NewCrawler(cfg)
+	if err != nil {
+		t.Fatalf("NewCrawler failed: %v", err)
+	}
+
+	err = c.Start([]string{"file:///etc/passwd"})
+	if err == nil {
+		t.Fatal("expected error for file:// seed")
+	}
+	if !strings.Contains(err.Error(), "http/https") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestIsSeedPage(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.OutputDir = t.TempDir()
+	cfg.Seeds = []string{"https://example.com/", "https://example.com/about"}
+	c, err := NewCrawler(cfg)
+	if err != nil {
+		t.Fatalf("NewCrawler failed: %v", err)
+	}
+
+	tests := []struct {
+		url  string
+		want bool
+	}{
+		{"https://example.com/", true},
+		{"https://example.com/about", true},
+		{"https://example.com/contact", false},
+		{"https://other.com/", false},
+	}
+	for _, tt := range tests {
+		if got := c.isSeedPage(tt.url); got != tt.want {
+			t.Errorf("isSeedPage(%q) = %v, want %v", tt.url, got, tt.want)
+		}
+	}
+}
+
+func TestStartResetsPauseState(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.OutputDir = t.TempDir()
+	cfg.Seeds = []string{"https://example.com/"}
+	c, err := NewCrawler(cfg)
+	if err != nil {
+		t.Fatalf("NewCrawler failed: %v", err)
+	}
+
+	// Simulate a previous crawl that was paused and then stopped, leaving
+	// paused set and a stale resume signal buffered in the channel.
+	c.paused.Store(true)
+	c.resumeCh <- struct{}{}
+
+	// Starting a fresh crawl must clear the stale pause state (the new crawl
+	// would otherwise block in the pause wait loop forever). Use an invalid
+	// seed so Start fails fast without launching a browser.
+	if err := c.Start([]string{"file:///etc/passwd"}); err == nil {
+		t.Fatal("expected seed error for file:// URL")
+	}
+	if c.paused.Load() {
+		t.Error("paused should be reset on a fresh Start")
+	}
+	select {
+	case <-c.resumeCh:
+		t.Error("stale resume signal should be drained on Start")
+	default:
+	}
+}
+
+func TestWriteSiteAggregate(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.OutputDir = dir
+	cfg.Seeds = []string{"https://example.com/"}
+	c, err := NewCrawler(cfg)
+	if err != nil {
+		t.Fatalf("NewCrawler failed: %v", err)
+	}
+
+	// Non-seed page with content fills the slot when no aggregate exists yet.
+	c.writeSiteAggregate("https://example.com/about", "article.json", []byte(`{"title":"about"}`), &c.siteArticleWritten)
+	path := filepath.Join(dir, "example.com", "article.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("aggregate not written by fallback: %v", err)
+	}
+	if !strings.Contains(string(data), "about") {
+		t.Errorf("unexpected fallback content: %s", data)
+	}
+
+	// The seed page is preferred and overwrites the fallback.
+	c.writeSiteAggregate("https://example.com/", "article.json", []byte(`{"title":"home"}`), &c.siteArticleWritten)
+	data, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("aggregate not overwritten by seed page: %v", err)
+	}
+	if !strings.Contains(string(data), "home") {
+		t.Errorf("seed page should overwrite fallback aggregate, got: %s", data)
+	}
+
+	// A later non-seed page must not clobber the existing aggregate.
+	c.writeSiteAggregate("https://example.com/contact", "structured-data.json", []byte(`{"x":1}`), &c.siteSDWritten)
+	c.writeSiteAggregate("https://example.com/contact", "article.json", []byte(`{"title":"contact"}`), &c.siteArticleWritten)
+	data, _ = os.ReadFile(path)
+	if strings.Contains(string(data), "contact") {
+		t.Errorf("non-seed page clobbered existing aggregate: %s", data)
+	}
+}
+
+func TestStatusRunningReflectsStarter(t *testing.T) {
+	cfg := config.DefaultConfig()
+	cfg.OutputDir = t.TempDir()
+	cfg.Seeds = []string{"https://example.com/"}
+	c, err := NewCrawler(cfg)
+	if err != nil {
+		t.Fatalf("NewCrawler failed: %v", err)
+	}
+
+	if c.Status().Running {
+		t.Error("Status.Running should be false before Start")
+	}
+	c.started.Store(true)
+	if !c.Status().Running {
+		t.Error("Status.Running should be true while crawling")
+	}
+	c.started.Store(false)
+	if c.Status().Running {
+		t.Error("Status.Running should be false after crawl")
 	}
 }

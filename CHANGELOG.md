@@ -1,5 +1,41 @@
 # Web Cloner - Changelog
 
+## Version 1.1.0 - Audit Fixes
+
+### Output Correctness
+
+1. **Per-page structured data / article / single-file outputs** — `structured-data.json`,
+   `article.json`, and `singlefile.html` were previously written to fixed per-host paths,
+   so only the last page's data survived. They are now written per page next to each
+   page's HTML (e.g. `about/index.html-article.json`), mirroring the shadow-DOM convention.
+   The seed page additionally receives site-root copies (`host/article.json`,
+   `host/structured-data.json`) so the downstream Next.js importer keeps working.
+
+2. **SPA route capture asset pipeline** — discovered SPA routes are now run through
+   `downloadHTMLAssets` and JS-dependency resolution so the localized pass can fully
+   rewrite every route instead of leaving raw, unmapped HTML.
+
+3. **Error-path logging** — screenshot, PDF, and asset download/save failures are now
+   logged at Error level with URL context instead of being silently swallowed or
+   logged at Debug.
+
+### API
+
+4. **`/api/pause` and `/api/resume` implemented** — the documented endpoints now exist.
+   Pausing stops URL dispatch while active pages finish; status reports `paused`.
+   `CrawlStatus` gains a `paused` field and the web dashboard stats include it.
+
+### Tests & Docs
+
+5. **Repair tests made self-contained** — `repair_test.go` no longer hard-fails when the
+   sample `output/` tree is absent; it skips instead and now includes unit tests for
+   asset extraction, CSS escape handling, and URL rewriting. New tests cover the
+   per-page storage helpers, `isSeedPage`, and the pause/resume API handlers.
+
+6. **Docs aligned with the implementation** — README now documents `repair`/`localize`/
+   `dedupe` subcommands, the real API surface (including `/metrics`), and the
+   `clone/` + `localized/` + `.clone-state/` output layout.
+
 ## Version 1.0.0 - Major Rewrite
 
 ### Completed Fixes

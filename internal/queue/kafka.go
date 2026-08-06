@@ -21,6 +21,8 @@ type KafkaQueue struct {
 	maxSize    int
 	seenMu     sync.RWMutex
 	seenSet    map[string]bool
+	pendingMu  sync.Mutex
+	pendingSet map[string]bool
 	seenTopic  string
 	brokers    []string
 	closeCh    chan struct{}
@@ -60,6 +62,7 @@ func NewKafkaQueueWithSize(ctx context.Context, kafkaURL string, maxSize int) (*
 		key:        "crawl:queue",
 		maxSize:    maxSize,
 		seenSet:    make(map[string]bool),
+		pendingSet: make(map[string]bool),
 		seenTopic:  "crawl_seen",
 		brokers:    []string{kafkaURL},
 		closeCh:    make(chan struct{}),
@@ -131,11 +134,12 @@ func (q *KafkaQueue) Close() error {
 
 // PushURL enqueues url at depth unless it was already seen or the queue is full.
 func (q *KafkaQueue) PushURL(url string, depth int) bool {
-	if q.HasSeen(url) {
-		return false
-	}
 	if q.pending.Load() >= int64(q.maxSize) {
 		return false
+	}
+	// Atomically check and mark as seen
+	if q.markSeenIfNotExists(url) {
+		return false // already seen
 	}
 	item := URLItem{URL: url, Depth: depth}
 	data, err := json.Marshal(item)
@@ -151,19 +155,22 @@ func (q *KafkaQueue) PushURL(url string, depth int) bool {
 	if err != nil {
 		return false
 	}
+	q.pendingMu.Lock()
+	q.pendingSet[url] = true
+	q.pendingMu.Unlock()
 	q.pending.Add(1)
-	q.markSeen(url)
 	return true
 }
 
-func (q *KafkaQueue) markSeen(url string) {
+// markSeenIfNotExists atomically checks if URL was seen and marks it if not.
+// Returns true if URL was already seen, false if newly marked.
+func (q *KafkaQueue) markSeenIfNotExists(url string) bool {
 	q.seenMu.Lock()
+	defer q.seenMu.Unlock()
 	if q.seenSet[url] {
-		q.seenMu.Unlock()
-		return
+		return true
 	}
 	q.seenSet[url] = true
-	q.seenMu.Unlock()
 
 	item := URLItem{URL: url, Depth: 0}
 	data, err := json.Marshal(item)
@@ -178,6 +185,12 @@ func (q *KafkaQueue) markSeen(url string) {
 		Key:   []byte(url),
 		Value: data,
 	})
+	return false
+}
+
+// markSeen marks a URL as seen (used by MarkSeen and LoadFromCheckpoint).
+func (q *KafkaQueue) markSeen(url string) {
+	q.markSeenIfNotExists(url)
 }
 
 // PopURL fetches and commits the next message from the queue.
@@ -197,6 +210,9 @@ func (q *KafkaQueue) PopURL() (URLItem, bool) {
 	if err := q.reader.CommitMessages(commitCtx, msg); err != nil {
 		return URLItem{}, false
 	}
+	q.pendingMu.Lock()
+	delete(q.pendingSet, item.URL)
+	q.pendingMu.Unlock()
 	q.pending.Add(-1)
 	return item, true
 }
@@ -222,12 +238,12 @@ func (q *KafkaQueue) MarkSeen(url string) {
 	q.markSeen(url)
 }
 
-// Items returns the seen URLs as URLItems.
+// Items returns the pending (queued but not yet popped) URLs as URLItems.
 func (q *KafkaQueue) Items() []URLItem {
-	q.seenMu.RLock()
-	defer q.seenMu.RUnlock()
-	items := make([]URLItem, 0, len(q.seenSet))
-	for url := range q.seenSet {
+	q.pendingMu.Lock()
+	defer q.pendingMu.Unlock()
+	items := make([]URLItem, 0, len(q.pendingSet))
+	for url := range q.pendingSet {
 		items = append(items, URLItem{URL: url})
 	}
 	return items
@@ -244,22 +260,20 @@ func (q *KafkaQueue) AllVisited() map[string]bool {
 	return result
 }
 
-// Snapshot returns a consistent snapshot of the queue contents and visited set.
+// Snapshot returns the pending items and the visited set.
 func (q *KafkaQueue) Snapshot() ([]URLItem, map[string]bool) {
+	items := q.Items()
 	q.seenMu.RLock()
-	defer q.seenMu.RUnlock()
-	items := make([]URLItem, 0, len(q.seenSet))
-	for url := range q.seenSet {
-		items = append(items, URLItem{URL: url})
-	}
 	result := make(map[string]bool, len(q.seenSet))
 	for k, v := range q.seenSet {
 		result[k] = v
 	}
+	q.seenMu.RUnlock()
 	return items, result
 }
 
-// LoadFromCheckpoint enqueues the given items and marks the visited URLs as seen.
+// LoadFromCheckpoint re-publishes the given pending items, seeds the local
+// pending mirror, and marks the visited URLs as seen.
 func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool) {
 	opCtx, opCancel := context.WithTimeout(q.parentCtx, 30*time.Second)
 	defer opCancel()
@@ -274,8 +288,15 @@ func (q *KafkaQueue) LoadFromCheckpoint(items []URLItem, visited map[string]bool
 			Key:   []byte(item.URL),
 			Value: data,
 		})
-		q.pending.Add(1)
 	}
+
+	q.pendingMu.Lock()
+	q.pendingSet = make(map[string]bool, len(items))
+	for _, item := range items {
+		q.pendingSet[item.URL] = true
+	}
+	q.pendingMu.Unlock()
+	q.pending.Store(int64(len(items)))
 
 	for url := range visited {
 		q.markSeen(url)

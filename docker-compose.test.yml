@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  chrome:
+    image: zenika/alpine-chrome:latest
+    ports:
+      - "9222:9222"
+    command:
+      - "--no-sandbox"
+      - "--disable-gpu"
+      - "--disable-dev-shm-usage"
+      - "--remote-debugging-address=0.0.0.0"
+      - "--remote-debugging-port=9222"
+      - "--disable-setuid-sandbox"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9222/json/version"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 1G
+
+  # Optional: Test HTTP server for integration tests
+  test-server:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./testdata:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 5

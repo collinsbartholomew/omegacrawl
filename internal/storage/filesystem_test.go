@@ -93,6 +93,54 @@ func TestFilesystem_WriteIndex(t *testing.T) {
 	}
 }
 
+func TestFilesystem_PerPageArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{OutputDir: dir}
+	fs := NewFilesystem(cfg)
+
+	urls := []string{
+		"https://example.com/index.html",
+		"https://example.com/about/index.html",
+	}
+
+	// Distinct pages must get distinct artifact paths (no fixed-name collision).
+	seenStructured := map[string]bool{}
+	seenArticle := map[string]bool{}
+	seenSingle := map[string]bool{}
+	for _, u := range urls {
+		sp, err := fs.SaveStructuredData(u, []byte(`{"a":1}`))
+		if err != nil {
+			t.Fatalf("SaveStructuredData(%s) failed: %v", u, err)
+		}
+		ap, err := fs.SaveArticle(u, []byte(`{"t":"x"}`))
+		if err != nil {
+			t.Fatalf("SaveArticle(%s) failed: %v", u, err)
+		}
+		sf, err := fs.SaveSingleFile(u, []byte("<html/>"))
+		if err != nil {
+			t.Fatalf("SaveSingleFile(%s) failed: %v", u, err)
+		}
+		if seenStructured[sp] {
+			t.Errorf("structured-data collision: %s", sp)
+		}
+		if seenArticle[ap] {
+			t.Errorf("article collision: %s", ap)
+		}
+		if seenSingle[sf] {
+			t.Errorf("singlefile collision: %s", sf)
+		}
+		seenStructured[sp] = true
+		seenArticle[ap] = true
+		seenSingle[sf] = true
+	}
+
+	// Paths must live next to the page HTML, mirroring the shadow-DOM convention.
+	expected := dir + "/example.com/index.html-structured-data.json"
+	if !seenStructured[expected] {
+		t.Errorf("expected per-page structured-data path %s, got %v", expected, seenStructured)
+	}
+}
+
 func TestFilesystem_MirrorStructure(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{OutputDir: dir}

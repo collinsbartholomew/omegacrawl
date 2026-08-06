@@ -17,7 +17,15 @@ type CrawlStats struct {
 	BytesTotal   int64  `json:"bytes_total"`
 	QueueSize    int    `json:"queue_size"`
 	Running      bool   `json:"running"`
+	Paused       bool   `json:"paused"`
 	Elapsed      string `json:"elapsed"`
+}
+
+// HealthStatus represents the health of the web UI service.
+type HealthStatus struct {
+	Status    string            `json:"status"`
+	Timestamp time.Time         `json:"timestamp"`
+	Checks    map[string]string `json:"checks,omitempty"`
 }
 
 // StatsProvider is implemented by components that can report crawl statistics.
@@ -48,6 +56,8 @@ func (s *Server) Start(port int) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/healthz", s.handleHealthz)
+	mux.HandleFunc("/readyz", s.handleReadyz)
 
 	s.server = &http.Server{Addr: fmt.Sprintf(":%d", port), Handler: mux}
 	return s.server.ListenAndServe()
@@ -77,6 +87,53 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	stats := p.(StatsProvider).Stats()
 	stats.Elapsed = time.Since(s.start).Round(time.Second).String()
 	json.NewEncoder(w).Encode(stats)
+}
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	health := HealthStatus{
+		Status:    "healthy",
+		Timestamp: time.Now(),
+		Checks: map[string]string{
+			"webui": "ok",
+		},
+	}
+	
+	// Check if provider is available
+	p := s.provider.Load()
+	if p != nil {
+		health.Checks["stats_provider"] = "connected"
+	} else {
+		health.Checks["stats_provider"] = "disconnected"
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(health)
+}
+
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	ready := HealthStatus{
+		Status:    "ready",
+		Timestamp: time.Now(),
+		Checks: map[string]string{
+			"webui": "ready",
+		},
+	}
+	
+	statusCode := http.StatusOK
+	w.WriteHeader(statusCode)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(ready)
 }
 
 var indexHTML = `<!DOCTYPE html>

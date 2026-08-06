@@ -31,6 +31,7 @@ type ClientConfig struct {
 	ResponseHeaderTimeout time.Duration
 	ExpectContinueTimeout time.Duration
 	DisableCompression    bool
+	Timeout               time.Duration
 }
 
 // DefaultConfig returns a ClientConfig with sensible defaults sized to the host CPU count.
@@ -93,11 +94,16 @@ func NewClientPool(cfg *ClientConfig) *ClientPool {
 		},
 	}
 
+	clientTimeout := cfg.Timeout
+	if clientTimeout <= 0 {
+		clientTimeout = 120 * time.Second
+	}
+
 	return &ClientPool{
 		transport: transport,
 		client: &stdhttp.Client{
 			Transport: transport,
-			Timeout:   0,
+			Timeout:   clientTimeout,
 			CheckRedirect: func(req *stdhttp.Request, via []*stdhttp.Request) error {
 				if len(via) >= 10 {
 					return stdhttp.ErrUseLastResponse

@@ -1,0 +1,27 @@
+# Dependency Review Configuration
+# This file configures the GitHub Dependency Review Action
+
+# Severity thresholds for failing the build
+fail-on-severity: high
+
+# Allow list for known acceptable vulnerabilities (if any)
+# allow-ghsas:
+#   - GHSA-xxxx-xxxx-xxxx
+
+# Configuration for specific ecosystems
+# ecosystems:
+#   - go
+#   - npm
+#   - pypi
+
+# Configuration for license scanning
+# allowed-licenses:
+#   - MIT
+#   - Apache-2.0
+#   - BSD-3-Clause
+#   - BSD-2-Clause
+#   - ISC
+#   - MPL-2.0
+
+# Configuration for scope filtering
+# include-dev-dependencies: false

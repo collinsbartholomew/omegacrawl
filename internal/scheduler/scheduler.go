@@ -8,13 +8,6 @@ import (
 	"time"
 )
 
-// Config holds the scheduler settings for a single job.
-type Config struct {
-	Enabled  bool   `json:"enabled"`
-	CronExpr string `json:"cron_expr"`
-	Timezone string `json:"timezone"`
-}
-
 // Job describes a scheduled task with a cron expression and run function.
 type Job struct {
 	ID       string
@@ -27,13 +20,13 @@ type Job struct {
 type Scheduler struct {
 	mu     sync.Mutex
 	jobs   []*Job
-	timers []*time.Timer
+	timers map[*time.Timer]struct{}
 	cancel context.CancelFunc
 }
 
 // New returns an empty Scheduler.
 func New() *Scheduler {
-	return &Scheduler{}
+	return &Scheduler{timers: make(map[*time.Timer]struct{})}
 }
 
 // Add validates the job's cron expression and registers it with the scheduler.
@@ -63,10 +56,10 @@ func (s *Scheduler) Stop() {
 		s.cancel()
 	}
 	s.mu.Lock()
-	for _, t := range s.timers {
+	for t := range s.timers {
 		t.Stop()
 	}
-	s.timers = nil
+	s.timers = make(map[*time.Timer]struct{})
 	s.mu.Unlock()
 }
 
@@ -89,17 +82,13 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 
 		timer := time.NewTimer(dur)
 		s.mu.Lock()
-		idx := len(s.timers)
-		s.timers = append(s.timers, timer)
+		s.timers[timer] = struct{}{}
 		s.mu.Unlock()
 
 		select {
 		case <-timer.C:
 			s.mu.Lock()
-			// Remove timer from slice
-			if idx < len(s.timers) && s.timers[idx] == timer {
-				s.timers = append(s.timers[:idx], s.timers[idx+1:]...)
-			}
+			delete(s.timers, timer)
 			s.mu.Unlock()
 
 			if running {
@@ -113,9 +102,7 @@ func (s *Scheduler) runJob(ctx context.Context, job *Job) {
 		case <-ctx.Done():
 			timer.Stop()
 			s.mu.Lock()
-			if idx < len(s.timers) && s.timers[idx] == timer {
-				s.timers = append(s.timers[:idx], s.timers[idx+1:]...)
-			}
+			delete(s.timers, timer)
 			s.mu.Unlock()
 			return
 		}
@@ -158,11 +145,20 @@ func parseCron(expr string) (func(time.Time) time.Time, error) {
 }
 
 func matchCron(fields []string, t time.Time) bool {
+	dom := matchField(fields[2], t.Day(), 1, 31)
+	month := matchField(fields[3], int(t.Month()), 1, 12)
+	dow := matchField(fields[4], int(t.Weekday()), 0, 6)
+
+	// Standard cron semantics: when both the day-of-month and day-of-week
+	// fields are restricted (not "*"), the job fires when EITHER matches;
+	// otherwise both must match.
+	dayMatch := dom || dow
+	if fields[2] == "*" || fields[4] == "*" {
+		dayMatch = dom && dow
+	}
 	return matchField(fields[0], t.Minute(), 0, 59) &&
 		matchField(fields[1], t.Hour(), 0, 23) &&
-		matchField(fields[2], t.Day(), 1, 31) &&
-		matchField(fields[3], int(t.Month()), 1, 12) &&
-		matchField(fields[4], int(t.Weekday()), 0, 6)
+		month && dayMatch
 }
 
 func matchField(pattern string, value, min, max int) bool {

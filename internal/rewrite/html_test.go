@@ -167,13 +167,13 @@ func TestExtractFontURLs(t *testing.T) {
 			expected: []string{"a.woff2", "b.woff2"},
 		},
 		{
-			name: "no font-face",
-			css: `body { color: red; }`,
+			name:     "no font-face",
+			css:      `body { color: red; }`,
 			expected: nil,
 		},
 		{
-			name: "empty CSS",
-			css: "",
+			name:     "empty CSS",
+			css:      "",
 			expected: nil,
 		},
 	}
@@ -211,28 +211,38 @@ func TestExtractAllCSSURLs(t *testing.T) {
 		expected []string
 	}{
 		{
-			name: "background images",
-			css: `body { background: url("https://example.com/bg.png"); } .card { background-image: url('card.jpg'); }`,
+			name:     "background images",
+			css:      `body { background: url("https://example.com/bg.png"); } .card { background-image: url('card.jpg'); }`,
 			expected: []string{"https://example.com/bg.png", "card.jpg"},
 		},
 		{
-			name: "font-face and background",
-			css: `@font-face { src: url('font.woff2'); } body { background: url(bg.jpg); }`,
+			name:     "font-face and background",
+			css:      `@font-face { src: url('font.woff2'); } body { background: url(bg.jpg); }`,
 			expected: []string{"font.woff2", "bg.jpg"},
 		},
 		{
-			name: "data URIs excluded",
-			css: `body { background: url("data:image/png;base64,abc"); }`,
+			name:     "data URIs excluded",
+			css:      `body { background: url("data:image/png;base64,abc"); }`,
 			expected: nil,
 		},
 		{
-			name: "no urls",
-			css: `body { color: red; }`,
+			name:     "escaped parentheses in url",
+			css:      `body { background: url(icon\(1\).png); }`,
+			expected: []string{`icon\(1\).png`},
+		},
+		{
+			name:     "escaped parentheses in quoted url",
+			css:      `body { background: url("icons/icon\(big\).png"); }`,
+			expected: []string{`icons/icon\(big\).png`},
+		},
+		{
+			name:     "no urls",
+			css:      `body { color: red; }`,
 			expected: nil,
 		},
 		{
-			name: "empty CSS",
-			css: "",
+			name:     "empty CSS",
+			css:      "",
 			expected: nil,
 		},
 	}

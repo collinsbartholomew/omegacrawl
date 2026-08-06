@@ -40,23 +40,6 @@ func (r *RetryConfig) GetBackoff(attempt int) time.Duration {
 	return time.Duration(backoff)
 }
 
-// RetryableError wraps an error that may be retried based on the HTTP status code.
-type RetryableError struct {
-	Err        error
-	Retryable  bool
-	StatusCode int
-}
-
-// Error returns the string representation of the wrapped error.
-func (e *RetryableError) Error() string {
-	return e.Err.Error()
-}
-
-// Unwrap returns the underlying error.
-func (e *RetryableError) Unwrap() error {
-	return e.Err
-}
-
 // IsRetryable reports whether the given HTTP status code indicates a retryable failure.
 func IsRetryable(statusCode int) bool {
 	switch {

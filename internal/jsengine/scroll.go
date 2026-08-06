@@ -206,3 +206,171 @@ func InfiniteScroll(ctx context.Context, cfg *InfiniteScrollConfig) (*ScrollResu
 
 	return result, nil
 }
+
+const InfiniteScrollScript = `
+		// Return current scroll metrics
+		(function() {
+			return {
+				scrollHeight: document.body.scrollHeight,
+				scrollTop: window.scrollY || document.documentElement.scrollTop,
+				clientHeight: document.documentElement.clientHeight,
+				itemCount: document.querySelectorAll('[data-infinite-scroll-item], .feed-item, .list-item, .card, article').length,
+				viewportHeight: window.innerHeight
+			};
+		})()
+	`
+
+const ScrollToBottomScript = `
+		window.scrollTo(0, document.body.scrollHeight);
+	`
+
+const ClickLoadMoreScript = `
+		(function() {
+			const selectors = [
+				'button.load-more',
+				'button[data-action="load-more"]',
+				'.load-more-button',
+				'.load-more',
+				'[data-testid="load-more"]',
+				'button:has-text("Load More")',
+				'a.load-more',
+				'.show-more',
+				'button.show-more',
+				'[data-action="show-more"]'
+			];
+			for (const sel of selectors) {
+				try {
+					const btn = document.querySelector(sel);
+					if (btn && btn.offsetParent !== null) {
+						btn.click();
+						return true;
+					}
+				} catch(e) {}
+			}
+			// Try text-based matching
+			const buttons = document.querySelectorAll('button, a, [role="button"]');
+			for (const btn of buttons) {
+				const text = btn.textContent.toLowerCase().trim();
+				if (text === 'load more' || text === 'show more' || text === 'view more' || text === 'see more') {
+					if (btn.offsetParent !== null) {
+						btn.click();
+						return true;
+					}
+				}
+			}
+			return false;
+		})()
+	`
+
+// ScrollMetrics captures the current scroll and content metrics of the page.
+type ScrollMetrics struct {
+	ScrollHeight   int `json:"scrollHeight"`
+	ScrollTop      int `json:"scrollTop"`
+	ClientHeight   int `json:"clientHeight"`
+	ItemCount      int `json:"itemCount"`
+	ViewportHeight int `json:"viewportHeight"`
+}
+
+// GetScrollMetrics returns the current scroll and item metrics of the page.
+func GetScrollMetrics(ctx context.Context) (*ScrollMetrics, error) {
+	var result ScrollMetrics
+	err := chromedp.Run(ctx, chromedp.Evaluate(InfiniteScrollScript, &result))
+	return &result, err
+}
+
+// ScrollToBottom scrolls the window to the bottom of the page.
+func ScrollToBottom(ctx context.Context) error {
+	return chromedp.Run(ctx, chromedp.Evaluate(ScrollToBottomScript, nil))
+}
+
+// ClickLoadMore clicks a visible load-more button and reports whether one was found.
+func ClickLoadMore(ctx context.Context) (bool, error) {
+	var result bool
+	err := chromedp.Run(ctx, chromedp.Evaluate(ClickLoadMoreScript, &result))
+	return result, err
+}
+
+// ScrollToElement scrolls the element matching the selector into view.
+func ScrollToElement(ctx context.Context, selector string) error {
+	safeSelector, err := json.Marshal(selector)
+	if err != nil {
+		return fmt.Errorf("failed to marshal selector: %w", err)
+	}
+	script := `
+		(function(selector) {
+			const el = document.querySelector(selector);
+			if (el) {
+				el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+				return true;
+			}
+			return false;
+		})(` + string(safeSelector) + `)
+	`
+	var result bool
+	return chromedp.Run(ctx, chromedp.Evaluate(script, &result))
+}
+
+// ExpandAllSections expands collapsible, accordion, and details elements on the page.
+func ExpandAllSections(ctx context.Context) error {
+	script := `
+		// Click all expandable elements
+		document.querySelectorAll('[data-toggle], [aria-expanded="false"], details:not([open]), .collapsible:not(.active)').forEach(el => {
+			try { el.click(); } catch(e) {}
+		});
+
+		// Expand all details elements
+		document.querySelectorAll('details').forEach(d => d.open = true);
+
+		// Click all accordion headers
+		document.querySelectorAll('.accordion-header, .accordion-trigger, [role="button"][aria-expanded="false"]').forEach(el => {
+			try { el.click(); } catch(e) {}
+		});
+	`
+	return chromedp.Run(ctx, chromedp.Evaluate(script, nil))
+}
+
+// DismissOverlays dismisses cookie consents, modals, and fixed overlay elements.
+func DismissOverlays(ctx context.Context) error {
+	script := `
+		// Dismiss cookie consent
+		const cookieSelectors = [
+			'[data-testid="cookie-accept"]',
+			'.cookie-accept',
+			'.accept-cookies',
+			'#accept-cookies',
+			'button[data-cookiefirst-action="accept"]',
+			'.cc-dismiss',
+			'#onetrust-accept-btn-handler'
+		];
+		cookieSelectors.forEach(sel => {
+			try {
+				const btn = document.querySelector(sel);
+				if (btn) btn.click();
+			} catch(e) {}
+		});
+
+		// Dismiss modals
+		const modalSelectors = [
+			'.modal-close',
+			'[data-dismiss="modal"]',
+			'[aria-label="Close"]',
+			'.close-button',
+			'button.close'
+		];
+		modalSelectors.forEach(sel => {
+			try {
+				const btn = document.querySelector(sel);
+				if (btn) btn.click();
+			} catch(e) {}
+		});
+
+		// Remove fixed overlays
+		document.querySelectorAll('[style*="position: fixed"], [style*="position:fixed"]').forEach(el => {
+			const style = window.getComputedStyle(el);
+			if (style.zIndex > 1000 || el.classList.toString().includes('modal') || el.classList.toString().includes('overlay')) {
+				el.remove();
+			}
+		});
+	`
+	return chromedp.Run(ctx, chromedp.Evaluate(script, nil))
+}

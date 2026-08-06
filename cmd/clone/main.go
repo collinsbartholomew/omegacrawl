@@ -3,24 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
-	"net/http"
 	"os"
-	"os/signal"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
-
-	"github.com/user/clone/internal/api"
-	"github.com/user/clone/internal/config"
-	"github.com/user/clone/internal/crawler"
-	"github.com/user/clone/internal/notify"
-	"github.com/user/clone/internal/scheduler"
-	"github.com/user/clone/internal/util"
-	"github.com/user/clone/internal/webui"
+	"github.com/user/clone/internal/tracing"
 )
 
 var (
@@ -30,6 +17,20 @@ var (
 )
 
 func main() {
+	// Initialize OpenTelemetry tracing
+	ctx := context.Background()
+	shutdown, err := tracing.InitTracer(ctx, "web-cloner")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize tracing: %v\n", err)
+	}
+	defer func() {
+		if shutdown != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = shutdown(shutdownCtx)
+		}
+	}()
+
 	rootCmd := &cobra.Command{
 		Use:   "clone [flags] URL...",
 		Short: "Clone websites with headless browser",
@@ -47,7 +48,7 @@ Examples:
 		RunE:    runClone,
 	}
 
-	rootCmd.Flags().StringVarP(&cfgFile, "config", "c", "", "config file (optional, CLI flags override)")
+	rootCmd.PersistentFlags().StringVarP(&cfgFile, "config", "c", "", "config file (optional, CLI flags override)")
 	rootCmd.Flags().StringVarP(&logLevel, "log-level", "l", "info", "log level")
 	rootCmd.Flags().IntP("depth", "d", 10, "max crawl depth")
 	rootCmd.Flags().IntP("concurrency", "n", 5, "max concurrent pages")
@@ -64,6 +65,9 @@ Examples:
 	rootCmd.Flags().Bool("interact", false, "enable systematic interaction engine (click links, fill forms)")
 	rootCmd.Flags().Bool("interactive", false, "interactive mode (visible browser, user handles CAPTCHAs and forms manually)")
 	rootCmd.Flags().Bool("manual-capture", false, "manual capture mode (user navigates freely, each page visited is captured)")
+	rootCmd.Flags().Bool("mobile-emulation", false, "enable mobile device emulation")
+	rootCmd.Flags().String("mobile-device", "", "mobile device to emulate (e.g. iPhone 12, Pixel 5)")
+	rootCmd.Flags().String("mobile-user-agent", "", "custom mobile user agent")
 	rootCmd.Flags().StringSlice("chrome-flag", nil, "additional Chrome CLI flag (can be specified multiple times)")
 	rootCmd.Flags().String("remote-chrome-url", "", "websocket URL for remote Chrome (ws://host:port/...)")
 	rootCmd.Flags().Int("browser-pool-size", 1, "number of concurrent browser processes")
@@ -91,263 +95,65 @@ Examples:
 	serveCmd.Flags().IntP("port", "p", 8080, "port to listen on")
 	rootCmd.AddCommand(serveCmd)
 
+	repairCmd := &cobra.Command{
+		Use:   "repair [directory]",
+		Short: "Repair missing assets in an existing clone",
+		Long: `Re-process an existing clone directory: find absolute asset URLs that
+were never saved during the crawl, download the missing files, and re-rewrite
+the page HTML so every reference resolves to a local file. No site re-crawl.
+
+Examples:
+  clone repair ./output/farmex2
+  clone repair -o output/farmex2`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runRepair,
+	}
+	repairCmd.Flags().StringP("output", "o", "output", "output directory")
+	repairCmd.Flags().Int("workers", 5, "max concurrent downloads")
+	rootCmd.AddCommand(repairCmd)
+
+	localizeCmd := &cobra.Command{
+		Use:   "localize [directory]",
+		Short: "Rewrite a clone into an offline-localized copy",
+		Long: `Copy a raw clone directory into <dir>/localized and rewrite every page
+and stylesheet so all references resolve to local files. The raw clone
+directory is left untouched. Works on clones produced by the crawler (which
+writes into <dir>/clone) and on legacy single-directory clones.
+
+Examples:
+  clone localize output/farmart2
+  clone localize -i output/farmex2 -o output/farmex2-localized`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runLocalize,
+	}
+	localizeCmd.Flags().StringP("input", "i", "", "clone directory to localize (defaults to <dir>/clone)")
+	localizeCmd.Flags().StringP("output", "o", "", "localized output directory (defaults to <dir>/localized)")
+	rootCmd.AddCommand(localizeCmd)
+
+	dedupeCmd := &cobra.Command{
+		Use:   "dedupe [directory]",
+		Short: "Export a deduplicated set of unique pages and assets",
+		Long: `Collapse duplicate and permutation pages (filters, pagination, query
+variants, shortlink aliases) into a single representative per unique
+document, and copy all assets. Useful before migrating to a new frontend
+(e.g. Next.js) so only the underlying data is kept, not every duplicate.
+
+Operates on <dir>/clone by default; use -i to point at a specific tree.
+
+Examples:
+  clone dedupe output/wavio
+  clone dedupe -i output/wavio/clone -o output/wavio/dedup`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: runDedupe,
+	}
+	dedupeCmd.Flags().StringP("input", "i", "", "tree to deduplicate (defaults to <dir>/clone)")
+	dedupeCmd.Flags().StringP("output", "o", "", "deduplicated output dir (defaults to <dir>/dedup)")
+	dedupeCmd.Flags().StringSlice("preserve-query-param", nil, "query param that selects distinct content (repeatable, overrides dedupe drop rules)")
+	dedupeCmd.Flags().StringSlice("preserve-path-segment", nil, "path segment that is real content, not pagination (repeatable, overrides dedupe drop rules)")
+	rootCmd.AddCommand(dedupeCmd)
+
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
-
-func runServe(cmd *cobra.Command, args []string) error {
-	dir := "output"
-	if len(args) > 0 {
-		dir = args[0]
-	}
-	port, _ := cmd.Flags().GetInt("port")
-
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return fmt.Errorf("directory not found: %s", dir)
-	}
-
-	entries, _ := os.ReadDir(dir)
-	var hostDir string
-	for _, e := range entries {
-		if e.IsDir() && strings.Contains(e.Name(), ".") {
-			hostDir = e.Name()
-			break
-		}
-	}
-
-	serveDir := dir
-	if hostDir != "" {
-		serveDir = dir + "/" + hostDir
-	}
-
-	fs := http.FileServer(http.Dir(serveDir))
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Cache-Control", "no-cache")
-		if r.Method == "OPTIONS" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		targetPath := strings.TrimPrefix(r.URL.Path, "/"+hostDir)
-		if targetPath == "" {
-			targetPath = "/"
-		}
-		localPath := serveDir + targetPath
-		if _, err := os.Stat(localPath); os.IsNotExist(err) {
-			htmlPath := localPath
-			if !strings.HasSuffix(htmlPath, ".html") {
-				htmlPath = serveDir + "/index.html"
-			}
-			if _, err2 := os.Stat(htmlPath); err2 != nil {
-				if !strings.HasSuffix(localPath, ".json") {
-					jsonPath := localPath + ".json"
-					if _, err3 := os.Stat(jsonPath); err3 == nil {
-						r.URL.Path = targetPath + ".json"
-						fs.ServeHTTP(w, r)
-						return
-					}
-				}
-				r.URL.Path = "/index.html"
-				fs.ServeHTTP(w, r)
-				return
-			}
-			r.URL.Path = "/index.html"
-		}
-		fs.ServeHTTP(w, r)
-	})
-
-	addr := fmt.Sprintf(":%d", port)
-	if hostDir != "" {
-		log.Printf("Serving %s on http://localhost%s (detected host: %s)", dir, addr, hostDir)
-	} else {
-		log.Printf("Serving %s on http://localhost%s", dir, addr)
-	}
-	return http.ListenAndServe(addr, handler)
-}
-
-func runClone(cmd *cobra.Command, args []string) error {
-	util.InitLogger(logLevel)
-
-	cfg := config.DefaultConfig()
-
-	// Load config file if specified (optional)
-	if cfgFile != "" {
-		if loaded, err := config.LoadFromFile(cfgFile); err == nil {
-			cfg = loaded
-		}
-	}
-
-	// URLs from args
-	cfg.Seeds = append(cfg.Seeds, args...)
-
-	if len(cfg.Seeds) == 0 {
-		return fmt.Errorf("no URLs provided\nUsage: clone [flags] URL...")
-	}
-
-	// Apply CLI flags (always override config file)
-	maxDepth, _ := cmd.Flags().GetInt("depth")
-	concurrency, _ := cmd.Flags().GetInt("concurrency")
-	output, _ := cmd.Flags().GetString("output")
-	screenshot, _ := cmd.Flags().GetBool("screenshot")
-	pdf, _ := cmd.Flags().GetBool("pdf")
-	proxy, _ := cmd.Flags().GetString("proxy")
-	timeout, _ := cmd.Flags().GetDuration("timeout")
-	stealth, _ := cmd.Flags().GetBool("stealth")
-	noRobots, _ := cmd.Flags().GetBool("no-robots")
-	delay, _ := cmd.Flags().GetDuration("delay")
-	maxURLs, _ := cmd.Flags().GetInt("max-urls")
-	scroll, _ := cmd.Flags().GetBool("scroll")
-	interact, _ := cmd.Flags().GetBool("interact")
-	interactive, _ := cmd.Flags().GetBool("interactive")
-	manualCapture, _ := cmd.Flags().GetBool("manual-capture")
-	dashboardPort, _ := cmd.Flags().GetInt("dashboard-port")
-	apiPort, _ := cmd.Flags().GetInt("api-port")
-	webhookURL, _ := cmd.Flags().GetString("webhook-url")
-	slackURL, _ := cmd.Flags().GetString("slack-url")
-	scheduleCron, _ := cmd.Flags().GetString("schedule")
-	chromeFlags, _ := cmd.Flags().GetStringSlice("chrome-flag")
-	remoteChromeURL, _ := cmd.Flags().GetString("remote-chrome-url")
-	browserPoolSize, _ := cmd.Flags().GetInt("browser-pool-size")
-	userDataDir, _ := cmd.Flags().GetString("user-data-dir")
-	wacz, _ := cmd.Flags().GetBool("wacz")
-	blockedURLs, _ := cmd.Flags().GetStringSlice("blocked-urls")
-
-	cfg.MaxDepth = maxDepth
-	cfg.MaxConcurrentPages = concurrency
-	cfg.OutputDir = output
-	if cmd.Flags().Changed("screenshot") {
-		cfg.EnableScreenshot = screenshot
-	}
-	cfg.EnablePDF = pdf
-	cfg.Proxy = proxy
-	cfg.PageTimeout = timeout
-	cfg.EnableStealth = stealth
-	cfg.RespectRobots = !noRobots
-	cfg.CrawlDelay = delay
-	cfg.MaxURLsPerHost = maxURLs
-	cfg.EnableInteractionEngine = interact
-	cfg.Interactive = interactive || manualCapture
-	cfg.ManualCapture = manualCapture
-	cfg.ChromeFlags = chromeFlags
-	cfg.RemoteChromeURL = remoteChromeURL
-	cfg.BrowserPoolSize = browserPoolSize
-	cfg.UserDataDir = userDataDir
-	cfg.EnableWACZ = wacz
-	cfg.BlockedURLPatterns = blockedURLs
-	cfg.APIPort = apiPort
-	cfg.WebhookURL = webhookURL
-	cfg.SlackURL = slackURL
-	cfg.ScheduleCron = scheduleCron
-
-	if cfg.InfiniteScroll == nil {
-		cfg.InfiniteScroll = &config.InfiniteScrollConfig{}
-	}
-	cfg.InfiniteScroll.Enabled = scroll
-
-	// Validate config
-	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("config validation failed: %w", err)
-	}
-
-	// Ensure output directory exists
-	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
-		return fmt.Errorf("cannot create output dir: %w", err)
-	}
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	c, err := crawler.NewCrawler(cfg)
-	if err != nil {
-		return fmt.Errorf("failed to create crawler: %w", err)
-	}
-
-	var dash *webui.Server
-	if dashboardPort > 0 {
-		dash = webui.New()
-		dash.SetProvider(c)
-		go func() {
-			util.LogInfo("dashboard", zap.Int("port", dashboardPort))
-			if err := dash.Start(dashboardPort); err != nil && err != http.ErrServerClosed {
-				util.LogError("dashboard error", err)
-			}
-		}()
-	}
-
-	var apiSrv *api.Server
-	if apiPort > 0 {
-		apiSrv = api.New(c)
-		go func() {
-			util.LogInfo("api server", zap.Int("port", apiPort))
-			if err := apiSrv.Start(apiPort); err != nil && err != http.ErrServerClosed {
-				util.LogError("api server error", err)
-			}
-		}()
-	}
-
-	n := &notify.Notifier{}
-	if cfg.WebhookURL != "" || cfg.SlackURL != "" || cfg.SMTPConfig != nil {
-		n = notify.New(&notify.Config{
-			WebhookURL: cfg.WebhookURL,
-			SlackURL:   cfg.SlackURL,
-			SMTP:       cfg.SMTPConfig,
-		})
-		n.Send(notify.Notification{Title: "Crawl Started", Message: "Crawl has been initialized.", Level: "info"})
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	var sched *scheduler.Scheduler
-	if cfg.ScheduleCron != "" {
-		sched = scheduler.New()
-		sched.Add(&scheduler.Job{
-			ID:       "crawl",
-			Name:     "Scheduled Crawl",
-			CronExpr: cfg.ScheduleCron,
-			RunFunc: func(ctx context.Context) error {
-				util.LogInfo("scheduled crawl starting")
-				n.Send(notify.Notification{Title: "Scheduled Crawl", Message: "Starting scheduled crawl", Level: "info"})
-				cr, _ := crawler.NewCrawler(cfg)
-				err := cr.Start(cfg.Seeds)
-				if err != nil {
-					n.Send(notify.Notification{Title: "Crawl Failed", Message: err.Error(), Level: "error"})
-				} else {
-					n.Send(notify.Notification{Title: "Crawl Complete", Message: "Scheduled crawl finished successfully", Level: "info"})
-				}
-				return err
-			},
-		})
-		sched.Start(ctx)
-		util.LogInfo("scheduler", zap.String("cron", cfg.ScheduleCron))
-		// Wait indefinitely for scheduled runs
-		<-ctx.Done()
-		return nil
-	}
-
-	go func() {
-		<-sigChan
-		util.LogInfo("stopping...")
-		if dash != nil {
-			dash.Stop()
-		}
-		if apiSrv != nil {
-			apiSrv.Stop()
-		}
-		if sched != nil {
-			sched.Stop()
-		}
-		c.Stop()
-	}()
-
-	util.LogInfo("cloning",
-		zap.Int("urls", len(cfg.Seeds)),
-		zap.Int("depth", cfg.MaxDepth),
-		zap.String("output", cfg.OutputDir),
-	)
-
-	return c.Start(cfg.Seeds)
 }

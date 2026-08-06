@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/smtp"
 	"strings"
 	"text/template"
 	"time"
+
+	"github.com/user/clone/internal/util"
+	"go.uber.org/zap"
 )
 
 // Config holds the notification channel configuration.
@@ -56,6 +60,9 @@ func New(cfg *Config) *Notifier {
 
 // Send delivers the notification to all configured channels and returns any errors.
 func (n *Notifier) Send(nt Notification) error {
+	if n == nil || n.cfg == nil {
+		return nil
+	}
 	var errs []string
 	if n.cfg.WebhookURL != "" {
 		if err := n.sendWebhook(nt); err != nil {
@@ -87,7 +94,18 @@ func (n *Notifier) sendWebhook(nt Notification) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	// A non-2xx response means the receiver rejected the notification;
+	// silently treating it as delivered hides outages.
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+			util.LogDebug("failed to discard webhook response body", zap.Error(copyErr))
+		}
+		return fmt.Errorf("webhook returned status %d", resp.StatusCode)
+	}
+	if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+		util.LogDebug("failed to discard webhook response body", zap.Error(copyErr))
+	}
 	return nil
 }
 
@@ -117,7 +135,16 @@ func (n *Notifier) sendSlack(nt Notification) error {
 	if err != nil {
 		return err
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+			util.LogDebug("failed to discard slack response body", zap.Error(copyErr))
+		}
+		return fmt.Errorf("slack returned status %d", resp.StatusCode)
+	}
+	if _, copyErr := io.Copy(io.Discard, resp.Body); copyErr != nil {
+		util.LogDebug("failed to discard slack response body", zap.Error(copyErr))
+	}
 	return nil
 }
 
